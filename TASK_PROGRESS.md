@@ -1,6 +1,40 @@
 # Task Progress
 
-Updated: 2026-07-25 08:31 HKT (Asia/Hong_Kong)
+Updated: 2026-07-30 19:53 HKT (Asia/Hong_Kong)
+
+## BerryTrace DreamSkin Zip Decompression Path Resolution & Detailed Logging (2026-07-30 19:53 HKT)
+
+- [complete] **Removed Built-in Default Presets (`DEFAULT_PRESETS`)**: Removed hardcoded default preset skins (`mikuu-full-background`, `preset-gothic-void-crusade`, `preset-arina-hashimoto`) and SVG strings as requested. Theme list now displays user-imported custom skins exclusively.
+- [complete] **Individual Skin Deletion & Physical Directory Cleanup (`handleDeleteCustomTheme`)**: Enhanced individual theme card deletion so clicking the delete button on any custom skin card physically deletes the extracted directory under `~/.berrytrace/skin/<themeId>` via `fs.removeDir` and removes its entry from storage.
+- [complete] **`~/.berrytrace/skin` Resource Binding (Removed Hardcoded `isOldPath` Hacks)**: Cleaned up arbitrary regex checks. `installThemeZipNative` and `saveWallpaperToDisk` natively use `getSkinRootDir` (`getSafePath('skin')`), ensuring all skin files and wallpapers strictly reside in `~/.berrytrace/skin/`.
+- [complete] **Subdirectory Path Calibration**: Fixed bug in `installThemeZipNative` (`plugin/src/adapter/package-importer.ts`) where nested subdirectories inside extracted theme zips (e.g. `zip_root/subfolder/theme.json` & `zip_root/subfolder/background.png`) failed to update `targetDir`. `diskImgPath` and `cssPath` now correctly resolve to `targetDir` where `theme.json` is located.
+- [complete] **Comprehensive Debug Logging**: Added step-by-step console logging across `installThemeZipNative`, `formatPluginResourceUrl`, `resolvePreviewDataUrl`, `saveWallpaperToDisk`, and `processImportPackage`.
+- [verified] Rebuilt plugin with `npm run build`, verified 0 TypeScript compilation errors (`tsc --noEmit`), and signed plugin package `org.dreamskin.plugin.dream-skin-1.0.0.btp` successfully via SDK CLI.
+
+## BerryTrace DreamSkin Plugin IDE Problem & Blur Fixes (2026-07-30 15:57 HKT)
+
+- [complete] **DreamSkin Spec Parity & Complete Blur Elimination**:
+  1. Overrode host `index.css` 16px fallback by injecting `--surface-blur: 0px !important;` and `--berrytrace-bg-blur: 0px !important;` under `html.has-wallpaper`.
+  2. Applied `backdrop-filter: none !important;` across `main`, `aside`, `nav`, `[class*="sidebar"]`, `.bg-card`, `.bg-muted`, `.bg-secondary` matching original DreamSkin L1/L2 specs.
+  3. Extracted and persisted theme author's native `theme.css` via `sdkUi.persistStyle(SKIN_STYLE_ID.CUSTOM_CSS, themeCss)` in `package-importer.ts` & `theme-adapter.ts`.
+  4. Preserved exact solid hex/rgba colors from `theme.json` without forced `parseColorToRgba` degradation.
+- [complete] **Background Image Blur Issue**: Fixed global UI blur by defaulting `setWallpaper` option `blur` to `"0px"` (instead of hardcoded `"12px"`), adding `blur?: string` support to `DreamSkinArt`, and removing injected `!important` `backdrop-filter: blur(...)` from `main` and `.bg-background` in `theme-adapter.ts`. The background wallpaper is now crisp and clear.
+- [complete] **`fontFamily` Property in `DreamSkinThemeConfig`**: Added `fontFamily?: string;` to `DreamSkinThemeConfig` interface in `plugin/src/adapter/theme-adapter.ts` to resolve property missing errors on lines 234-235.
+- [complete] **`lucide-react` Type Declaration & Module Error**: Added `"lucide-react": "^0.475.0"` to `devDependencies` in `plugin/package.json` and generated `plugin/tsconfig.json` for TypeScript configuration, resolving the import module error in `plugin/src/view/index.tsx`.
+- [complete] **Legacy DOM Injection & Reset Export Fix**: Exported `injectThemeVariablesToDOM` and `resetBerryTraceTheme` fallback functions from `plugin/src/adapter/theme-adapter.ts` so dynamic fallback imports in `plugin/src/view/index.tsx` (lines 292, 316, 375) resolve cleanly.
+- [complete] **JSZip File Type Check Fix**: Updated `plugin/src/adapter/package-importer.ts` to safely handle `JSZipObject` single entry extraction vs regex array results.
+- [complete] **Clean Up & Verification**: Removed obsolete nested `plugin/src/adapter/adapter` folder. Verified type checking with `./node_modules/.bin/tsc --noEmit` (0 errors) and validated bundle compilation via `npm run build`.
+
+## BerryTrace DreamSkin Plugin Fixes (2026-07-30 15:10 HKT)
+
+- [complete] **Issue 1 (Only 1 Skin Installed / Overwriting Previous Skins)**: Fixed `processImportPackage` in `plugin/src/view/index.tsx` by detecting generic/duplicate theme IDs (e.g. `custom`, `default`, `theme`, `dream-skin`) and generating unique theme IDs (`${rawSlug}_${timestamp}`). Updated wallpaper storage path and theme library persistence so multiple imported custom skins are preserved simultaneously without overwriting previous themes.
+- [complete] **Issue 2 (Preview Image Display Failure)**:
+  1. Updated `installThemeZipNative` in `plugin/src/adapter/package-importer.ts` to convert extracted background images into Base64 Data URIs (`data:image/...;base64,...`) when `fs.readFile` is available, matching `parseDreamSkinZip`.
+  2. Created `resolvePreviewDataUrl` helper in `plugin/src/adapter/theme-adapter.ts` to asynchronously resolve local disk/protocol image paths (`file://`, `berrytrace-plugin://local-file/`, `/Users/...`) to Data URIs for React `<img>` rendering.
+  3. Added `ThemePreviewCard` component in `plugin/src/view/index.tsx` to handle async Data URI resolution and fallback palette rendering.
+- [complete] **Plugin View Container Background Fix**: Replaced `bg-background` with `bg-transparent` on root container in `plugin/src/view/index.tsx` so theme wallpaper and window glass translucency can display cleanly without being blocked by solid opaque background color.
+- [complete] **Theme Color & Font CSS Override Fix**: Fixed CSS specificity conflict in `theme-adapter.ts` where `html.has-wallpaper` was overriding custom theme `--background` and `--card` colors with hardcoded dark/light glass values. Added `parseColorToRgba` helper to blend user-defined theme colors with translucency, added `:root, html` targeting for Token CSS, added `fontFamily` support, and expanded verbose `console.log` output for all CSS injection steps.
+- [verified] Rebuilt and packaged plugin using `node build.js` and `berrytrace-cli.js pack`; generated `plugin/dist/` and signed `org.dreamskin.plugin.dream-skin-1.0.0.btp` package successfully.
 
 ## v1.5.1 Version Release (2026-07-25 08:28 HKT)
 
