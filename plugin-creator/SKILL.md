@@ -66,6 +66,7 @@ UI 注册、命令、菜单、激活条件全部在 `plugin.json` 声明，不�
 | **API 映射** | [api-map.json](./api-map.json) |
 | **错误码** | [error-map.json](./error-map.json) |
 | **本地小型 LLM 调试与调用** | [23-local-llm.md](./references/23-local-llm.md) |
+| **异步互斥锁 (AsyncLock)** | [24-async-lock.md](./references/24-async-lock.md) |
 | **🐛 高频奇葩问题 FAQ** | [99-known-tricky-bugs.md](./references/99-known-tricky-bugs.md) |
 
 ---
@@ -117,9 +118,11 @@ UI 注册、命令、菜单、激活条件全部在 `plugin.json` 声明，不�
     - **简单 Skin**（CSS 一次写入）：用 `sdk.ui.persistStyle(id, css)` — 宿主 SkinLayer 重启自动恢复，插件无需始终运行。
     - **复杂 Skin**（动态响应）：在 `plugin.json` 声明 `"activationEvents": ["onStartupFinished"]`，用 `sdk.ui.broadcastStyle()` + `sdk.ui.onThemeChange()` 实时更新。
     - **混合 Skin**（按需切换常驻）：用 `sdk.plugin.setStartupResident(true/false)` 动态控制下次启动是否常驻，80% 静态用户零进程占用，动态用户自动开机常驻。
+    - **修改主题模式**：使用 `sdk.ui.setTheme('light' | 'dark' | 'system')` 统一修改宿主主题，无需使用 Electron 全局对象。
 16. **替换品牌色必须用 `sdk.ui.setToken('--color-brand', '#hex')`** — 直接调用 `style.setProperty` 只改 `--color-brand`，不会同步 `--brand-rgb`，导致 Tailwind `bg-brand/10`、`ring-brand/40` 等带透明度工具类不跟随主题。`setToken` 自动处理伴生变量。
 17. **窗口差异化样式**：不同窗口有唯一 `<html>` class，`quick-panel-root-page`、`float-web-root-page` 等在 `index.css` 静态声明；**`main-window-root-page`** 由宿主在 `did-finish-load` 事件中动态注入（已实现）。插件用 CSS 选择器按窗口控制样式，无需宿主额外配合。参见 [07j-ui-theme.md](./references/07j-ui-theme.md)。
 18. **壁纸控制**：使用 `sdk.ui.setWallpaper(url, options)` 一键挂载全屏壁纸，宿主自动处理背景图激活、持久化恢复和多窗口广播。毛玻璃效果由插件自行注入 CSS 实现。参见 [07j-ui-theme.md](./references/07j-ui-theme.md)。
+19. **插件安装与启动生命周期 (`activate(context)`)**：`activate(context)` 接收 `context.action`（`'install'` / `'initial-load'` / `'enable'` / `'reload'` 等）。在首次安装 (`'install'`) 或无缓存时进行全量扫描建图，并将探索到的贡献写入 `pluginData/<cleanId>/.berrytrace/declared-contributions.json`。宿主再次启动时在 `PluginScanner` 自动合并，实现零进程开销的静态菜单/Sub-Agent 展示。详见 [13-startup.md](./references/13-startup.md)。
 
 ---
 

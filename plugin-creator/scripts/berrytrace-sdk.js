@@ -51,6 +51,10 @@ export function createPluginSDK(pluginId, options) {
     const callbackMap = new Map();
     let callbackCounter = 1;
     const commandHandlers = new Map();
+    const p2pPendingConnects = new Map();
+    const p2pConnectedHandlers = [];
+    let connectPluginImpl = () => Promise.reject(new Error('Not implemented'));
+    let onPluginConnectedImpl = () => () => { };
     function registerCallback(fn) {
         const callbackId = `cb_${Date.now()}_${callbackCounter++}`;
         callbackMap.set(callbackId, fn);
@@ -72,6 +76,34 @@ export function createPluginSDK(pluginId, options) {
     let emitEventImpl;
     let postMessageImpl = () => { };
     let sendToHost = () => { };
+    const unwrapDocumentHandle = async (data) => {
+        if (!data)
+            return data;
+        if (typeof data === 'object' && data.__isDocumentHandle && data.handleId) {
+            try {
+                console.log(`[SDK:${pluginId}:DocumentCenter:UNWRAP:INIT] Unwrapping DocumentHandle handleId=${data.handleId} (sizeBytes=${data.sizeBytes})`);
+                const raw = await callApiImpl('system', 'getDocumentContent', [data.handleId]);
+                if (typeof raw === 'string' && raw.length > 0) {
+                    try {
+                        const parsed = JSON.parse(raw);
+                        console.log(`[SDK:${pluginId}:DocumentCenter:UNWRAP:SUCCESS] Unwrapped JSON object from handleId=${data.handleId}`);
+                        return parsed;
+                    }
+                    catch {
+                        console.log(`[SDK:${pluginId}:DocumentCenter:UNWRAP:SUCCESS] Unwrapped raw string from handleId=${data.handleId}`);
+                        return raw;
+                    }
+                }
+            }
+            catch (err) {
+                console.warn(`⚠️ [SDK:${pluginId}:DocumentCenter:UNWRAP:WARN] Failed to auto-unwrap DocumentHandle ${data.handleId}:`, err);
+            }
+        }
+        if (Array.isArray(data)) {
+            return Promise.all(data.map(item => unwrapDocumentHandle(item)));
+        }
+        return data;
+    };
     if (isNodeBackground) {
         // ── 进程池模式检测 ──────────────────────────────────────────────────────
         // Host Runner 在加载插件前设置 globalThis.__pluginPoolRouter。
@@ -186,6 +218,32 @@ export function createPluginSDK(pluginId, options) {
                 }
                 return;
             }
+            if (msg.type === 'plugin:p2p-connected') {
+                const port = parentPort ? (event.ports && event.ports[0]) : (event && event.ports && event.ports[0] ? event.ports[0] : sendHandle);
+                const { peerPluginId, requesterPluginId, channelName, role } = msg;
+                const actualPeer = peerPluginId || requesterPluginId;
+                const actualChannel = channelName || 'default';
+                if (port) {
+                    if (typeof port.start === 'function')
+                        port.start();
+                    if (role === 'requester') {
+                        const pending = p2pPendingConnects.get(`${actualPeer}:${actualChannel}`);
+                        if (pending) {
+                            p2pPendingConnects.delete(`${actualPeer}:${actualChannel}`);
+                            pending.resolve(port);
+                        }
+                    }
+                    for (const cb of p2pConnectedHandlers) {
+                        try {
+                            cb(port, actualPeer, actualChannel);
+                        }
+                        catch (err) {
+                            console.error(err);
+                        }
+                    }
+                }
+                return;
+            }
             if (msg.type === 'sdk:callApi:response') {
                 const { token, success, result, error } = msg;
                 const pending = pendingCalls.get(token);
@@ -209,16 +267,32 @@ export function createPluginSDK(pluginId, options) {
                     cb(...args);
             }
             else if (msg.type === 'sdk:events:on') {
-                const { eventName, payload } = msg;
+                const { eventName } = msg;
+                const payload = await unwrapDocumentHandle(msg.payload);
                 if (eventName === 'commands:execute') {
                     const { commandId, args } = payload || {};
+                    const realArgs = await unwrapDocumentHandle(args);
+                    const argPayload = Array.isArray(realArgs) ? realArgs[0] : realArgs;
                     const handler = commandHandlers.get(commandId);
                     if (handler) {
                         try {
-                            await handler(args);
+                            await handler(realArgs);
                         }
                         catch (err) {
                             console.error(err);
+                        }
+                    }
+                    if (commandId) {
+                        const targetCbList = callbackMap.get(`evt:${commandId}`);
+                        if (targetCbList) {
+                            for (const cb of targetCbList) {
+                                try {
+                                    cb(argPayload);
+                                }
+                                catch (err) {
+                                    console.error(err);
+                                }
+                            }
                         }
                     }
                 }
@@ -324,7 +398,7 @@ export function createPluginSDK(pluginId, options) {
                     if (manifest) {
                         const listens = manifest.contributes?.events?.listens || [];
                         const isDeclared = listens.some((item) => item.name === eventName);
-                        const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:'];
+                        const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:', 'local:'];
                         const isPlatformEvent = prefixes.some(p => eventName.startsWith(p));
                         if (isPlatformEvent && eventName !== 'commands:execute' && !isDeclared) {
                             console.warn(`\x1b[33m[SDK:WARN:${pluginId}] Event "${eventName}" is listened in code but NOT declared in plugin.json listens list! CROSS-PROCESS MESSAGES WILL BE SILENTLY LOST.\x1b[0m`);
@@ -344,18 +418,24 @@ export function createPluginSDK(pluginId, options) {
                     list.splice(idx, 1);
             };
         };
-        emitEventImpl = (eventName, payload) => {
-            const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:'];
-            const isPlatformEvent = prefixes.some(p => eventName.startsWith(p));
-            if (isPlatformEvent) {
-                sendToHost({ type: 'sdk:events:emit', eventName, payload });
-            }
-            if (directPort) {
-                throttledEmitter.emit(eventName, payload, directPort);
-            }
-            else if (!isPlatformEvent) {
-                sendToHost({ type: 'sdk:events:emit', eventName, payload });
-            }
+        connectPluginImpl = (targetPluginId, channelName = 'default') => {
+            return new Promise((resolve, reject) => {
+                p2pPendingConnects.set(`${targetPluginId}:${channelName}`, { resolve, reject });
+                sendToHost({
+                    type: 'plugin:connect-to-plugin',
+                    requesterPluginId: pluginId,
+                    targetPluginId,
+                    channelName
+                });
+            });
+        };
+        onPluginConnectedImpl = (cb) => {
+            p2pConnectedHandlers.push(cb);
+            return () => {
+                const idx = p2pConnectedHandlers.indexOf(cb);
+                if (idx !== -1)
+                    p2pConnectedHandlers.splice(idx, 1);
+            };
         };
         // ── 看门狗心跳（SDK 内置，插件开发者无感）──────────────────────────────
         // 每 5 秒向主进程发送一次，携带内存和 CPU 累计指标
@@ -504,27 +584,49 @@ export function createPluginSDK(pluginId, options) {
             });
             window.electronAPI.ipc.on('commands:execute', async (data) => {
                 const { commandId, args } = data || {};
+                const realArgs = await unwrapDocumentHandle(args);
+                const argPayload = Array.isArray(realArgs) ? realArgs[0] : realArgs;
                 const handler = commandHandlers.get(commandId);
                 if (handler) {
                     try {
-                        await handler(args);
+                        await handler(realArgs);
                     }
                     catch (err) {
                         console.error(err);
                     }
                 }
+                if (commandId) {
+                    const targetCbList = callbackMap.get(`evt:${commandId}`);
+                    if (targetCbList) {
+                        for (const cb of targetCbList) {
+                            try {
+                                cb(argPayload);
+                            }
+                            catch (err) {
+                                console.error(err);
+                            }
+                        }
+                    }
+                }
             });
         }
         onEventImpl = (eventName, cb) => {
-            const domHandler = (e) => {
+            const domHandler = async (e) => {
                 const detail = e.detail;
-                cb(...(Array.isArray(detail) ? detail : [detail]));
+                const unwrapped = await unwrapDocumentHandle(Array.isArray(detail) ? detail : [detail]);
+                cb(...(Array.isArray(unwrapped) ? unwrapped : [unwrapped]));
             };
             window.addEventListener(`sdk:event:${eventName}`, domHandler);
-            const ipcOff = window.electronAPI.ipc.on(eventName, cb);
+            const ipcOff = window.electronAPI.ipc.on(eventName, async (data) => {
+                const unwrapped = await unwrapDocumentHandle(data);
+                cb(unwrapped);
+            });
             let ipcPluginOff = null;
             if (!eventName.startsWith('plugin:event:')) {
-                ipcPluginOff = window.electronAPI.ipc.on(`plugin:event:${eventName}`, cb);
+                ipcPluginOff = window.electronAPI.ipc.on(`plugin:event:${eventName}`, async (data) => {
+                    const unwrapped = await unwrapDocumentHandle(data);
+                    cb(unwrapped);
+                });
             }
             // 注册到本地 callbackMap 供直连 MessagePort 事件分发
             const key = `evt:${eventName}`;
@@ -845,6 +947,8 @@ export function createPluginSDK(pluginId, options) {
             registerItem: (item) => callApi('selectionMenu', 'registerItem', [item]),
             unregisterItem: (id) => callApi('selectionMenu', 'unregisterItem', [id]),
         }),
+        connectPlugin: (targetPluginId, channelName) => connectPluginImpl(targetPluginId, channelName),
+        onPluginConnected: (cb) => onPluginConnectedImpl(cb),
         hooks: createApiProxy('hooks', {
             register: (name, handler, priority) => callApi('hooks', 'register', [name, pluginId, priority ?? 0, handler.toString()]),
             unregister: (name) => callApi('hooks', 'unregister', [name, pluginId]),
@@ -895,4 +999,70 @@ export function createPluginSDK(pluginId, options) {
             getRegisteredTabs: () => callApi('settings', 'getRegisteredTabs'),
         },
     };
+}
+/**
+ * AsyncLock — 极简单 Key 异步排他互斥锁 (Async Mutex Helper)
+ * 适用于插件内部单操作链或局部临界区，无需 Key 标识
+ */
+export class AsyncLock {
+    queue = Promise.resolve();
+    async runExclusive(fn) {
+        const current = this.queue;
+        let release;
+        const next = new Promise((resolve) => {
+            release = resolve;
+        });
+        this.queue = current.finally(() => next);
+        try {
+            await current.catch(() => { });
+            return await fn();
+        }
+        finally {
+            release();
+        }
+    }
+}
+/**
+ * KeyedAsyncLock — 独立按 Key 分组的异步排他互斥锁 (Async Mutex)
+ *
+ * 针对并发请求或临界区，按 Key（如 `sessionId` / `resourceId`）进行排他性队列调度。
+ * 既支持单例 `KeyedAsyncLock.getInstance()`，也支持通过 `new KeyedAsyncLock()` 创建独立实例。
+ */
+export class KeyedAsyncLock {
+    static instance = null;
+    locks = new Map();
+    static getInstance() {
+        if (!KeyedAsyncLock.instance) {
+            KeyedAsyncLock.instance = new KeyedAsyncLock();
+        }
+        return KeyedAsyncLock.instance;
+    }
+    isBusy(key) {
+        return this.locks.has(key);
+    }
+    async runExclusive(key, fn) {
+        const currentLock = this.locks.get(key) || Promise.resolve();
+        let releaseLock;
+        const nextLock = new Promise((resolve) => {
+            releaseLock = resolve;
+        });
+        const chainedLock = currentLock.finally(() => nextLock);
+        this.locks.set(key, chainedLock);
+        try {
+            await currentLock.catch(() => { });
+            return await fn();
+        }
+        finally {
+            releaseLock();
+            if (this.locks.get(key) === chainedLock) {
+                this.locks.delete(key);
+            }
+        }
+    }
+    async runOrSkip(key, fn) {
+        if (this.isBusy(key)) {
+            return null;
+        }
+        return this.runExclusive(key, fn);
+    }
 }

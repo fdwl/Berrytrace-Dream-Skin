@@ -4,16 +4,13 @@
 
 事件根据优先级与类型采用不同的分流通道：
 
-1. **直连高速通道（MessagePort 旁路直连）**：
-   * 适用场景：所有包含高频进度的事件（如 `progress:*` 和 `plugin:silent-setup-progress` 等）以及建立直连后的普通自定义事件。
-   * 通信路径：
-     ```
-     渲染进程 ↔ MessagePort (Port1/Port2 直连) ↔ 后台进程 (utilityProcess/PooledHost)
-     ```
-   * 优势：高频事件自动走直连通道，并在 SDK 内部提供 50ms 时间窗口滑动节流保护，防止渲染队列积压，保证渲染器稳定在 60 FPS 且主进程 Event Loop 零开销。
+1. **P2P 点对点直连通道（MessagePort 旁路直通）**：
+   * 适用场景：插件间高频流式通信（如 `voice-agents` 音频/频谱数据到 `voice-ui-jarvis` 浮球，30~60Hz 传输）。
+   * 建立方法：由消费者/请求方主动调用 `const port = await sdk.connectPlugin(targetPluginId, channelName)`；提供者/服务端通过 `sdk.onPluginConnected((port, peerPluginId) => { ... })` 接收。
+   * 优势：100% 绕过主进程与全局 Event Bus，主进程开销为 0，零 JSON 序列化抖动。
 
 2. **普通系统通道（主进程中转）**：
-   * 适用场景：系统事件和尚未建立直连时的备用通道。
+   * 适用场景：离散控制事件和低频通知。
    * 通信路径：
      ```
      渲染进程                      主进程                       后台进程 (utilityProcess)
@@ -23,41 +20,33 @@
                                                                  → sdk.events.on('xxx') 触发
      ```
 
-## 事件驱动的插件自动唤醒
+## 事件驱动与 `autoWake` 被动唤醒防线
 
-**核心机制**：插件在 `plugin.json` 的 `contributes.events.listens` 中声明关心的事件，宿主根据声明自动管理插件的按需加载。
-
-```
-plugin.json 声明
-  contributes.events.listens → 本插件监听的事件
-  contributes.events.emits   → 本插件发射的事件（声明意图，供 AI 和工具链分析）
-
-启动时
-  → EventSubscriptionRegistry 从所有插件的 listens 构建索引
-  → Map<eventName, Set<pluginId>>
-
-事件触发时
-  → 查询 EventSubscriptionRegistry 找到订阅者
-  → 订阅者已运行 → 直接 sdk:events:on 转发
-  → 订阅者未运行 → ensurePluginLoaded → 创建进程 → 重放触发事件
-```
-
-**示例 plugin.json**：
+**核心机制**：插件在 `plugin.json` 的 `contributes.events.listens` 中声明关心的事件。支持通过 `"autoWake": false` 防范盲目唤醒。
 
 ```json
 {
   "contributes": {
     "events": {
       "listens": [
-        { "name": "agent:step_update", "description": "监听 Agent 步骤状态" },
-        { "name": "workspace:file-changed", "description": "文件变更更新索引" }
-      ],
-      "emits": [
-        { "name": "my-plugin:sync-done", "description": "同步完成通知" }
+        { 
+          "name": "voice:state-broadcast", 
+          "description": "监听语音状态广播",
+          "autoWake": false
+        },
+        { 
+          "name": "voice:activate-ui", 
+          "description": "监听 UI 激活指令",
+          "autoWake": true 
+        }
       ]
     }
   }
 }
+```
+
+* **`autoWake: false` (默认)**：当插件处于休眠/未加载状态时，事件触发**不会盲目启动插件子进程**。仅在插件处于活跃运行状态时才会推送接收消息。
+* **`autoWake: true`**：事件触发时，若插件未运行，主进程会强制唤醒该插件并重放触发事件。
 ```
 
 **关键规则**：

@@ -70,6 +70,7 @@ export interface SdkUi {
   getTheme(): "light" | "dark";
   onThemeChange(listener: (mode: "light" | "dark") => void): () => void;
   registerFont?(familyName: string, url: string, target?: string): void;
+  setTheme?(theme: "light" | "dark" | "system"): void;
   setAppearance?(mode: "light" | "dark" | "auto"): void;
   clearAppearance?(): void;
   setWallpaper(url: string, options?: {
@@ -425,15 +426,21 @@ export async function applySkinViaSDK(
   ALL_THEME_VARS.forEach((v) => root.style.removeProperty(v));
   sdkUi.clearPersistedStyle(SKIN_STYLE_ID.CUSTOM_CSS);
 
-  // ── 0.5. 同步宿主明暗外观 (dark / light) ─────────────────────────────────
-  if (appearance === "dark") {
+  // ── 0.5. 同步宿主明暗外观 (dark / light / system) ─────────────────────────────────
+  if (sdkUi.setTheme) {
+    sdkUi.setTheme(appearance === "auto" ? "system" : appearance);
+  } else if (appearance === "dark") {
     root.classList.add("dark");
     root.classList.remove("light");
+    root.setAttribute("data-theme", "dark");
     if (sdkUi.setAppearance) sdkUi.setAppearance("dark");
   } else if (appearance === "light") {
     root.classList.add("light");
     root.classList.remove("dark");
+    root.setAttribute("data-theme", "light");
     if (sdkUi.setAppearance) sdkUi.setAppearance("light");
+  } else if (appearance === "auto") {
+    if (sdkUi.clearAppearance) sdkUi.clearAppearance();
   }
 
   // ── 1. 色彩 Token CSS ──────────────────────────────────────────────────────
@@ -603,16 +610,6 @@ html.has-wallpaper [role="menu"] {
     sdkUi.clearPersistedStyle(SKIN_STYLE_ID.GLASS);
   }
 
-  if (appearance === "dark" || appearance === "light") {
-    if (sdkUi.setAppearance) {
-      sdkUi.setAppearance(appearance);
-    } else {
-      if (appearance === "dark") document.documentElement.classList.add("dark");
-      else document.documentElement.classList.remove("dark");
-    }
-  } else if (sdkUi.clearAppearance) {
-    sdkUi.clearAppearance();
-  }
 
   if (sdkPlugin) {
     await sdkPlugin.setStartupResident(!!isDynamic);
@@ -654,12 +651,13 @@ export async function clearSkinViaSDK(
   root.classList.remove('has-wallpaper');
 
   // 4. 清除外观覆盖，并还原宿主用户原本保存的主题模式 (dark / light / system)
-  if (sdkUi.clearAppearance) {
-    sdkUi.clearAppearance();
-  }
-
   try {
-    const savedAppTheme = localStorage.getItem('app-theme') || 'system';
+    const savedAppTheme = (localStorage.getItem('app-theme') as 'light' | 'dark' | 'system') || 'system';
+    if (sdkUi.setTheme) {
+      sdkUi.setTheme(savedAppTheme);
+    } else if (sdkUi.clearAppearance) {
+      sdkUi.clearAppearance();
+    }
     const isDark = savedAppTheme === 'dark' || (savedAppTheme === 'system' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     root.classList.toggle('dark', isDark);
     root.setAttribute('data-theme', isDark ? 'dark' : 'light');

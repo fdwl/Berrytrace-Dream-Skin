@@ -3284,8 +3284,12 @@ async function performSdkBuild(pluginPath) {
     };
     if (main2) {
       const srcMain = main2.replace(/^dist\//, "src/").replace(/\.js$/, ".ts");
+      const srcMainTsx = main2.replace(/^dist\//, "src/").replace(/\.js$/, ".tsx");
       const srcMainJs = main2.replace(/^dist\//, "src/");
       let entryPoint = path2.join(pluginPath, srcMain);
+      if (!fs2.existsSync(entryPoint)) {
+        entryPoint = path2.join(pluginPath, srcMainTsx);
+      }
       if (!fs2.existsSync(entryPoint)) {
         entryPoint = path2.join(pluginPath, srcMainJs);
       }
@@ -3480,8 +3484,12 @@ async function performSdkBuild(pluginPath) {
               return {
                 contents: `
                   const React = (typeof window !== 'undefined' ? window : globalThis).React;
-                  export const jsx = React.createElement;
-                  export const jsxs = React.createElement;
+                  export function jsx(type, props, key) {
+                    const config = key !== undefined ? Object.assign({}, props, { key }) : props;
+                    return React.createElement(type, config);
+                  }
+                  export const jsxs = jsx;
+                  export const jsxDEV = jsx;
                   export const Fragment = React.Fragment;
                 `,
                 loader: "js"
@@ -3574,6 +3582,12 @@ async function performSdkBuild(pluginPath) {
                   export const FileText        = _L.FileText;
                   export const Network         = _L.Network;
                   export const Shield          = _L.Shield;
+                  export const ShieldCheck     = _L.ShieldCheck;
+                  export const LayoutDashboard = _L.LayoutDashboard;
+                  export const Crown           = _L.Crown;
+                  export const ArrowUpRight    = _L.ArrowUpRight;
+                  export const PlayCircle      = _L.PlayCircle;
+                  export const Brain           = _L.Brain;
                   export const Key             = _L.Key;
                   export const Clock           = _L.Clock;
                   export const Activity        = _L.Activity;
@@ -3880,6 +3894,18 @@ async function performSdkBuild(pluginPath) {
         }
       });
     }
+    const packageJsonPath = path2.join(pluginPath, "package.json");
+    if (fs2.existsSync(packageJsonPath)) {
+      try {
+        const pkg = JSON.parse(fs2.readFileSync(packageJsonPath, "utf8"));
+        if (pkg.scripts?.postbuild) {
+          const { execSync } = await import("child_process");
+          execSync(pkg.scripts.postbuild, { cwd: pluginPath, stdio: "inherit" });
+        }
+      } catch (postErr) {
+        console.warn("\u26A0\uFE0F \u63D2\u4EF6 postbuild \u811A\u672C\u6267\u884C\u51FA\u73B0\u8B66\u544A:", postErr.message);
+      }
+    }
     console.log(`\u2713 \u63D2\u4EF6 "${id}" \u6784\u5EFA\u6210\u529F\uFF01
 `);
     return { success: true, pluginId: id };
@@ -4162,6 +4188,35 @@ function packPlugin(pluginPath = process.cwd()) {
       });
     });
   } else {
+    const prodDeps = (function getTransitiveProdDeps(dirPath) {
+      const pkgJsonPath = path2.join(dirPath, "package.json");
+      if (!fs2.existsSync(pkgJsonPath)) return /* @__PURE__ */ new Set();
+      const result = /* @__PURE__ */ new Set();
+      try {
+        const pkg = JSON.parse(fs2.readFileSync(pkgJsonPath, "utf8"));
+        const queue = pkg.dependencies ? Object.keys(pkg.dependencies) : [];
+        while (queue.length > 0) {
+          const depName = queue.shift();
+          if (!depName || result.has(depName)) continue;
+          result.add(depName);
+          const depPkgPath = path2.join(dirPath, "node_modules", depName, "package.json");
+          if (fs2.existsSync(depPkgPath)) {
+            try {
+              const depPkg = JSON.parse(fs2.readFileSync(depPkgPath, "utf8"));
+              if (depPkg.dependencies) {
+                for (const subDep of Object.keys(depPkg.dependencies)) {
+                  if (!result.has(subDep)) queue.push(subDep);
+                }
+              }
+            } catch {
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[Packager] Failed to calculate transitive dependencies:", err);
+      }
+      return result;
+    })(pluginPath);
     const hasDist = fs2.existsSync(path2.join(pluginPath, "dist"));
     filesToPack = filesToPack.filter((relPath) => {
       const normalizedPath = relPath.replace(/\\/g, "/");
@@ -4181,27 +4236,15 @@ function packPlugin(pluginPath = process.cwd()) {
         if (pluginPath.includes(".berrytrace") && pluginPath.includes("pack-")) {
           return true;
         }
-        try {
-          const pkgJsonPath = path2.join(pluginPath, "package.json");
-          if (fs2.existsSync(pkgJsonPath)) {
-            const pkg = JSON.parse(fs2.readFileSync(pkgJsonPath, "utf8"));
-            const deps = pkg.dependencies ? Object.keys(pkg.dependencies) : [];
-            const subPart = parts[1];
-            if (subPart) {
-              if (subPart.startsWith("@")) {
-                const scopeName = `${subPart}/${parts[2]}`;
-                if (deps.some((d) => d === scopeName || d.startsWith(scopeName + "/"))) {
-                  return true;
-                }
-              } else {
-                if (deps.some((d) => d === subPart || d.startsWith(subPart + "/"))) {
-                  return true;
-                }
-              }
-            }
+        const subPart = parts[1];
+        if (subPart) {
+          let pkgName = subPart;
+          if (subPart.startsWith("@") && parts[2]) {
+            pkgName = `${subPart}/${parts[2]}`;
           }
-        } catch (err) {
-          console.warn("[Packager] Failed to filter node_modules dependencies:", err);
+          if (prodDeps.has(pkgName) || Array.from(prodDeps).some((d) => pkgName.startsWith(d + "/"))) {
+            return true;
+          }
         }
         return false;
       }

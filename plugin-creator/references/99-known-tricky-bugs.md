@@ -6,118 +6,53 @@
 
 ---
 
-## Bug #001 — `AnimatePresence` 子元素缺少 `key` prop
+## Bug #001 — `AnimatePresence` 子元素提示缺少 `key` prop
 
-**严重程度**：⚠️ 低（不影响功能，但持续刷 warning，干扰调试）  
-**复现次数**：已复现 5+ 次（2026-07 前后多次反复修复）  
-**影响范围**：所有使用 `framer-motion` / `motion/react` 的插件和宿主组件
+**严重程度**：⚠️ 低（不影响运行，但干扰控制台日志）  
+**影响范围**：所有使用 `framer-motion` 动画组件的插件 View
 
 ### 错误症状
 
 ```
 Each child in a list should have a unique "key" prop.
-Check the render method of `ForwardRef(motion.div)`.
-See https://react.dev/link/warning-keys for more information.
+Check the render method of `AnimatePresence`.
 ```
 
-调用堆栈通常形如：
+### ✅ 使用规范与避免方式
 
-```
-sv @ index.js
-a @ index.js
-<ForwardRef(motion.div)>
-Uv @ index.js          ← framer-motion 内部
-Se @ index.js          ← AnimatePresence
-yh @ index.js
-onOpen @ SomeView.tsx  ← 插件 View 的挂载入口
-```
+1. **直接子元素必须带唯一 `key`**：
+   `<AnimatePresence>` 的直接子元素（如 `<motion.div>`）必须指定唯一、稳定的 `key` 属性（如 `key={currentStep}` 或 `key="panel-active"`）。
 
-### 根本原因
+2. **步骤切换 / 多 Tab 场景推荐使用 Component 映射表**：
+   对于步骤切换或多选项卡场景，推荐使用声明式 Component 映射表分发：
 
-`AnimatePresence` 需要追踪每个子元素的"进入 / 存在 / 离开"状态来执行动画。因此，它的**所有直接子元素都必须有唯一 `key`**。
+   ```tsx
+   const STEP_COMPONENTS: Record<number, React.ComponentType> = {
+     1: WelcomeStep,
+     2: WorkspaceStep,
+     3: ModelConfigStep,
+   }
 
-问题高发的两种模式：
+   const ActiveStep = STEP_COMPONENTS[currentStep] || WelcomeStep
 
-**模式 A：条件渲染的 `motion.div` 忘加 key**
+   <AnimatePresence mode="wait">
+     <motion.div key={`step-${currentStep}`} className="w-full h-full">
+       <ActiveStep />
+     </motion.div>
+   </AnimatePresence>
+   ```
 
-```tsx
-// ❌ 错误 — AnimatePresence 里的 motion.div 没有 key
-<AnimatePresence>
-  {isVisible && (
-    <motion.div          // ← ⚠️ 缺少 key！
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-    >
-      内容
-    </motion.div>
-  )}
-</AnimatePresence>
-```
-
-**模式 B：三元运算符两个分支，空状态分支忘加 key**
-
-```tsx
-// ❌ 错误 — 空状态 <div> 没有 key
-<AnimatePresence initial={false}>
-  {items.length === 0 ? (
-    <div className="empty-state">  // ← ⚠️ 缺少 key！
-      暂无数据
-    </div>
-  ) : (
-    items.map(item => (
-      <motion.div key={item.id} ...>  // ← ✅ 这里有 key
-      </motion.div>
-    ))
-  )}
-</AnimatePresence>
-```
-
-### ✅ 正确写法
-
-```tsx
-// ✅ 正确 — 条件渲染的 motion.div 有 key
-<AnimatePresence>
-  {isVisible && (
-    <motion.div
-      key="my-panel"       // ← 必须有语义化的 key
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-    >
-      内容
-    </motion.div>
-  )}
-</AnimatePresence>
-
-// ✅ 正确 — 三元运算符每个分支都有 key
-<AnimatePresence initial={false}>
-  {items.length === 0 ? (
-    <div key="empty-state" className="empty-state">
-      暂无数据
-    </div>
-  ) : (
-    items.map(item => (
-      <motion.div key={item.id} ...>
-      </motion.div>
-    ))
-  )}
-</AnimatePresence>
-```
-
-### 防止复现的检查清单
-
-**每次写 `<AnimatePresence>` 之后，立即执行以下检查：**
-
-- [ ] 是否每个直接子元素都有 `key`？
-- [ ] 条件渲染（`&&`、`? :`）的**每个分支**都有 `key`？
-- [ ] `.map()` 返回的元素有 `key`？（通常已有，但也要确认）
-- [ ] `key` 值是否稳定、语义化（不要用 `Math.random()` 或数组 index 作为 key）？
+3. **修改后生效规则**：
+   修改插件代码后，需运行以下命令完成单插件增量编译与宿主热重载：
+   ```bash
+   npm run build:plugin <plugin-name>
+   ```
 
 ### 历史修复记录
 
 | 日期 | 文件 | 修复内容 |
 |------|------|---------|
+| 2026-07-30 | `builtin-plugins/berrytrace-online/src/views/onboarding/OnboardingWizard.tsx` | 修复并排 `&&` 短路及预实例化 JSX 缺失 key 问题：映射表改为 ComponentType + `<StepComponent key={...} />` 并重新 `npm run build:plugin` |
 | 2026-07-29 | `voice-agents/jarvis-ai-voice-dialog/src/App.tsx` | 4 处 `AnimatePresence` 内 `motion.div` 缺 key |
 | 2026-07-29 | `voice-agents/jarvis-ai-voice-dialog/src/components/RemindersList.tsx` | 空状态 `<div>` 缺 key |
 | 2026-07-29 | `typeless-keyboard-shortcut-guide/src/components/SandboxWorkspace.tsx` | `motion.div` 缺 key |
@@ -355,6 +290,71 @@ background 进程调用 `sdk.events.emit('my:event', data)` 后，panel（UI）�
 ```
 
 **注意**：`emits`（我发射）和 `listens`（我接收）是两个独立字段，两者默认都不转发，必须显式声明。
+
+---
+
+## Bug #008 — 插件自定义协议 `berrytrace-plugin://` 动态加载 `.mjs` / WebAssembly 模块被拦截
+
+**严重程度**：🔴 高（导致 ONNX Runtime / VAD 无法初始化，语音/算法核心崩溃）  
+**复现次数**：已复现 1+ 次（2026-07-31）  
+**影响范围**：包含 WASM / `.mjs` 动态模块依赖的插件（如 voice-agents、VAD、WebAssembly AI 引擎）
+
+### 错误症状
+
+```
+Failed to load module script: Expected a JavaScript-or-Wasm module script but the server responded with a MIME type of "application/octet-stream". Strict MIME type checking is enforced for module scripts per HTML spec.
+[VoiceCoreEngine:setupMicVAD:FAILED] Error: no available backend found.
+```
+
+### 根本原因
+
+1. 插件中动态 `import()` 加载 `.mjs` 脚本或 WASM 模板（如 `ort-wasm-simd-threaded.mjs`）。
+2. 宿主自定义协议 `berrytrace-plugin://` 在响应请求时，MIME 类型判断逻辑缺少 `.mjs` 和 `.wasm` 识别，回退为 `application/octet-stream`。
+3. Chromium 渲染进程依据 HTML 规范对 ESM 模块注入执行严格 MIME 类型校验 (Strict MIME Type Checking)，拒绝加载非 `application/javascript` 或 `text/javascript` 类型的脚本，导致后端加载失败。
+
+### ✅ 解决方案（SSOT 动态 MIME 类型解析与二进制 fallback 校验）
+
+宿主已在 [protocol-handler.ts](file:///Users/li/work/work/berrytrace_app/electron/services/protocol-handler.ts) 中重构了 `getMimeType(filePath, buffer)`：
+1. **已知类型映射表 (`KNOWN_MIME_MAP`)**：覆盖标准 Web 脚本（.mjs/.cjs/.wasm）、压缩包（.zip/.rar/.7z/.tar）、文档（.pdf/.docx）、媒体（.mp4/.mp3/.webp）、AI 模型（.onnx/.pth/.safetensors/.gguf）等全量文件格式；
+2. **未知自定义格式动态探测 (`isBinaryBuffer`)**：对于未预设的自定义扩展名（如 `.dat`, `.mydata`），自动采样文件前 1024 字节判断是否存在 `0x00` 空字节：
+   * 包含 `0x00` ➔ 判定为二进制文件 `application/octet-stream`
+   * 无 `0x00` ➔ 判定为文本文件 `text/plain; charset=utf-8`
+
+```typescript
+const mimeType = getMimeType(fullPath, data);
+```
+
+---
+
+## Bug #009 — `keybindings` 绑定了 Command 但未注册 `shortcutActions` 导致 `Action not found`
+
+**严重程度**：⚠️ 低（打印控制台 Warning，手势可能无法触发界面联动）  
+**复现次数**：已复现 1+ 次（2026-07-31）  
+**影响范围**：所有绑定物理手势/长按快捷键的插件
+
+### 错误症状
+
+```
+[ShortcutActionRegistry] Action not found: com.berrytrace.plugin.voice-agents:ptt-start
+```
+
+### 根本原因
+
+在 `plugin.json` 的 `contributes.keybindings` 中配置了快捷键/手势映射到的 `command` ID（如 `ptt-start`），但在 `contributes.shortcutActions` 列表中未申明对应的 Action ID 与描述元数据，导致 `ShortcutActionRegistry` 查找失败报警。
+
+### ✅ 解决方案
+
+在 `plugin.json` 的 `contributes.shortcutActions` 中补全所有关联 Command 的 Action 注册：
+
+```json
+"shortcutActions": [
+  {
+    "id": "com.berrytrace.plugin.voice-agents:ptt-start",
+    "label": "按键通话 — 按住开始录音",
+    "icon": "<svg>...</svg>"
+  }
+]
+```
 
 ---
 

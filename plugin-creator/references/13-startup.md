@@ -126,6 +126,70 @@
 - 子窗口销毁
 - 文件句柄释放
 
+## activate(context) 生命周期钩子参数
+
+在插件的 `main` 入口中，`activate(context)` 接收宿主传递的 `context` 生命周期上下文：
+
+```typescript
+export interface PluginLifecycleContext {
+  action: 'install' | 'initial-load' | 'enable' | 'disable' | 'uninstall' | 'reload' | 'normal';
+  loadMode: 'setup' | 'normal';
+  updatedAt: string;
+  trigger?: {
+    eventName: string;
+    payload: unknown;
+  };
+}
+
+export async function activate(context?: PluginLifecycleContext): Promise<void> {
+  console.log(`[my_plugin] 激活运行，触发动作: ${context?.action || 'normal'}`);
+
+  // 1. 判断是否为首次安装 (install) 或缓存缺失
+  const isFirstInstall = context?.action === 'install';
+  
+  if (isFirstInstall) {
+    // 首次安装：执行全量环境探索/初始化建图，生成本地缓存与声明文件
+    await performInitialSetupAndCaching();
+  } else {
+    // 按需唤醒：检查 48h TTL 缓存，效期内直接复用缓存，跳过昂贵搜盘
+    await loadWithTtlCache();
+  }
+}
+```
+
+### 生命周动作 (`context.action`) 说明：
+
+| action | 触发场景 | 插件推荐行为 |
+| :--- | :--- | :--- |
+| **`'install'`** | 用户或系统首次安装该插件 | **强制全量初始化**：搜盘环境、建立初始数据库、生成 `declared-contributions.json` |
+| **`'initial-load'`** | 软件启动时的首次加载 | 优先读取本地缓存，验证效期，快速响应 |
+| **`'enable'`** | 用户在设置中手动启用插件 | 恢复背景服务与事件监听 |
+| **`'disable'`** | 用户在设置中手动禁用插件 | 清理定时器，关闭连接 |
+| **`'reload'`** | 开发者热重载 (`berrytrace-cli reload`) | 重置本地变量，重新加载新配置 |
+| **`'normal'`** | 响应事件 / 按需唤醒 | 执行特定任务 |
+
+---
+
+## 动态生成式声明文件 (Generative Declared Contributions)
+
+为了兼顾“零开机开销”与“动态菜单/视图暴露”，插件可在首次安装 (`install`) 或首次激活时，将扫描到的环境贡献写入数据目录：
+
+- **保存路径**：`pluginData/<cleanPluginId>/.berrytrace/declared-contributions.json`
+- **文件格式**：
+  ```json
+  {
+    "contributes": {
+      "tabCreateMenuItems": [ ... ],
+      "subagents": [ ... ]
+    }
+  }
+  ```
+
+**宿主工作机制**：
+宿主启动在 `PluginScanner` 阶段解析 `plugin.json` 时，会自动尝试读取该 `declared-contributions.json` 并与 manifest 的 `contributes` 进行深度合并。**这意味着下次应用启动时，即使插件完全不被拉起运行，宿主也能静态感知并展示插件探出的菜单、Sub-Agent 与 Tab 项！**
+
+---
+
 ## 完整加载流程
 
 ```
@@ -135,7 +199,7 @@ app.whenReady()
   → PluginManager.initDeferred()       // Phase 3: 普通插件
       → PluginLauncher.spawn()          // utilityProcess 后台进程
       → SDK 初始化（createPluginSDK）
-      → activate()
+      → activate(context)               // 传入 context.action ('install' | 'normal' ...)
       → 注册 MCP 工具/回调
   → 定期检查热重载
 ```

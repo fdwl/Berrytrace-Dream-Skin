@@ -18,8 +18,11 @@
 | `registerFont(familyName, url, target?)` | 注册自定义字体 | ❌ | ❌ |
 | `setWallpaper(url, options?)` | 设置全屏壁纸（激活 has-wallpaper class） | ✅ | ✅ |
 | `clearWallpaper()` | 清除壁纸并恢复默认背景 | ✅ | ✅ |
-| `getTheme()` | 获取当前主题模式 | — | — |
+| `getTheme()` | 获取当前主题模式 (`light` \| `dark`) | — | — |
 | `onThemeChange(listener)` | 监听 Light/Dark 切换 | — | — |
+| `setTheme(theme)` | 设置宿主主题模式 (`light` \| `dark` \| `system`) | ✅ | ✅ |
+| `setAppearance(mode)` | 临时覆盖外观模式 (`light` \| `dark` \| `auto`) | ✅ | ✅ |
+| `clearAppearance()` | 清除外观覆盖 | ✅ | ✅ |
 
 ---
 
@@ -197,6 +200,26 @@ sdk.ui.setToken('--color-brand', '#e85d75', true);
 
 ---
 
+## 主题与外观模式切换 (setTheme / setAppearance)
+
+当插件需要修改系统/宿主整体主题模式时，请使用 `sdk.ui.setTheme(mode)`。
+
+```ts
+// 将系统主题切换为暗色模式
+sdk.ui.setTheme('dark');
+
+// 将系统主题切换为亮色模式
+sdk.ui.setTheme('light');
+
+// 恢复跟随系统 (system)
+sdk.ui.setTheme('system');
+```
+
+- **`sdk.ui.setTheme(mode: 'light' | 'dark' | 'system')`**: 修改宿主的主题模式（同步更新 `app-theme` 本地存储、DOM 根 class、主进程 Native Theme 缓存并广播给所有窗口）。
+- **`sdk.ui.setAppearance(mode: 'light' | 'dark' | 'auto')`**: 适用于皮肤/Skin 插件临时覆盖渲染外观（不改变用户的系统主题偏好设置）。
+
+---
+
 ## 窗口作用域控制（按窗口差异化样式）
 
 宿主每个窗口的 `<html>` 根节点有唯一的 CSS class，插件可据此精确控制哪个窗口应用哪些样式。
@@ -309,3 +332,56 @@ App 启动
 | 毛玻璃效果没有 | 宿主不强制施加毛玻璃 | 插件自行 `injectStyle` 添加 `backdrop-filter` |
 | 字体加载但未生效 | 没有绑定到 `--font-sans` / `--font-mono` | `registerFont(name, url, '--font-sans')` |
 | 动态皮肤重启后不自动运行 | plugin.json 没有 `activationEvents` | 用 `sdk.plugin.setStartupResident(true)` 动态设置 |
+
+---
+
+## 插件 UI 微交互一致性规范
+
+插件 UI（`plugins-dev/<plugin-id>/src/`）由宿主 Tailwind **统一编译**，可直接使用以下宿主原语，无需额外安装依赖。
+
+### 可直接使用的宿主交互 Utility 类
+
+| Utility 类 | 适用场景 | 效果 |
+|-----------|---------|------|
+| `interactive-item` | 列表行、菜单项、设置行 | hover 背景 + 150ms 过渡 |
+| `interactive-card` | 卡片、选项块、大容器 | hover 阴影 + 按下轻微缩放 |
+| `interactive-icon` | 纯图标小按钮（非 `<Button>`） | hover 背景 + 100ms 过渡 |
+
+皮肤插件修改 `--accent` Token 后，三个类**自动跟随变色**，插件无需任何额外处理。
+
+### 插件中正确写法
+
+```tsx
+// ✅ 插件列表行：直接使用宿主 utility 类，皮肤主题自动跟随
+<div className="interactive-item px-3 py-2 rounded-lg" onClick={handleClick}>
+  <span className="text-sm text-foreground">Item Label</span>
+</div>
+
+// ✅ 插件卡片：interactive-card + 自定义内边距
+<div className="interactive-card p-4 rounded-xl bg-card border border-border" onClick={openDetail}>
+  <CardContent />
+</div>
+
+// ✅ 插件图标按钮（非 Shadcn Button）
+<div className="interactive-icon p-1.5 rounded-md" onClick={refresh} title="刷新">
+  <RefreshCw className="size-4 text-muted-foreground" />
+</div>
+```
+
+### 插件中禁止写法
+
+```tsx
+// ❌ 手写不一致的 hover/active（每个插件行为不同，皮肤无法统一覆盖）
+<div
+  className="cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800 active:scale-95"
+  onClick={handleClick}
+>
+```
+
+### Motion Token（插件同样可用）
+
+```tsx
+// ✅ 使用宿主 Motion Token（统一全站动画节奏）
+<div className="transition-colors duration-base">...</div>
+<div className="transition-all duration-fast ease-spring">...</div>
+```
