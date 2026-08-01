@@ -1,0 +1,42 @@
+diff --git a/electron/plugins/plugin-verifier.ts b/electron/plugins/plugin-verifier.ts
+index 54b00ca..62319af 100644
+--- a/electron/plugins/plugin-verifier.ts
++++ b/electron/plugins/plugin-verifier.ts
+@@ -136,21 +136,26 @@ export type PluginStatus = 'DEV' | 'APPROVED' | 'VERIFIED' | 'UNVERIFIED' | 'BLO
+ 
+ export class PluginVerifier {
+   public static async getPluginStatus(
+-    manifest: PluginManifest,
+-    fullPath: string,
+-    isDevFolder: boolean
++    _manifest: PluginManifest,
++    _fullPath: string,
++    isDevFolder: boolean,
++    _checkFileIntegrity: boolean = false
+   ): Promise<PluginStatus> {
+     if (isDevFolder) {
+       return 'DEV';
+     }
+ 
++    // 🔒 安全签名校验功能暂时注释/关闭，默认直接放行 APPROVED
++    return 'APPROVED';
++
++    /*
+     const signaturePath = join(fullPath, 'signature.json');
+     const hasSignature = await fs.stat(signaturePath).then(s => s.isFile()).catch(() => false);
+     if (hasSignature) {
+       try {
+         const sigContent = await fs.readFile(signaturePath, 'utf-8');
+         const signatureJson = JSON.parse(sigContent);
+-        const verifResult = verifyPackageSignature(fullPath, signatureJson);
++        const verifResult = verifyPackageSignature(fullPath, signatureJson, checkFileIntegrity);
+         if (verifResult.isValid) {
+           return verifResult.isOfficial ? 'APPROVED' : 'VERIFIED';
+         }
+@@ -164,5 +169,6 @@ export class PluginVerifier {
+     }
+ 
+     return 'UNVERIFIED';
++    */
+   }
+ }

@@ -1,0 +1,174 @@
+import { join } from 'path';
+import { promises as fs } from 'fs';
+import { verifyPluginSignature, verifyPackageSignature } from './signature-verifier';
+
+export interface PluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  description?: string;
+  scope?: 'workspace' | 'global';
+  main: string;
+  permissions?: string[];
+  mcp?: Record<string, unknown>;
+  signature?: string;
+  fileAssociations?: string[];
+  triggerPrefix?: string | string[];
+  quickPanelMode?: 'window' | 'embedded';
+  view?: string;
+  settingsSchema?: Record<string, unknown>;
+  auth?: {
+    provider: string;
+    required?: boolean;
+    scopes?: string[];
+    [key: string]: unknown;
+  };
+  type?: string;
+  keywords?: string[];
+  documentCreators?: Array<{
+    id?: string;
+    label: string;
+    extension: string;
+    defaultFileName?: string;
+    description?: string;
+  }>;
+  disableDefaultDrag?: boolean;
+  supportTabs?: boolean;
+  startupPriority?: 'high' | 'normal';
+  /** 常驻插件：不会被空闲回收，启动时预加载。在 plugin.json 中声明 "resident": true */
+  resident?: boolean;
+  uiMode?: 'iframe' | 'webContentsView';
+  /**
+   * 进程隔离等级（声明式）
+   * - required:     必须独立进程（AI 引擎、任意代码执行类插件）
+   * - recommended:  建议独立，主进程可在低内存时降级（原生模块、网络 I/O 密集型）
+   * - optional:     可共享进程（纯计算/轻量插件），默认值
+   */
+  processIsolation?: 'required' | 'recommended' | 'optional';
+  windowScope?: string | string[];
+  nativeElectron?: boolean;
+  /** 限制插件进程 V8 堆内存上限 (MB) */
+  memoryLimit?: number;
+  agentKernel?: {
+    protocol: string;
+    capabilities: string[];
+  };
+  berrytrace?: {
+    id: string;
+    label?: string;
+    icon?: string;
+    startupPriority?: 'high' | 'normal';
+    requiredFiles?: Array<{ path: string; minSize: number }>;
+  };
+  activationEvents?: string[];
+  /**
+   * 插件空闲回收超时时间（毫秒），可选。
+   * 默认使用全局 5 分钟 (300000ms)。
+   */
+  idleTimeout?: number;
+  contributes?: {
+    selectionMenuItems?: Array<{
+      id: string;
+      label: string;
+      icon?: string;
+      viewType?: string;
+      [key: string]: unknown;
+    }>;
+    shortcutActions?: Array<{
+      id: string;
+      label: string;
+      icon?: string;
+      [key: string]: unknown;
+    }>;
+    ribbonIcons?: Array<{
+      id: string;
+      icon: string;
+      label: string;
+      command: string;
+      contextAction?: string;
+      windowScope?: string | string[];
+      [key: string]: unknown;
+    }>;
+    commands?: Array<{
+      command: string;
+      title: string;
+      category?: string;
+      [key: string]: unknown;
+    }>;
+    workspaceViews?: Array<{
+      id: string;
+      title: string;
+      view: string;
+      [key: string]: unknown;
+    }>;
+    folderContextMenuItems?: Array<{
+      id: string;
+      label: string;
+      command: string;
+      [key: string]: unknown;
+    }>;
+    events?: {
+      emits?: Array<{ name: string; description?: string }>;
+      listens?: Array<{ name: string; description?: string }>;
+    };
+    views?: Array<{
+      viewType: string;
+      placement?: { type: string; label?: string; icon?: string; order?: number };
+      [key: string]: unknown;
+    }>;
+    settingsSections?: Array<{
+      id: string;
+      targetTab: string;
+      label?: string;
+      viewClassName: string;
+      order?: number;
+      [key: string]: unknown;
+    }>;
+    voiceHandlers?: Array<{
+      priority?: number;
+      [key: string]: unknown;
+    }>;
+    [key: string]: unknown;
+  };
+}
+
+export type PluginStatus = 'DEV' | 'APPROVED' | 'VERIFIED' | 'UNVERIFIED' | 'BLOCKED';
+
+export class PluginVerifier {
+  public static async getPluginStatus(
+    _manifest: PluginManifest,
+    _fullPath: string,
+    isDevFolder: boolean,
+    _checkFileIntegrity: boolean = false
+  ): Promise<PluginStatus> {
+    if (isDevFolder) {
+      return 'DEV';
+    }
+
+    // 🔒 安全签名校验功能暂时注释/关闭，默认直接放行 APPROVED
+    return 'APPROVED';
+
+    /*
+    const signaturePath = join(fullPath, 'signature.json');
+    const hasSignature = await fs.stat(signaturePath).then(s => s.isFile()).catch(() => false);
+    if (hasSignature) {
+      try {
+        const sigContent = await fs.readFile(signaturePath, 'utf-8');
+        const signatureJson = JSON.parse(sigContent);
+        const verifResult = verifyPackageSignature(fullPath, signatureJson, checkFileIntegrity);
+        if (verifResult.isValid) {
+          return verifResult.isOfficial ? 'APPROVED' : 'VERIFIED';
+        }
+      } catch (err) {
+        console.error(`[PluginVerifier] Failed to verify signature.json at ${signaturePath}:`, err);
+      }
+    }
+
+    if (verifyPluginSignature(manifest)) {
+      return 'APPROVED';
+    }
+
+    return 'UNVERIFIED';
+    */
+  }
+}

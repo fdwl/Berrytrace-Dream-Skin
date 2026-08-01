@@ -1,0 +1,966 @@
+diff --git a/src/views/plugins/workspace/BrowserTabPanel.tsx b/src/views/plugins/workspace/BrowserTabPanel.tsx
+index 2fe92be..365c598 100644
+--- a/src/views/plugins/workspace/BrowserTabPanel.tsx
++++ b/src/views/plugins/workspace/BrowserTabPanel.tsx
+@@ -1,16 +1,37 @@
+ /**
+- * BrowserTabPanel — 沙盒化 DOM 原生 <webview> 架构下的浏览器 Tab 面板
+- *
+- * 采用与 Orca 架构一致的 <webview> 标签方案：
+- *   1. 嵌入 HTML DOM 节点树，遵循 CSS 布局与 z-index 层级
+- *   2. 下拉菜单、Modal 弹窗、Quick Panel 自然浮在网页上方，决不穿透
+- *   3. 结合主窗口 sandbox: true 与 partition 隔离，防止 WASM/WebGL 崩溃扩散
+- *   4. Tab 切换由 CSS display 切换，状态完美留存
++ * BrowserTabPanel — DOM 原生 <webview> 结合 Orca 高级交互引擎 (极致体验完美版)
+  */
+ 
+-import { useEffect, useRef, useState, useCallback } from 'react';
++import React, { useEffect, useRef, useState, useCallback } from 'react';
++import {
++  ArrowLeft,
++  ArrowRight,
++  RotateCw,
++  Home,
++  ExternalLink,
++  Target,
++  MessageSquarePlus,
++  Pencil,
++  CheckCircle2,
++  Send,
++  Trash2,
++  X,
++  Bug,
++} from 'lucide-react';
+ import { useWorkspaceStore } from '../../../stores/workspace';
+ import { useAppStore } from '../../../stores/app';
++import { useBrowserHistoryStore } from '../../../stores/browserHistory';
++import { BrowserAddressBar } from './components/BrowserAddressBar';
++import { BrowserImportHintButton } from './components/BrowserImportHintButton';
++import { BrowserAnnotationSheet } from './components/BrowserAnnotationSheet';
++import { GrabConfirmationSheet } from './components/GrabConfirmationSheet';
++import { MarkupOverlay } from './components/markup/MarkupOverlay';
++import {
++  buildGuestOverlayScript,
++  buildRenderPinsScript,
++  formatGrabPayloadAsMarkdown,
++  formatAnnotationAsMarkdown,
++} from './utils/grab-guest-script';
+ 
+ interface BrowserTabPanelProps {
+   tabId: string;
+@@ -18,35 +39,143 @@ interface BrowserTabPanelProps {
+   customParams?: Record<string, any>;
+ }
+ 
++export interface SavedAnnotation {
++  id: string;
++  payload: any;
++  comment: string;
++  intent: string;
++}
++
+ export default function BrowserTabPanel({ tabId, visible, customParams }: BrowserTabPanelProps) {
+   const webviewRef = useRef<any>(null);
+-  const theme = useAppStore(state => state.theme);
++  const webviewContainerRef = useRef<HTMLDivElement | null>(null);
++  const theme = useAppStore((state) => state.theme);
++  const addHistoryEntry = useBrowserHistoryStore((s) => s.addHistoryEntry);
++  const updateHistoryTitle = useBrowserHistoryStore((s) => s.updateHistoryTitle);
+ 
+   const initialUrl = customParams?.initialUrl || 'https://www.google.com';
+   const [address, setAddress] = useState(initialUrl);
+-  const [inputAddress, setInputAddress] = useState(initialUrl);
+   const [isLoading, setIsLoading] = useState(false);
+   const [canGoBack, setCanGoBack] = useState(false);
+   const [canGoForward, setCanGoForward] = useState(false);
+ 
+-  // ── 1. 绑定原生 <webview> 事件 ────────────────────────────────────────────────
++  const [toastMessage, setToastMessage] = useState<string | null>(null);
++
++  // ── Mode Toggles ──────────────────────────────────────────────────────────
++  const [isGrabActive, setIsGrabActive] = useState(false);
++  const isGrabActiveRef = useRef(isGrabActive);
++  isGrabActiveRef.current = isGrabActive;
++
++  const [isAnnotateActive, setIsAnnotateActive] = useState(false);
++  const isAnnotateActiveRef = useRef(isAnnotateActive);
++  isAnnotateActiveRef.current = isAnnotateActive;
++
++  // Active Payloads & Annotations State
++  const [activeGrabPayload, setActiveGrabPayload] = useState<any | null>(null);
++  const [pendingAnnotationPayload, setPendingAnnotationPayload] = useState<any | null>(null);
++  const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null);
++  const [annotations, setAnnotations] = useState<SavedAnnotation[]>([]);
++  const annotationsRef = useRef(annotations);
++  annotationsRef.current = annotations;
++
++  const [markupBaseUrl, setMarkupBaseUrl] = useState<string | null>(null);
++
++  const showToast = (msg: string) => {
++    setToastMessage(msg);
++    setTimeout(() => setToastMessage(null), 3000);
++  };
++
++  // Helper: Open Dedicated Webview DevTools Window
++  const handleOpenWebviewDevTools = () => {
++    const webview = webviewRef.current;
++    if (!webview) return;
++    try {
++      if (typeof webview.openDevTools === 'function') {
++        webview.openDevTools();
++        showToast('已成功打开 Webview 独立开发者工具控制台！');
++        console.log('🚀 [BrowserTabPanel] Webview openDevTools() invoked successfully.');
++      } else {
++        showToast('当前 Webview 不支持 openDevTools');
++      }
++    } catch (err) {
++      console.error('🚨 [BrowserTabPanel:ERROR] Error opening Webview DevTools:', err);
++    }
++  };
++
++  // ── Sync Guest Page Pins ──────────────────────────────────────────────────
++  const updateGuestPins = useCallback(() => {
++    const webview = webviewRef.current;
++    if (!webview) return;
++    const pinData = annotationsRef.current.map((a) => ({
++      id: a.id,
++      selector: a.payload.target.selector,
++      comment: a.comment,
++      intent: a.intent,
++    }));
++    try {
++      webview.executeJavaScript(buildRenderPinsScript(pinData)).catch(() => {});
++    } catch {}
++  }, []);
++
++  useEffect(() => {
++    updateGuestPins();
++  }, [annotations, updateGuestPins]);
++
++  // Helper: Dispatch Pasted Snippet or Attachment Mention Chip to Agent ChatInput
++  const dispatchAttachmentMention = async (filename: string, content: string, isBase64 = false) => {
++    if (isBase64) {
++      if (!window.electronAPI?.callApi) return;
++      try {
++        const res: any = await window.electronAPI.callApi('browser', 'saveTempAttachment', [
++          { filename, content, isBase64: true },
++        ]);
++        if (res?.ok && res.relativePath) {
++          window.dispatchEvent(
++            new CustomEvent('insert-agent-chat-input-mention', {
++              detail: {
++                title: filename,
++                relativePath: res.relativePath,
++              },
++            })
++          );
++        }
++      } catch (err) {
++        console.error('[BrowserTabPanel] Error saving attachment:', err);
++      }
++    } else {
++      // Pure text or Markdown -> Add Pasted Snippet Chip
++      window.dispatchEvent(new CustomEvent('insert-agent-chat-input', { detail: content }));
++    }
++  };
++
++  // ── 1. Webview Event Handling & Input Event Interception ───────────────────
+   useEffect(() => {
+     const webview = webviewRef.current;
+     if (!webview) return;
+ 
+-    const handleStartLoading = () => setIsLoading(true);
++    const handleStartLoading = () => {
++      setIsLoading(true);
++      if (isGrabActiveRef.current) {
++        setIsGrabActive(false);
++        setActiveGrabPayload(null);
++      }
++    };
+     const handleStopLoading = () => {
+       setIsLoading(false);
+       setCanGoBack(webview.canGoBack?.() || false);
+       setCanGoForward(webview.canGoForward?.() || false);
++      updateGuestPins();
++      if (isGrabActiveRef.current || isAnnotateActiveRef.current) {
++        webview.executeJavaScript(buildGuestOverlayScript('arm')).catch(() => {});
++      }
+     };
+ 
+     const handleNavigate = (e: any) => {
+       const url = e.url;
+       if (url) {
+         setAddress(url);
+-        setInputAddress(url);
+         useWorkspaceStore.getState().updateTabConfig(tabId, { customParams: { initialUrl: url } });
++        addHistoryEntry(url);
+       }
+       setCanGoBack(webview.canGoBack?.() || false);
+       setCanGoForward(webview.canGoForward?.() || false);
+@@ -55,6 +184,7 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+     const handleTitleUpdate = (e: any) => {
+       if (e.title?.trim()) {
+         useWorkspaceStore.getState().updateTabName(tabId, e.title);
++        if (address) updateHistoryTitle(address, e.title);
+       }
+     };
+ 
+@@ -67,156 +197,666 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+       }
+     };
+ 
+-    const handleCrashed = (e: any) => {
+-      setIsLoading(false);
+-      console.warn(`[BrowserTabPanel:${tabId}] Webview guest crashed/gone:`, e);
++    const handleDomReady = () => {
++      const isDark = document.documentElement.classList.contains('dark') || theme === 'dark';
++      if (isDark) {
++        try {
++          webview.insertCSS(`:root { color-scheme: dark; }`).catch(() => {});
++        } catch {}
++      }
++      updateGuestPins();
++    };
++
++    // Console Message Listener for Pin Click re-editing
++    const handleConsoleMessage = (e: any) => {
++      const msg = e.message || '';
++      if (msg.startsWith('BERRYTRACE_PIN_CLICK:')) {
++        const pinId = msg.split('BERRYTRACE_PIN_CLICK:')[1]?.trim();
++        if (pinId) {
++          const found = annotationsRef.current.find((a) => a.id === pinId);
++          if (found) {
++            setEditingAnnotationId(found.id);
++            setPendingAnnotationPayload(found.payload);
++          }
++        }
++      }
++    };
++
++    const handleBeforeInput = async (e: any) => {
++      if (!isGrabActiveRef.current) return;
++      const input = e.input;
++      if (!input || input.type !== 'keyDown') return;
++      const key = input.key ? input.key.toLowerCase() : '';
++
++      if (key === 'escape') {
++        setIsGrabActive(false);
++        setActiveGrabPayload(null);
++        webview.executeJavaScript(buildGuestOverlayScript('teardown')).catch(() => {});
++        showToast('已退出抓取模式');
++      } else if (key === 's') {
++        try {
++          const payload = await webview.executeJavaScript(buildGuestOverlayScript('extractHover'));
++          if (payload) {
++            const md = formatGrabPayloadAsMarkdown(payload);
++            await navigator.clipboard.writeText(md);
++            showToast('已按 [S] 键复制当前元素 Markdown 到剪切板！');
++          }
++        } catch {}
++      } else if (key === 'c') {
++        try {
++          if (typeof webview.capturePage === 'function') {
++            const nativeImg = await webview.capturePage();
++            const res = await fetch(nativeImg.toDataURL());
++            const blob = await res.blob();
++            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
++            showToast('已按 [C] 键复制页面截图到剪切板！');
++          }
++        } catch {}
++      }
++    };
++
++    const handleDidFailLoad = (e: any) => {
++      // Ignore normal navigation cancellation / abortion
++      if (e.errorCode === -3 || e.errorDescription === 'ERR_ABORTED' || !e.errorDescription) {
++        return;
++      }
++      console.warn(`[BrowserTabPanel] Page load failed: ${e.errorDescription} (${e.errorCode})`);
+     };
+ 
+     webview.addEventListener('did-start-loading', handleStartLoading);
+     webview.addEventListener('did-stop-loading', handleStopLoading);
++    webview.addEventListener('did-fail-load', handleDidFailLoad);
+     webview.addEventListener('did-navigate', handleNavigate);
+     webview.addEventListener('did-navigate-in-page', handleNavigate);
+     webview.addEventListener('page-title-updated', handleTitleUpdate);
+     webview.addEventListener('new-window', handleNewWindow);
+-    webview.addEventListener('crashed', handleCrashed);
+-    webview.addEventListener('render-process-gone', handleCrashed);
++    webview.addEventListener('dom-ready', handleDomReady);
++    webview.addEventListener('console-message', handleConsoleMessage);
++    webview.addEventListener('before-input-event', handleBeforeInput);
+ 
+     return () => {
+       webview.removeEventListener('did-start-loading', handleStartLoading);
+       webview.removeEventListener('did-stop-loading', handleStopLoading);
++      webview.removeEventListener('did-fail-load', handleDidFailLoad);
+       webview.removeEventListener('did-navigate', handleNavigate);
+       webview.removeEventListener('did-navigate-in-page', handleNavigate);
+       webview.removeEventListener('page-title-updated', handleTitleUpdate);
+       webview.removeEventListener('new-window', handleNewWindow);
+-      webview.removeEventListener('crashed', handleCrashed);
+-      webview.removeEventListener('render-process-gone', handleCrashed);
++      webview.removeEventListener('dom-ready', handleDomReady);
++      webview.removeEventListener('console-message', handleConsoleMessage);
++      webview.removeEventListener('before-input-event', handleBeforeInput);
++
++      try {
++        webview.executeJavaScript(buildGuestOverlayScript('teardown')).catch(() => {});
++      } catch {}
+     };
+-  }, [tabId]);
++  }, [tabId, theme, address, addHistoryEntry, updateHistoryTitle, updateGuestPins]);
+ 
+-  // ── 2. 工具栏导航操作 ────────────────────────────────────────────────────────
+-  const handleGoBack = useCallback(() => {
+-    webviewRef.current?.goBack?.();
++  // Helper: Safe loadURL that swallows ERR_ABORTED (-3) exceptions
++  const safeLoadUrl = useCallback((url: string) => {
++    const webview = webviewRef.current;
++    if (!webview || !url) return;
++    try {
++      const res = webview.loadURL(url);
++      if (res && typeof res.catch === 'function') {
++        res.catch((err: any) => {
++          if (err?.message?.includes('ERR_ABORTED') || err?.errno === -3) {
++            return;
++          }
++          console.error('[BrowserTabPanel] loadURL promise error:', err);
++        });
++      }
++    } catch (err: any) {
++      if (!err?.message?.includes('ERR_ABORTED')) {
++        console.error('[BrowserTabPanel] loadURL exception:', err);
++      }
++    }
+   }, []);
+ 
+-  const handleGoForward = useCallback(() => {
+-    webviewRef.current?.goForward?.();
++  // ── 2. Toolbar Navigation Actions ──────────────────────────────────────────
++  const handleGoBack = useCallback(() => webviewRef.current?.goBack?.(), []);
++  const handleGoForward = useCallback(() => webviewRef.current?.goForward?.(), []);
++  const handleReload = useCallback(() => {
++    if (isLoading) webviewRef.current?.stop?.();
++    else webviewRef.current?.reload?.();
++  }, [isLoading]);
++  const handleGoHome = useCallback(() => safeLoadUrl('https://www.google.com'), [safeLoadUrl]);
++
++  const handleNavigateSubmit = (url: string) => {
++    if (!url) return;
++    setAddress(url);
++    safeLoadUrl(url);
++  };
++
++  const handleOpenExternal = () => {
++    if (window.electronAPI?.callApi) {
++      window.electronAPI.callApi('system', 'openExternal', [address]);
++    }
++  };
++
++
++  // ── Helper: Capture Cropped Element Screenshot Before Dialog Appears ───────
++  const captureElementScreenshot = useCallback(async (webview: any, payload: any) => {
++    if (!webview || !payload?.target?.rectViewport) return null;
++    const rect = payload.target.rectViewport;
++    if (rect.width <= 0 || rect.height <= 0) return null;
++
++    try {
++      await webview.executeJavaScript(`(function(){
++        var box = document.getElementById('__berrytrace-highlight-box');
++        var label = document.getElementById('__berrytrace-hover-label');
++        if (box) box.style.display = 'none';
++        if (label) label.style.display = 'none';
++      })()`).catch(() => {});
++
++      let nativeImg: any = null;
++      if (typeof webview.capturePage === 'function') {
++        nativeImg = await webview.capturePage();
++      }
++
++      await webview.executeJavaScript(`(function(){
++        var box = document.getElementById('__berrytrace-highlight-box');
++        var label = document.getElementById('__berrytrace-hover-label');
++        if (box) box.style.display = 'block';
++        if (label) label.style.display = 'block';
++      })()`).catch(() => {});
++
++      if (!nativeImg || typeof nativeImg.isEmpty !== 'function' || nativeImg.isEmpty()) return null;
++
++      const bitmapSize = nativeImg.getSize();
++      const guestCssWidth = (await webview.executeJavaScript('window.innerWidth').catch(() => 0)) || webview.clientWidth || window.innerWidth;
++      if (!guestCssWidth || guestCssWidth <= 0) return null;
++
++      const scaleFactor = bitmapSize.width / guestCssWidth;
++      const cropX = Math.max(0, Math.round(rect.x * scaleFactor));
++      const cropY = Math.max(0, Math.round(rect.y * scaleFactor));
++      const cropW = Math.min(bitmapSize.width - cropX, Math.round(rect.width * scaleFactor));
++      const cropH = Math.min(bitmapSize.height - cropY, Math.round(rect.height * scaleFactor));
++
++      if (cropW <= 0 || cropH <= 0) return null;
++
++      const croppedImg = nativeImg.crop({ x: cropX, y: cropY, width: cropW, height: cropH });
++      return {
++        dataUrl: croppedImg.toDataURL(),
++        width: Math.round(cropW / scaleFactor),
++        height: Math.round(cropH / scaleFactor),
++      };
++    } catch (err) {
++      console.warn('[BrowserTabPanel] Error capturing element screenshot:', err);
++      return null;
++    }
+   }, []);
+ 
+-  const handleReload = useCallback(() => {
+-    if (isLoading) {
+-      webviewRef.current?.stop?.();
++  // ── 3. Feature 3: Grab Element Mode Loop ──────────────────────────────────
++  const startGrabModeLoop = useCallback(async () => {
++    const webview = webviewRef.current;
++    if (!webview) return;
++    try {
++      await webview.executeJavaScript(buildGuestOverlayScript('arm'));
++      const result = await webview.executeJavaScript(buildGuestOverlayScript('awaitClick'));
++      let payload = result?.payload;
++      if (!payload && result?.kind === 'selected') {
++        payload = await webview.executeJavaScript(buildGuestOverlayScript('finalize'));
++      }
++      if (payload) {
++        // Capture element screenshot BEFORE showing sheet modal
++        const screenshot = await captureElementScreenshot(webview, payload);
++        payload.screenshot = screenshot;
++
++        setActiveGrabPayload(payload);
++        setIsGrabActive(false);
++        webview.executeJavaScript(buildGuestOverlayScript('teardown')).catch(() => {});
++        showToast('已成功选中 DOM 元素并截取元素图像！');
++      } else if (result?.kind === 'cancelled' && result?.reason === 'escape') {
++        setIsGrabActive(false);
++        setActiveGrabPayload(null);
++        showToast('已退出抓取元素模式');
++      }
++    } catch (err) {
++      console.error('[BrowserTabPanel] Grab loop error:', err);
++    }
++  }, [captureElementScreenshot]);
++
++  const toggleGrabMode = () => {
++    const webview = webviewRef.current;
++    if (isGrabActiveRef.current) {
++      setIsGrabActive(false);
++      setActiveGrabPayload(null);
++      if (webview) webview.executeJavaScript(buildGuestOverlayScript('teardown')).catch(() => {});
++      showToast('已退出抓取元素模式');
+     } else {
+-      webviewRef.current?.reload?.();
++      if (isAnnotateActiveRef.current) toggleAnnotateMode();
++      setIsGrabActive(true);
++      showToast('抓取模式已开启: 鼠标悬浮选定 DOM，点击拾取片段');
++      startGrabModeLoop();
+     }
+-  }, [isLoading]);
++  };
++
++  const handleCopyGrabText = async () => {
++    if (!activeGrabPayload) return;
++    const md = formatGrabPayloadAsMarkdown(activeGrabPayload);
++    await navigator.clipboard.writeText(md);
++    setActiveGrabPayload(null);
++    showToast('已成功复制 DOM 元素 Markdown 到剪切板！');
++  };
++
++  const handleCopyGrabScreenshot = async () => {
++    if (!activeGrabPayload) return;
++    try {
++      let dataUrl = activeGrabPayload.screenshot?.dataUrl;
++      if (!dataUrl && webviewRef.current) {
++        const screenshot = await captureElementScreenshot(webviewRef.current, activeGrabPayload);
++        dataUrl = screenshot?.dataUrl;
++      }
++      if (dataUrl) {
++        const res = await fetch(dataUrl);
++        const blob = await res.blob();
++        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
++        showToast('已成功复制选中元素局部截图到剪切板！');
++      }
++    } catch (err) {
++      console.error('[BrowserTabPanel] Copy screenshot error:', err);
++    }
++    setActiveGrabPayload(null);
++  };
++
++  const handleAttachGrabToAgent = async () => {
++    if (!activeGrabPayload) return;
++    const md = formatGrabPayloadAsMarkdown(activeGrabPayload);
++    await dispatchAttachmentMention(`element_grab_${Date.now()}.md`, md, false);
++
++    if (activeGrabPayload.screenshot?.dataUrl) {
++      await dispatchAttachmentMention(`element_crop_${Date.now()}.png`, activeGrabPayload.screenshot.dataUrl, true);
++    }
++
++    setActiveGrabPayload(null);
++    showToast('已将抓取 DOM 结构与局部元素截图添加至 Agent ChatInput 卡片！');
++  };
+ 
+-  const handleGoHome = useCallback(() => {
+-    webviewRef.current?.loadURL?.('https://www.google.com');
++  // ── 4. Feature 4: Annotate Element Mode Toggle & Continuous Selection ──────
++  const startAnnotateModeLoop = useCallback(async () => {
++    const webview = webviewRef.current;
++    if (!webview) return;
++    try {
++      await webview.executeJavaScript(buildGuestOverlayScript('arm'));
++      const result = await webview.executeJavaScript(buildGuestOverlayScript('awaitClick'));
++      let payload = result?.payload;
++      if (!payload && result?.kind === 'selected') {
++        payload = await webview.executeJavaScript(buildGuestOverlayScript('finalize'));
++      }
++      if (payload) {
++        setPendingAnnotationPayload(payload);
++        setEditingAnnotationId(null);
++      } else if (result?.kind === 'cancelled' && result?.reason === 'escape') {
++        setIsAnnotateActive(false);
++        setPendingAnnotationPayload(null);
++        showToast('已退出注释模式');
++      }
++    } catch (err) {
++      console.error('[BrowserTabPanel] Annotate loop error:', err);
++    }
+   }, []);
+ 
+-  const handleNavigateSubmit = (e: React.FormEvent) => {
+-    e.preventDefault();
+-    let url = inputAddress.trim();
+-    if (!url) return;
+-    const isUrl = /^(https?:\/\/)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(:\d+)?(\/\S*)?$/.test(url);
+-    if (!isUrl) {
+-      url = `https://www.google.com/search?q=${encodeURIComponent(url)}`;
+-    } else if (!/^https?:\/\//i.test(url)) {
+-      url = `https://${url}`;
++  const toggleAnnotateMode = () => {
++    const webview = webviewRef.current;
++    if (isAnnotateActiveRef.current) {
++      setIsAnnotateActive(false);
++      setPendingAnnotationPayload(null);
++      setEditingAnnotationId(null);
++      if (webview) webview.executeJavaScript(buildGuestOverlayScript('teardown')).catch(() => {});
++      showToast('已关闭元素注释模式');
++    } else {
++      if (isGrabActive) toggleGrabMode();
++      setIsAnnotateActive(true);
++      showToast('注释模式已开启: 点击页面元素进行标注，可在页面保留 Pin 标记');
++      startAnnotateModeLoop();
+     }
+-    webviewRef.current?.loadURL?.(url);
+   };
+ 
+-  const handleOpenExternal = () => {
+-    if (window.electronAPI?.callApi) {
+-      window.electronAPI.callApi('system', 'openExternal', [address]);
++  const handleSaveSingleAnnotation = (comment: string, intent: string) => {
++    if (!pendingAnnotationPayload) return;
++
++    if (editingAnnotationId) {
++      setAnnotations(annotationsRef.current.map((a) => a.id === editingAnnotationId ? { ...a, comment, intent } : a));
++      setEditingAnnotationId(null);
++      showToast('已更新该元素注释！');
++    } else {
++      const newEntry: SavedAnnotation = {
++        id: Math.random().toString(36).substring(2),
++        payload: pendingAnnotationPayload,
++        comment,
++        intent,
++      };
++      const nextList = [...annotationsRef.current, newEntry];
++      setAnnotations(nextList);
++      showToast(`已添加第 ${nextList.length} 条元素注释！可在页面点击 Pin 标记重新编辑`);
++    }
++
++    setPendingAnnotationPayload(null);
++
++    if (isAnnotateActiveRef.current) {
++      setTimeout(() => {
++        startAnnotateModeLoop();
++      }, 50);
++    }
++  };
++
++  const handleSendAllAnnotationsToAgent = async () => {
++    if (annotationsRef.current.length === 0) return;
++    const lines: string[] = [];
++    lines.push(`## Design Feedback (${address})`);
++    lines.push(`包含 ${annotationsRef.current.length} 条页面元素标注：`);
++    lines.push('');
++
++    annotationsRef.current.forEach((item, idx) => {
++      lines.push(`### ${idx + 1}. <${item.payload.target.tagName}> "${item.payload.target.selector}"`);
++      lines.push(formatAnnotationAsMarkdown(item.payload, item.comment, item.intent));
++      lines.push('');
++    });
++
++    const fullMarkdown = lines.join('\n');
++    await dispatchAttachmentMention(`page_annotations_${Date.now()}.md`, fullMarkdown, false);
++    setAnnotations([]);
++    showToast(`已将 ${annotationsRef.current.length} 条标注作为 Snippet 卡片提交至 Agent ChatInput！`);
++  };
++
++  const handleClearAllAnnotations = () => {
++    setAnnotations([]);
++    showToast('已清空所有已保存的注释');
++  };
++
++  // ── 5. Feature 5: Draw on Screenshot Markup Editor ────────────────────────
++  const handleMarkupDraw = async () => {
++    const webview = webviewRef.current;
++    if (!webview) return;
++    try {
++      showToast('正在捕获页面画面...');
++      let dataUrl = '';
++      if (typeof webview.capturePage === 'function') {
++        const nativeImg = await webview.capturePage();
++        dataUrl = nativeImg.toDataURL();
++      }
++
++      if (!dataUrl) {
++        const canvas = document.createElement('canvas');
++        canvas.width = webviewContainerRef.current?.clientWidth || window.innerWidth;
++        canvas.height = webviewContainerRef.current?.clientHeight || window.innerHeight;
++        const ctx = canvas.getContext('2d');
++        if (ctx) {
++          ctx.fillStyle = '#0f172a';
++          ctx.fillRect(0, 0, canvas.width, canvas.height);
++          ctx.font = '20px sans-serif';
++          ctx.fillStyle = '#94a3b8';
++          ctx.fillText(`Browser View Screenshot (${address})`, 40, 80);
++        }
++        dataUrl = canvas.toDataURL('image/png');
++      }
++
++      setMarkupBaseUrl(dataUrl);
++    } catch (err) {
++      console.error('[BrowserTabPanel] Screenshot error:', err);
++      showToast('捕获截图失败');
++    }
++  };
++
++  const handleMarkupComplete = async (resultDataUrl: string) => {
++    setMarkupBaseUrl(null);
++    try {
++      const res = await fetch(resultDataUrl);
++      const blob = await res.blob();
++      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
++      showToast('标注图片已成功复制到剪切板！');
++
++      const filename = `markup_screenshot_${Date.now()}.png`;
++      await dispatchAttachmentMention(filename, resultDataUrl, true);
++      showToast('已将标注截图作为图片 Block 附件提交至 Agent ChatInput！');
++    } catch (err) {
++      console.error('[BrowserTabPanel] Error exporting markup:', err);
++      showToast('标注完成');
+     }
+   };
+ 
+   return (
+     <div
+-      className="w-full h-full flex flex-col bg-[var(--bg-page)] overflow-hidden relative"
++      className="w-full h-full flex flex-col bg-background text-foreground overflow-hidden relative select-none"
+       style={{ display: visible ? 'flex' : 'none' }}
+     >
+       {/* Browser Toolbar */}
+-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[var(--border-light)] bg-[var(--bg-page)] shrink-0 h-9 select-none z-10">
+-        {/* Navigation Buttons */}
++      <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-border bg-card shrink-0 h-9 z-10 select-none">
+         <button
++          type="button"
+           onClick={handleGoBack}
+           disabled={!canGoBack}
+-          className="p-1 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[var(--text-secondary)] border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
+-          title="后退"
++          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-30 disabled:hover:bg-transparent border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title="后退 (Back)"
+         >
+-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+-            <polyline points="15 18 9 12 15 6" />
+-          </svg>
++          <ArrowLeft className="w-3.5 h-3.5" />
+         </button>
+ 
+         <button
++          type="button"
+           onClick={handleGoForward}
+           disabled={!canGoForward}
+-          className="p-1 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-[var(--text-secondary)] border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
+-          title="前进"
++          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-30 disabled:hover:bg-transparent border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title="前进 (Forward)"
+         >
+-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+-            <polyline points="9 18 15 12 9 6" />
+-          </svg>
++          <ArrowRight className="w-3.5 h-3.5" />
+         </button>
+ 
+         <button
++          type="button"
+           onClick={handleReload}
+-          className="p-1 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
+-          title={isLoading ? '停止' : '重新加载'}
++          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title={isLoading ? '停止加载 (Stop)' : '重新加载 (Reload)'}
+         >
+-          {isLoading ? (
+-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+-              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+-            </svg>
+-          ) : (
+-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className={isLoading ? 'animate-spin' : ''}>
+-              <path d="M23 4v6h-6" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+-            </svg>
+-          )}
++          <RotateCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+         </button>
+ 
+         <button
++          type="button"
+           onClick={handleGoHome}
+-          className="p-1 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
+-          title="主页"
++          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title="返回主页 (Home)"
+         >
+-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+-            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+-            <polyline points="9 22 9 12 15 12 15 22" />
+-          </svg>
++          <Home className="w-3.5 h-3.5" />
+         </button>
+ 
+-        {/* Address Input Bar */}
+-        <form onSubmit={handleNavigateSubmit} className="flex-1 flex items-center gap-1.5 px-3.5 py-1 rounded-lg bg-[var(--bg-input,rgba(0,0,0,0.1))] border border-[var(--border-light)] focus-within:border-[var(--color-brand)] focus-within:ring-1 focus-within:ring-[var(--color-brand)] transition-all h-6">
+-          <input
+-            id={`browser-address-${tabId}`}
+-            type="text"
+-            value={inputAddress}
+-            onChange={(e) => setInputAddress(e.target.value)}
+-            className="flex-1 bg-transparent border-none text-[11px] text-[var(--text-primary)] focus:outline-none placeholder-[var(--text-tertiary)]"
+-            placeholder="输入网址或进行搜索"
+-          />
+-        </form>
++        <BrowserAddressBar
++          value={address}
++          onChange={setAddress}
++          onSubmit={handleNavigateSubmit}
++        />
++
++        <BrowserImportHintButton
++          onSuccessToast={showToast}
++          onErrorToast={showToast}
++        />
+ 
+-        {/* External Link Button */}
+         <button
++          type="button"
++          onClick={toggleGrabMode}
++          className={`p-1 rounded border-none cursor-pointer flex items-center justify-center transition-colors ${
++            isGrabActive
++              ? 'bg-blue-600 text-white shadow ring-2 ring-blue-400'
++              : 'text-muted-foreground hover:text-foreground hover:bg-muted bg-transparent'
++          }`}
++          title={isGrabActive ? '关闭抓取模式 (Exit Grab)' : '开启页面元素抓取模式 (Grab Mode: S复制/C截图)'}
++        >
++          <Target className="w-3.5 h-3.5" />
++        </button>
++
++        <div className="relative inline-flex items-center">
++          <button
++            type="button"
++            onClick={toggleAnnotateMode}
++            className={`p-1 rounded border-none cursor-pointer flex items-center justify-center transition-colors ${
++              isAnnotateActive
++                ? 'bg-emerald-600 text-white shadow ring-2 ring-emerald-400'
++                : 'text-muted-foreground hover:text-foreground hover:bg-muted bg-transparent'
++            }`}
++            title={isAnnotateActive ? '关闭注释模式 (Exit Annotate)' : '开启多元素注释标注模式 (Annotate Mode)'}
++          >
++            <MessageSquarePlus className="w-3.5 h-3.5" />
++          </button>
++          {annotations.length > 0 && (
++            <span className="absolute -top-1 -right-1 px-1 min-w-4 h-4 rounded-full bg-emerald-500 text-white font-bold text-[9px] flex items-center justify-center pointer-events-none shadow">
++              {annotations.length}
++            </span>
++          )}
++        </div>
++
++        {annotations.length > 0 && (
++          <div className="flex items-center gap-1">
++            <button
++              type="button"
++              onClick={handleSendAllAnnotationsToAgent}
++              className="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-600 dark:text-emerald-400 border border-emerald-500/40 text-[11px] font-medium flex items-center gap-1 cursor-pointer transition-colors"
++              title={`一键提交全部 ${annotations.length} 条标注到 Agent ChatInput`}
++            >
++              <Send className="w-3 h-3" />
++              <span>发送 ({annotations.length})</span>
++            </button>
++            <button
++              type="button"
++              onClick={handleClearAllAnnotations}
++              className="p-1 rounded text-muted-foreground hover:text-red-500 hover:bg-muted cursor-pointer"
++              title="清空标注"
++            >
++              <Trash2 className="w-3 h-3" />
++            </button>
++          </div>
++        )}
++
++        <button
++          type="button"
++          onClick={handleMarkupDraw}
++          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title="截图中绘制 (High-DPI Screen Markup Editor)"
++        >
++          <Pencil className="w-3.5 h-3.5" />
++        </button>
++
++        <button
++          type="button"
+           onClick={handleOpenExternal}
+-          className="p-1 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
+-          title="在外部浏览器打开"
++          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title="在外部浏览器打开 (Open in External Browser)"
+         >
+-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+-            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+-            <polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+-          </svg>
++          <ExternalLink className="w-3.5 h-3.5" />
++        </button>
++
++        <button
++          type="button"
++          onClick={handleOpenWebviewDevTools}
++          className="p-1 rounded text-muted-foreground hover:text-amber-500 hover:bg-muted border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++          title="打开内嵌 Webview 开发者工具调试控制台 (Open Webview DevTools)"
++        >
++          <Bug className="w-3.5 h-3.5" />
+         </button>
+       </div>
+ 
+-      {/* 沙盒隔离的 HTML <webview> 节点 */}
+-      <div className="flex-1 relative w-full h-full overflow-hidden">
++      {/* Floating Grab Mode Banner */}
++      {isGrabActive && (
++        <div className="absolute top-9 inset-x-0 z-30 bg-blue-600/90 text-white text-[11px] px-3 py-1 flex items-center justify-between backdrop-blur shadow-md animate-in slide-in-from-top-1 duration-150 pointer-events-auto">
++          <div className="flex items-center gap-3">
++            <span className="font-semibold flex items-center gap-1">
++              <Target className="w-3.5 h-3.5" />
++              抓取元素模式
++            </span>
++            <span className="opacity-90">
++              鼠标悬浮选定页面 DOM | 点击拾取并添加至附件片段 | 按 <kbd className="px-1 bg-black/30 rounded font-mono">S</kbd> 复制 DOM | 按 <kbd className="px-1 bg-black/30 rounded font-mono">C</kbd> 复制截图 | 按 <kbd className="px-1 bg-black/30 rounded font-mono">Esc</kbd> 退出
++            </span>
++          </div>
++          <button
++            type="button"
++            onClick={toggleGrabMode}
++            className="p-0.5 hover:bg-white/20 rounded cursor-pointer"
++            title="退出抓取模式"
++          >
++            <X className="w-3.5 h-3.5" />
++          </button>
++        </div>
++      )}
++
++      {/* Floating Annotate Mode Banner */}
++      {isAnnotateActive && (
++        <div className="absolute top-9 inset-x-0 z-30 bg-emerald-600/90 text-white text-[11px] px-3 py-1 flex items-center justify-between backdrop-blur shadow-md animate-in slide-in-from-top-1 duration-150 pointer-events-auto">
++          <div className="flex items-center gap-3">
++            <span className="font-semibold flex items-center gap-1">
++              <MessageSquarePlus className="w-3.5 h-3.5" />
++              元素标注模式 ({annotations.length} 条已标注)
++            </span>
++            <span className="opacity-90">
++              点击元素连续添加批注；点击网页上生成的数字 Pin 标记可再次编辑修改；完成后点击工具栏 “发送” 批量提交至 Agent
++            </span>
++          </div>
++          <button
++            type="button"
++            onClick={toggleAnnotateMode}
++            className="p-0.5 hover:bg-white/20 rounded cursor-pointer"
++            title="退出标注模式"
++          >
++            <X className="w-3.5 h-3.5" />
++          </button>
++        </div>
++      )}
++
++      {/* Toast Notification */}
++      {toastMessage && (
++        <div className="absolute top-12 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-1.5 rounded-xl bg-popover border border-border text-foreground text-xs shadow-2xl backdrop-blur animate-in fade-in slide-in-from-top-2 duration-150">
++          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
++          <span>{toastMessage}</span>
++        </div>
++      )}
++
++      {/* Grab Selected Confirmation Sheet */}
++      {activeGrabPayload && (
++        <GrabConfirmationSheet
++          payload={activeGrabPayload}
++          onCopyText={handleCopyGrabText}
++          onCopyScreenshot={handleCopyGrabScreenshot}
++          onAttachToAgent={handleAttachGrabToAgent}
++          onCancel={() => setActiveGrabPayload(null)}
++        />
++      )}
++
++      {/* Annotate Sheet Modal */}
++      {pendingAnnotationPayload && (
++        <BrowserAnnotationSheet
++          payload={pendingAnnotationPayload}
++          annotationIndex={
++            editingAnnotationId
++              ? annotations.findIndex((a) => a.id === editingAnnotationId) + 1
++              : annotations.length + 1
++          }
++          existingComment={
++            editingAnnotationId
++              ? annotations.find((a) => a.id === editingAnnotationId)?.comment
++              : ''
++          }
++          existingIntent={
++            editingAnnotationId
++              ? annotations.find((a) => a.id === editingAnnotationId)?.intent
++              : 'fix'
++          }
++          onSaveAnnotation={handleSaveSingleAnnotation}
++          onCancel={() => {
++            setPendingAnnotationPayload(null);
++            setEditingAnnotationId(null);
++          }}
++        />
++      )}
++
++      {/* Webview & Markup Container */}
++      <div ref={webviewContainerRef} className="flex-1 relative w-full h-full overflow-hidden bg-background">
++        {markupBaseUrl && (
++          <MarkupOverlay
++            baseDataUrl={markupBaseUrl}
++            onComplete={handleMarkupComplete}
++            onCancel={() => setMarkupBaseUrl(null)}
++          />
++        )}
++
+         <webview
+           ref={webviewRef}
+           src={initialUrl}
+@@ -227,7 +867,7 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+             height: '100%',
+             border: 'none',
+             outline: 'none',
+-            background: '#ffffff',
++            background: 'transparent',
+           }}
+         />
+       </div>

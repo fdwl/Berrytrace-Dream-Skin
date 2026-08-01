@@ -1,0 +1,110 @@
+import { Menu } from 'electron'
+import type { MenuItemConstructorOptions } from 'electron'
+import { cache, CacheAttribute } from '../config/index'
+import { ElectronGlobalShortcuts } from './global-shortcuts'
+import { oemManager } from './oem-manager'
+
+export interface MenuDependencies {
+  openPreferences: () => void
+  togglePublishWindow?: () => void
+  triggerLock: () => void
+  toggleAlwaysOnTop: () => void
+}
+
+export class ElectronMenu {
+  private static instance: ElectronMenu
+  private deps: MenuDependencies | null = null
+
+  private constructor() {}
+
+  public static getInstance(): ElectronMenu {
+    if (!ElectronMenu.instance) {
+      ElectronMenu.instance = new ElectronMenu()
+    }
+    return ElectronMenu.instance
+  }
+
+  public setDependencies(deps: MenuDependencies): void {
+    this.deps = deps
+  }
+
+  public setupMenu(): void {
+    const isMac = process.platform === 'darwin'
+    const lockShortcut = (cache.get(CacheAttribute.prefLockShortcut) as string) || ElectronGlobalShortcuts.getInstance().getDefaultLockShortcut()
+    const appName = oemManager.getConfig().appName || '莓莓印记'
+
+    const template: MenuItemConstructorOptions[] = [
+      ...(isMac
+        ? [{
+          label: appName,
+          submenu: [
+            { label: `关于 ${appName}`, role: 'about' },
+            { type: 'separator' },
+            { label: '偏好设置...', accelerator: 'CmdOrCtrl+,', click: () => this.deps?.openPreferences() },
+            { type: 'separator' },
+            { label: '服务', role: 'services' },
+            { type: 'separator' },
+            { label: `隐藏 ${appName}`, role: 'hide' },
+            { label: '隐藏其他', role: 'hideOthers' },
+            { label: '显示全部', role: 'unhide' },
+            { type: 'separator' },
+            { label: `退出 ${appName}`, role: 'quit' },
+          ] as MenuItemConstructorOptions[],
+        }]
+        : []),
+      {
+        label: '文件',
+        submenu: [
+          { label: '锁定桌面', accelerator: lockShortcut, click: () => this.deps?.triggerLock() },
+          { type: 'separator' },
+          ...(!isMac
+            ? [{ label: '偏好设置...', accelerator: 'Ctrl+,', click: () => this.deps?.openPreferences() }, { type: 'separator' }] as MenuItemConstructorOptions[]
+            : []),
+          isMac ? { label: '关闭窗口', role: 'close' } : { label: '退出', role: 'quit' },
+        ] as MenuItemConstructorOptions[],
+      },
+      {
+        label: '编辑',
+        submenu: [
+          { label: '撤销', role: 'undo' },
+          { label: '重做', role: 'redo' },
+          { type: 'separator' },
+          { label: '剪切', role: 'cut' },
+          { label: '复制', role: 'copy' },
+          { label: '粘贴', role: 'paste' },
+          { label: '全选', role: 'selectAll' },
+        ] as MenuItemConstructorOptions[],
+      },
+      {
+        label: '视图',
+        submenu: [
+          { label: '重新加载', role: 'reload' },
+          { label: '强制重新加载', role: 'forceReload' },
+          { type: 'separator' },
+          { label: '切换开发者工具', role: 'toggleDevTools' },
+          { type: 'separator' },
+          { label: '重置缩放', role: 'resetZoom' },
+          { label: '放大', role: 'zoomIn' },
+          { label: '缩小', role: 'zoomOut' },
+          { type: 'separator' },
+          { label: '全屏', role: 'togglefullscreen' },
+        ] as MenuItemConstructorOptions[],
+      },
+      {
+        label: '窗口',
+        submenu: [
+          { label: '最小化', role: 'minimize' },
+          { label: '缩放', role: 'zoom' },
+          ...(isMac
+            ? [{ type: 'separator' }, { label: '前置全部窗口', role: 'front' }, { type: 'separator' }, {
+              label: '窗口置顶', click: () => this.deps?.toggleAlwaysOnTop(),
+            }] as MenuItemConstructorOptions[]
+            : [{ label: '关闭', role: 'close' } as MenuItemConstructorOptions]),
+        ] as MenuItemConstructorOptions[],
+      },
+    ]
+
+    const menu = Menu.buildFromTemplate(template)
+    Menu.setApplicationMenu(menu)
+  }
+}

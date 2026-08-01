@@ -1,0 +1,142 @@
+import { app, ipcMain, BrowserWindow } from 'electron'
+import v8 from 'node:v8'
+import vm from 'node:vm'
+
+export interface MemoryMetric {
+  pid: number
+  type: string
+  memoryMB: number
+}
+
+export interface MemoryReport {
+  mainProcessMemoryMB: number
+  processes: MemoryMetric[]
+  systemFreeMB: number
+  systemTotalMB: number
+}
+
+export class MemoryMonitor {
+  private static intervalId: NodeJS.Timeout | null = null
+
+  public static start(intervalMs = 60000 * 5) {
+    if (this.intervalId) return
+
+    // Immediately log once on start
+    this.logMemory()
+
+    this.intervalId = setInterval(() => {
+      this.logMemory()
+    }, intervalMs)
+
+    console.log(`[MemoryMonitor] Started with logging interval of ${intervalMs}ms.`)
+  }
+
+  public static stop() {
+    if (this.intervalId) {
+      clearInterval(this.intervalId)
+      this.intervalId = null
+      console.log('[MemoryMonitor] Stopped.')
+    }
+  }
+
+  public static async getReport(): Promise<MemoryReport> {
+    const metrics = app.getAppMetrics()
+    const sysMem = process.getSystemMemoryInfo()
+    let mainProcessMemoryMB = 0
+
+    try {
+      const mainMetric = metrics.find((p) => p.type === 'Browser')
+      if (mainMetric) {
+        mainProcessMemoryMB = Math.round(mainMetric.memory.workingSetSize / 1024)
+      }
+    } catch (e) {
+      console.error('[MemoryMonitor] Failed to get main process memory:', e)
+    }
+
+    const processes: MemoryMetric[] = metrics.map((p) => ({
+      pid: p.pid,
+      type: p.type,
+      memoryMB: Math.round(p.memory.workingSetSize / 1024),
+    }))
+
+    return {
+      mainProcessMemoryMB,
+      processes,
+      systemFreeMB: Math.round(sysMem.free / 1024),
+      systemTotalMB: Math.round(sysMem.total / 1024),
+    }
+  }
+
+  public static async logMemory() {
+    try {
+      const report = await this.getReport()
+      // 只在内存压力高时打印详细进程列表，减少日志噪音
+      if (report.systemFreeMB < 200) {
+        console.log('📊 ====== [Memory Monitor Report] ======')
+        console.log(`- Main Process Memory: ${report.mainProcessMemoryMB} MB`)
+        report.processes.forEach((p) => {
+          console.log(`- Process (PID: ${p.pid}, Type: ${p.type}): ${p.memoryMB} MB`)
+        })
+        console.log(`- System Free Memory: ${report.systemFreeMB} MB / ${report.systemTotalMB} MB`)
+        console.log('========================================')
+      } else {
+        console.log(`[MemoryMonitor] Main=${report.mainProcessMemoryMB}MB Free=${report.systemFreeMB}MB/${report.systemTotalMB}MB`)
+      }
+
+      // Perform low memory check and GC intervention
+      this.checkMemoryPressure(report)
+    } catch (err) {
+      console.error('[MemoryMonitor] Failed to log memory report:', err)
+    }
+  }
+
+  private static checkMemoryPressure(report: MemoryReport) {
+    // 降低到 100MB 避免系统内存略紧时就频繁触发 GC 造成 UI 卡顿
+    const CRITICAL_FREE_MB = 100
+    if (report.systemFreeMB < CRITICAL_FREE_MB) {
+      console.warn(`[MemoryMonitor] CRITICAL MEMORY PRESSURE! Free system memory is only ${report.systemFreeMB} MB. Triggering garbage collection...`)
+      
+      // Trigger GC in main process
+      // global.gc 由 --expose-gc 暴露，但某些 Electron 版本可能不可用，我们尝试动态暴露
+      let gcFn = typeof global.gc === 'function' ? global.gc : (globalThis as Record<string, unknown>).gc as (() => void) | undefined;
+      if (!gcFn) {
+        try {
+          v8.setFlagsFromString('--expose_gc');
+          gcFn = vm.runInNewContext('gc');
+        } catch (e) {
+          console.error('[MemoryMonitor] Failed to dynamically expose gc function:', e);
+        }
+      }
+
+      if (gcFn) {
+        try {
+          gcFn();
+          console.log('[MemoryMonitor] GC executed in main process successfully.')
+        } catch (e) {
+          console.error('[MemoryMonitor] Failed to run GC in main process:', e)
+        }
+      } else {
+        console.warn('[MemoryMonitor] V8 GC function is not exposed. --expose-gc may not be effective in this Electron version.')
+      }
+
+      // Trigger GC in all renderer processes
+      // Note: render frames may be disposed (navigating/crashed) — wrap each send individually
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (win.isDestroyed()) return
+        const wc = win.webContents
+        if (!wc || wc.isDestroyed() || wc.isCrashed()) return
+        try {
+          wc.send('system:request-gc')
+        } catch (err) {
+          // Render frame disposed during page load or navigation — safe to ignore
+        }
+      })
+    }
+  }
+
+  public static registerIpcHandlers() {
+    ipcMain.handle('system:get-memory-info', async () => {
+      return await this.getReport()
+    })
+  }
+}

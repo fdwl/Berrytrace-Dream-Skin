@@ -1,0 +1,99 @@
+diff --git a/electron/plugins/workflow-intent-router.ts b/electron/plugins/workflow-intent-router.ts
+new file mode 100644
+index 0000000..fa50b9f
+--- /dev/null
++++ b/electron/plugins/workflow-intent-router.ts
+@@ -0,0 +1,93 @@
++import { WorkflowEngine } from './workflow-engine';
++import { WorkflowDefinition } from './workflow-types';
++
++export interface IntentMatchResult {
++  matched: boolean;
++  workflowId?: string;
++  workflowName?: string;
++  confidence: number;
++  extractedParams?: Record<string, unknown>;
++  matchedTrigger?: string;
++}
++
++export class WorkflowIntentRouter {
++  private static instance: WorkflowIntentRouter | null = null;
++
++  private constructor() {}
++
++  public static getInstance(): WorkflowIntentRouter {
++    if (!WorkflowIntentRouter.instance) {
++      WorkflowIntentRouter.instance = new WorkflowIntentRouter();
++    }
++    return WorkflowIntentRouter.instance;
++  }
++
++  /**
++   * 意图路由器: 智能匹配自然语言 Query 与已注册 Workflow 的触发条件
++   */
++  public matchIntent(userQuery: string): IntentMatchResult {
++    if (!userQuery || !userQuery.trim()) {
++      return { matched: false, confidence: 0 };
++    }
++
++    const query = userQuery.trim().toLowerCase();
++    const workflows = WorkflowEngine.getInstance().list();
++
++    let bestMatch: IntentMatchResult = { matched: false, confidence: 0 };
++
++    for (const def of workflows) {
++      const triggers = def.triggers?.userQueries;
++      if (!triggers || !Array.isArray(triggers) || triggers.length === 0) continue;
++
++      for (const pattern of triggers) {
++        const pLower = pattern.trim().toLowerCase();
++
++        // 1. 完全精确匹配 (Confidence = 1.0)
++        if (query === pLower) {
++          return {
++            matched: true,
++            workflowId: def.id,
++            workflowName: def.name || def.id,
++            confidence: 1.0,
++            matchedTrigger: pattern,
++          };
++        }
++
++        // 2. 通配符正则匹配 (如 "帮我*切片")
++        if (pattern.includes('*') || pattern.includes(':')) {
++          try {
++            const regexStr = '^' + pLower.replace(/\*/g, '(.*?)') + '$';
++            const regex = new RegExp(regexStr, 'i');
++            const match = query.match(regex);
++            if (match) {
++              return {
++                matched: true,
++                workflowId: def.id,
++                workflowName: def.name || def.id,
++                confidence: 0.95,
++                matchedTrigger: pattern,
++                extractedParams: { matchGroup: match[1] },
++              };
++            }
++          } catch {}
++        }
++
++        // 3. 包含关系匹配 (Confidence = 0.8)
++        if (query.includes(pLower) || pLower.includes(query)) {
++          const confidence = 0.8;
++          if (confidence > bestMatch.confidence) {
++            bestMatch = {
++              matched: true,
++              workflowId: def.id,
++              workflowName: def.name || def.id,
++              confidence,
++              matchedTrigger: pattern,
++            };
++          }
++        }
++      }
++    }
++
++    return bestMatch;
++  }
++}

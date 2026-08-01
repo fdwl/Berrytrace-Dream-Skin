@@ -1,0 +1,126 @@
+diff --git a/electron/plugins/plugin-scanner.ts b/electron/plugins/plugin-scanner.ts
+index ebbf1a6..59a85a3 100644
+--- a/electron/plugins/plugin-scanner.ts
++++ b/electron/plugins/plugin-scanner.ts
+@@ -1,8 +1,30 @@
+-import { join } from 'path';
++import { join, dirname } from 'path';
+ import { promises as fs } from 'fs';
+ import { app } from 'electron';
+-import { PluginManifest, PluginStatus, PluginVerifier } from './plugin-verifier';
+-import { PLUGINS_DIR } from '../config/paths';
++import type { PluginManifest, PluginStatus} from './plugin-verifier';
++import { PluginVerifier } from './plugin-verifier';
++import { PLUGINS_DIR, pluginDataDir } from '../config/paths';
++import { fileURLToPath } from 'url';
++
++const __dirname = dirname(fileURLToPath(import.meta.url));
++
++/** 深度合并两个 contributes 对象：数组字段追加，非数组字段覆盖 */
++function mergeContributes(
++  base: Record<string, unknown>,
++  extra: Record<string, unknown>,
++): Record<string, unknown> {
++  const result: Record<string, unknown> = { ...base };
++  for (const [key, val] of Object.entries(extra)) {
++    if (Array.isArray(val) && Array.isArray(result[key])) {
++      result[key] = [...(result[key] as unknown[]), ...val];
++    } else if (Array.isArray(val)) {
++      result[key] = [...val];
++    } else {
++      result[key] = val;
++    }
++  }
++  return result;
++}
+ 
+ export interface ScannedPlugin {
+   manifest: PluginManifest;
+@@ -23,6 +45,21 @@ export class PluginScanner {
+       const content = await fs.readFile(manifestPath, 'utf-8');
+       const manifest: PluginManifest = JSON.parse(content);
+       if (manifest.id) {
++        // 尝试合并生成式声明贡献（如 CLI 扫描结果），不依赖渲染进程加载
++        const cleanId = manifest.id.replace(/[^a-zA-Z0-9-]/g, '_');
++        const genContribPath = join(pluginDataDir(cleanId), '.berrytrace', 'declared-contributions.json');
++        try {
++          const genContent = await fs.readFile(genContribPath, 'utf-8');
++          const gen = JSON.parse(genContent) as { contributes?: Record<string, unknown> };
++          if (gen?.contributes && typeof gen.contributes === 'object') {
++            manifest.contributes = mergeContributes(
++              (manifest.contributes ?? {}) as Record<string, unknown>,
++              gen.contributes,
++            ) as PluginManifest['contributes'];
++          }
++        } catch {
++          // 文件不存在或 JSON 无效 — 正常情况（首次运行）
++        }
+         const status = await PluginVerifier.getPluginStatus(manifest, fullPath, false);
+         const manifestStat = await fs.stat(manifestPath).catch(() => null);
+         const installedAt = manifestStat ? (manifestStat.birthtime || manifestStat.mtime || new Date()).toISOString() : new Date().toISOString();
+@@ -77,8 +114,24 @@ export class PluginScanner {
+     const { oemManager } = await import('../services/oem-manager');
+     const oemConfig = oemManager.getConfig();
+     const oemId = oemConfig.oemId || 'default';
++    const allowedBuiltins = oemConfig.builtinPlugins || [];
++    const allOemPlugins = oemManager.getAllOEMBuiltinPlugins();
+ 
+-    console.log(`[Perf] [PluginScanner] Starting scanAll (OEM: ${oemId})...`);
++    console.debug(`[Perf] [PluginScanner] Starting scanAll (OEM: ${oemId}, Allowed Builtins: [${allowedBuiltins.join(', ')}])...`);
++
++    // 校验插件是否与当前启动的 OEM 匹配
++    const isAllowedForCurrentOEM = (item: ScannedPlugin): boolean => {
++      const isBuiltinType = item.manifest.type === 'builtin';
++      const isKnownOemPlugin = allOemPlugins.has(item.manifest.id);
++
++      if (isBuiltinType || isKnownOemPlugin) {
++        if (!allowedBuiltins.includes(item.manifest.id)) {
++          console.debug(`[PluginScanner] 🛡️ Ignored mismatched OEM plugin: "${item.manifest.id}" (type: ${item.manifest.type || 'unknown'}, not permitted in OEM '${oemId}')`);
++          return false;
++        }
++      }
++      return true;
++    };
+ 
+     // 1. Scan Prod Directory Only (user-installed plugins, isolated by OEM mode)
+     const t_prod = performance.now();
+@@ -86,7 +139,9 @@ export class PluginScanner {
+     await fs.mkdir(oemPluginDir, { recursive: true });
+     const prodScanned = await this.scanDirectory(oemPluginDir, false);
+     for (const item of prodScanned) {
+-      pluginsMap.set(item.manifest.id, item);
++      if (isAllowedForCurrentOEM(item)) {
++        pluginsMap.set(item.manifest.id, item);
++      }
+     }
+     console.log(`[Perf] [PluginScanner] Scanned ${prodScanned.length} plugins from ${oemPluginDir} in ${(performance.now() - t_prod).toFixed(2)}ms`);
+ 
+@@ -94,25 +149,18 @@ export class PluginScanner {
+     const t_builtin = performance.now();
+     try {
+       const isPackaged = app.isPackaged;
+-      const builtinPluginsDir = isPackaged
+-        ? join(app.getAppPath(), 'dist', 'plugins')
+-        : join(app.getAppPath(), 'builtin-plugins');
++      const builtinPluginsDir = join(__dirname, '..', 'dist', 'plugins');
+ 
+       const stat = await fs.stat(builtinPluginsDir).catch(() => null);
+       if (stat && stat.isDirectory()) {
+-        const { oemManager } = await import('../services/oem-manager');
+-        const allowedBuiltins = oemManager.getConfig().builtinPlugins || [];
+-
+         const builtinScanned = await this.scanDirectory(builtinPluginsDir, !isPackaged);
+         for (const item of builtinScanned) {
+-          if (allowedBuiltins.includes(item.manifest.id)) {
++          if (isAllowedForCurrentOEM(item)) {
+             if (isPackaged) {
+               item.status = 'APPROVED'; // Force APPROVED status in production for whitelisted built-ins
+             }
+             pluginsMap.set(item.manifest.id, item);
+-            console.log(`[PluginScanner] Loaded OEM builtin plugin: ${item.manifest.id} (type: ${item.manifest.type}, status: ${item.status})`);
+-          } else {
+-            console.log(`[PluginScanner] Ignored OEM builtin plugin: ${item.manifest.id} (not in whitelist)`);
++            console.debug(`[PluginScanner] Loaded OEM builtin plugin: ${item.manifest.id} (type: ${item.manifest.type}, status: ${item.status})`);
+           }
+         }
+         console.log(`[Perf] [PluginScanner] Scanned ${builtinScanned.length} builtin plugins from ${builtinPluginsDir} in ${(performance.now() - t_builtin).toFixed(2)}ms`);

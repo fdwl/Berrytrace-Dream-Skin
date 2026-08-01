@@ -1,0 +1,132 @@
+import type { WorkflowStep } from './workflow-types';
+
+export interface ExecutionLayer {
+  layerIndex: number;
+  steps: WorkflowStep[];
+}
+
+export interface DagBuildResult {
+  valid: boolean;
+  layers: ExecutionLayer[];
+  error?: string;
+  sortedSteps: WorkflowStep[];
+}
+
+export class WorkflowDagBuilder {
+  /**
+   * 将 Workflow 的 steps 构建并展开为拓扑执行图（Execution Layers）
+   */
+  public static buildGraph(steps: WorkflowStep[]): DagBuildResult {
+    if (!steps || steps.length === 0) {
+      return { valid: true, layers: [], sortedSteps: [] };
+    }
+
+    const stepMap = new Map<string, WorkflowStep>();
+    const inDegree = new Map<string, number>();
+    const adjacency = new Map<string, string[]>();
+
+    // 1. 初始化每个节点的依赖信息
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (!step.id) {
+        return { valid: false, layers: [], sortedSteps: [], error: `Step at index ${i} is missing an 'id'` };
+      }
+      if (stepMap.has(step.id)) {
+        return { valid: false, layers: [], sortedSteps: [], error: `Duplicate step ID '${step.id}' found` };
+      }
+
+      stepMap.set(step.id, step);
+      inDegree.set(step.id, 0);
+      adjacency.set(step.id, []);
+    }
+
+    // 2. 解析依赖边 (after 依赖)
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      let dependencies: string[] = [];
+
+      if (step.after && Array.isArray(step.after) && step.after.length > 0) {
+        dependencies = step.after;
+      } else if (i > 0) {
+        // 向后兼容：省略 after 时，默认依赖紧邻的上一个 step
+        dependencies = [steps[i - 1].id];
+      }
+
+      for (const depId of dependencies) {
+        if (!stepMap.has(depId)) {
+          return {
+            valid: false,
+            layers: [],
+            sortedSteps: [],
+            error: `Step '${step.id}' references non-existent dependency '${depId}' in 'after'`,
+          };
+        }
+
+        // 添加有向边 depId -> step.id
+        const adj = adjacency.get(depId) || [];
+        adj.push(step.id);
+        adjacency.set(depId, adj);
+
+        inDegree.set(step.id, (inDegree.get(step.id) || 0) + 1);
+      }
+    }
+
+    // 3. Kahn 拓扑分层排序算法
+    const layers: ExecutionLayer[] = [];
+    const sortedSteps: WorkflowStep[] = [];
+    let currentQueue: string[] = [];
+
+    for (const [id, degree] of inDegree.entries()) {
+      if (degree === 0) {
+        currentQueue.push(id);
+      }
+    }
+
+    let layerIdx = 0;
+    let processedCount = 0;
+
+    while (currentQueue.length > 0) {
+      const nextQueue: string[] = [];
+      const layerSteps: WorkflowStep[] = [];
+
+      for (const nodeIdx of currentQueue) {
+        const step = stepMap.get(nodeIdx)!;
+        layerSteps.push(step);
+        sortedSteps.push(step);
+        processedCount++;
+
+        const neighbors = adjacency.get(nodeIdx) || [];
+        for (const neighbor of neighbors) {
+          const newDeg = (inDegree.get(neighbor) || 0) - 1;
+          inDegree.set(neighbor, newDeg);
+          if (newDeg === 0) {
+            nextQueue.push(neighbor);
+          }
+        }
+      }
+
+      layers.push({
+        layerIndex: layerIdx++,
+        steps: layerSteps,
+      });
+
+      currentQueue = nextQueue;
+    }
+
+    // 4. 循环依赖检查
+    if (processedCount !== steps.length) {
+      return {
+        valid: false,
+        layers: [],
+        sortedSteps: [],
+        error: `Circular dependency detected in workflow graph! Processed ${processedCount}/${steps.length} steps.`,
+      };
+    }
+
+    return {
+      valid: true,
+      layers,
+      sortedSteps,
+    };
+  }
+}

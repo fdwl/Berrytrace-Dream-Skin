@@ -1,0 +1,205 @@
+diff --git a/electron/plugins/controllers/workspace.ts b/electron/plugins/controllers/workspace.ts
+index 00acf58..ce0de6a 100644
+--- a/electron/plugins/controllers/workspace.ts
++++ b/electron/plugins/controllers/workspace.ts
+@@ -1,10 +1,15 @@
++import { exec } from 'node:child_process';
++import { promisify } from 'node:util';
++import { promises as fsPromises } from 'node:fs';
++
+ import { app, BrowserWindow, ipcMain } from 'electron';
+ import { join } from 'path';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { ElectronMainWindow } from '../../windows/main-window';
+ import { ElectronSelection } from '../../services/selection';
+ import { PluginManager, getPluginRootDir } from '../plugin-manager';
+-import { SelectionMenuItem } from '../../../src/plugins/SelectionMenuRegistry';
++import type { SelectionMenuItem } from '../../../src/plugins/SelectionMenuRegistry';
+ 
+ export class WorkspaceController extends BaseApiController {
+   // ── workspace namespace ──
+@@ -303,6 +308,15 @@ export class WorkspaceController extends BaseApiController {
+ 
+   // ── plugin namespace ──
+ 
++  /**
++   * 按需确保加载目标插件 Manifest/服务。
++   * @param targetPluginId 目标插件 ID
++   */
++  async plugin_ensurePluginLoaded(targetPluginId: string): Promise<unknown> {
++    const pm = PluginManager.getInstance();
++    return pm.ensurePluginLoaded(targetPluginId);
++  }
++
+   /**
+    * 获取当前插件元信息。
+    * @returns { id, name, version, path }
+@@ -326,6 +340,14 @@ export class WorkspaceController extends BaseApiController {
+     return (pm as any).getLifecycleContext(context.pluginId);
+   }
+ 
++  /**
++   * 检查指定插件是否被启用。
++   */
++  async plugin_isPluginEnabled(targetPluginId: string): Promise<boolean> {
++    const pm = PluginManager.getInstance();
++    return pm.isPluginEnabled(targetPluginId);
++  }
++
+   // ── selectionMenu namespace ──
+ 
+   /**
+@@ -363,4 +385,151 @@ export class WorkspaceController extends BaseApiController {
+     }
+     return null;
+   }
++
++  async workspace_scanPorts(workspacePath: string): Promise<Array<{ port: number; processName: string; pid: number; cwd: string }>> {
++    if (!workspacePath) return [];
++    const normalizedWsPath = workspacePath.replace(/\\/g, '/').toLowerCase();
++
++    try {
++      const execAsync = promisify(exec);
++      const safeExec = async (cmd: string): Promise<string> => {
++        try {
++          const { stdout } = await execAsync(cmd, { timeout: 3000 });
++          return stdout;
++        } catch (err: any) {
++          if (err && typeof err.stdout === 'string' && err.stdout.trim()) {
++            return err.stdout;
++          }
++          return '';
++        }
++      };
++
++      if (process.platform === 'darwin') {
++        // 1. Get all listening TCP ports
++        const lsofOut = await safeExec('lsof -nP -iTCP -sTCP:LISTEN -F pcn');
++        if (!lsofOut) return [];
++        const ports: Array<{ port: number; processName: string; pid: number }> = [];
++        let currentPid: number | null = null;
++        let currentProcessName = '';
++
++        for (const line of lsofOut.split('\n')) {
++          if (!line) continue;
++          const tag = line[0];
++          const value = line.slice(1);
++          if (tag === 'p') {
++            currentPid = parseInt(value, 10);
++          } else if (tag === 'c') {
++            currentProcessName = value;
++          } else if (tag === 'n' && currentPid != null) {
++            const lastColon = value.lastIndexOf(':');
++            if (lastColon !== -1) {
++              const port = parseInt(value.substring(lastColon + 1), 10);
++              if (Number.isFinite(port)) {
++                ports.push({ port, processName: currentProcessName, pid: currentPid });
++              }
++            }
++          }
++        }
++
++        if (ports.length === 0) return [];
++
++        // 2. Get CWDs for all PIDs
++        const pids = Array.from(new Set(ports.map(p => p.pid)));
++        const cwdOut = await safeExec(`lsof -a -p ${pids.join(',')} -d cwd -Fn`);
++        const cwdMap = new Map<number, string>();
++        let activePid: number | null = null;
++
++        for (const line of cwdOut.split('\n')) {
++          if (!line) continue;
++          const tag = line[0];
++          const value = line.slice(1);
++          if (tag === 'p') {
++            activePid = parseInt(value, 10);
++          } else if (tag === 'n' && activePid != null) {
++            cwdMap.set(activePid, value);
++          }
++        }
++
++        // 3. Filter and map ports belonging to this workspace
++        const results: Array<{ port: number; processName: string; pid: number; cwd: string }> = [];
++        for (const p of ports) {
++          const cwd = cwdMap.get(p.pid);
++          if (cwd) {
++            const normalizedCwd = cwd.replace(/\\/g, '/').toLowerCase();
++            if (normalizedCwd === normalizedWsPath || normalizedCwd.startsWith(normalizedWsPath + '/')) {
++              results.push({
++                port: p.port,
++                processName: p.processName,
++                pid: p.pid,
++                cwd
++              });
++            }
++          }
++        }
++
++        // Deduplicate by port number (keep first)
++        const seenPorts = new Set<number>();
++        return results.filter(r => {
++          if (seenPorts.has(r.port)) return false;
++          seenPorts.add(r.port);
++          return true;
++        }).sort((a, b) => a.port - b.port);
++      }
++    } catch (err) {
++      console.warn('[WorkspaceController] Port scan failed or no ports found:', err);
++    }
++    return [];
++  }
++
++  /**
++   * 读取项目根目录下 .berrytrace/config.json 配置
++   */
++  async workspace_getProjectConfig(workspacePath: string): Promise<Record<string, any>> {
++    if (!workspacePath) return {};
++    try {
++      const configPath = join(workspacePath, '.berrytrace', 'config.json');
++      const content = await fsPromises.readFile(configPath, 'utf-8');
++      return JSON.parse(content);
++    } catch (err) {
++      return {};
++    }
++  }
++
++  /**
++   * 保存配置到项目根目录下 .berrytrace/config.json
++   */
++  async workspace_saveProjectConfig(options: { workspacePath: string; config: Record<string, any> } | string, configArg?: Record<string, any>): Promise<boolean> {
++    let workspacePath = '';
++    let config: Record<string, any> = {};
++
++    if (typeof options === 'string') {
++      workspacePath = options;
++      config = configArg || {};
++    } else if (options && typeof options === 'object') {
++      workspacePath = options.workspacePath;
++      config = options.config || {};
++    }
++
++    if (!workspacePath) return false;
++
++    try {
++      const dirPath = join(workspacePath, '.berrytrace');
++      await fsPromises.mkdir(dirPath, { recursive: true });
++      const configPath = join(dirPath, 'config.json');
++
++      let existing = {};
++      try {
++        const content = await fsPromises.readFile(configPath, 'utf-8');
++        existing = JSON.parse(content);
++      } catch (e) {}
++
++      const merged = { ...existing, ...config, updatedAt: Date.now() };
++      await fsPromises.writeFile(configPath, JSON.stringify(merged, null, 2), 'utf-8');
++      return true;
++    } catch (err) {
++      console.error('[WorkspaceController] Failed to save project config:', err);
++      return false;
++    }
++  }
+ }
++

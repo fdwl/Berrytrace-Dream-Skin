@@ -1,0 +1,458 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/08-build.md b/plugins-dev/npx-tools/skills/plugin-creator/references/08-build.md
+index e6a934e..852369f 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/08-build.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/08-build.md
+@@ -1,92 +1,54 @@
+ # 08 — 构建规范
+ 
+-## 唯一铁律：external 只放一个包
++## 核心原则
+ 
+-```javascript
+-// ✅ 正确
+-external: ['berrytrace-plugin-sdk']
+-
+-// ❌ 错误：ws / express / path 都是纯 JS，应该 bundle 进去
+-external: ['berrytrace-plugin-sdk', 'ws', 'express', 'path']
++**esbuild 是静态分析工具**——它只能处理静态的 `import/require`。遇到动态路径（如 `require(variable)` 或库内部的懒加载），这些依赖会在运行时找不到。
+ 
+-// ❌ 错误：electron 在插件子进程里不可用，加了也没用
+-external: ['berrytrace-plugin-sdk', 'electron']
+-```
++## 构建模式概览
+ 
+-**为什么只放 SDK？**
++BerryTrace SDK 现在通过**全局 shim** 注入，不再需要 `external: ['berrytrace-plugin-sdk']`：
+ 
+-- `berrytrace-plugin-sdk` → 宿主 App 已打包，通过 `NODE_PATH` 自动提供给所有插件进程
+-- 其他所有 npm 包 → esbuild `bundle: true` 直接内联进 `dist/background.js`
+-- `.btp` 安装包不含 `node_modules/`，用户机器上不会有这些包，必须 bundle
++- **view 构建（browser）**：`berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand` 均从 `window` 全局变量读取，不打包进产物
++- **background 构建（node）**：`berrytrace-plugin-sdk` 和 `electron` external，`package.json` 的 `dependencies` 自动 external
++- 构建产物 `minify: false`，方便调试
++- JSX 使用 `React.createElement` / `React.Fragment` 作为 factory
+ 
+ ---
+ 
+-## 例外：native `.node` 文件（esbuild 无法 bundle）
+-
+-含 C++ 编译产物（`.node` 二进制文件）的模块无法被 esbuild 直接内联，且 `.btp` 插件包安装在用户电脑上时**完全不包含 `node_modules` 目录**。因此，如果您仅仅在 `external` 里声明了原生包名并在构建时复制 `.node` 文件，由于客户端没有 `node_modules`，运行时直接 `require('原生包名')` 仍然会抛出 `MODULE_NOT_FOUND` 错误并导致进程崩溃。
+-
+-**正确的 Native 模块处理范式如下**：
+-
+-1. **构建与复制**：
+-   在 `bundle.mjs` 中将原生包声明为 `external`（避免 esbuild 解析它），在构建脚本中将其原生二进制 `.node` 文件根据当前的平台与架构，复制到插件的 `bin/` 目录下（重命名为如 `module-platform-arch.node`），一同打包进插件。
+-
+-   ```javascript
+-   // 1. esbuild.build 中声明 external
+-   external: ['berrytrace-plugin-sdk', 'your-native-module']
+-
+-   // 2. 复制并重命名 native 二进制
+-   import { copyFileSync, existsSync, mkdirSync } from 'fs';
+-   const platform = process.platform;
+-   const arch = process.arch;
+-   const srcNode = 'node_modules/your-native-module/build/Release/binding.node';
+-   const destNode = `bin/module-${platform}-${arch}.node`;
+-   if (existsSync(srcNode)) {
+-     mkdirSync('bin', { recursive: true });
+-     copyFileSync(srcNode, destNode);
+-   }
+-   ```
+-
+-2. **在代码中动态相对路径加载**：
+-   在插件业务代码中，**不能直接 `require('your-native-module')`**，必须根据运行平台和架构使用相对路径动态 require 刚才打包好的 `.node` 文件：
+-
+-   ```typescript
+-   import { join, dirname } from 'path';
+-   import { fileURLToPath } from 'url';
+-   import { existsSync } from 'fs';
+-
+-   const __filename = fileURLToPath(import.meta.url);
+-   const __dirname = dirname(__filename);
+-
+-   function loadNativeModule() {
+-     const platform = process.platform;
+-     const arch = process.arch;
+-     // 拼接 .node 原生文件的相对路径
+-     const binPath = join(__dirname, '..', 'bin', `module-${platform}-${arch}.node`);
+-
+-     if (existsSync(binPath)) {
+-       return require(binPath);
+-     }
+-     
+-     // 降级：开发环境下直接 require 包名（依赖本地 node_modules 存在）
+-     try {
+-       return require('your-native-module');
+-     } catch (err) {
+-       console.error('Failed to load native module:', err);
+-       return null;
+-     }
+-   }
+-
+-   const nativeModule = loadNativeModule();
+-   ```
+-
+-**判断依据**：`npm install` 后出现 `node-gyp rebuild` 编译步骤 → native 模块。
+-只有必须依赖 C++ 原生二进制运行的模块才采用上述 Native 处理范式，其他一律使用 `esbuild` 自动 bundle 进单文件。
++## 决策树：你的依赖放哪？
++
++```
++依赖分类
++│
++├── 1. 纯 JS 包（axios、zod、ws、dayjs、sharp 等）
++│        ↓
++│   → 不加 external，esbuild 直接 bundle 进 dist/index.js
++│   → package.json: dependencies
++│   → 无需 node_modules
++│
++├── 2. 有动态 require 的大型包（playwright-core、puppeteer 等）
++│        ↓
++│   → 加 external（避免 esbuild 解析报错）
++│   → plugin.json 加 "files" 字段，包含 node_modules
++│   → berrytrace pack 会把整个 node_modules 打进 .btp
++│
++└── 3. 原生 .node 二进制包（better-sqlite3、canvas、node-gyp 系）
++         ↓
++    → 加 external（esbuild 无法处理 C++ 二进制）
++    → bundle.mjs 里 copyFileSync .node 文件到 dist/bin/
++    → 代码里用相对路径 require('../bin/module-darwin-arm64.node')
++```
++
++**如何判断一个包是否属于第 2 类（动态 require）**：
++- 包里没有 `dependencies` 字段，但体积很大（> 3MB）
++- `npm install` 后，被 hoist 到顶层的包有几十个（说明间接依赖很多）
++- 包的 `lib/` 内有 `require(变量)` 或 `require(模板字符串)`
+ 
+ ---
+ 
+-## 标准 bundle.mjs
++## 标准 bundle.mjs（第 1 类：纯 JS 包）
+ 
+-复制以下内容到 `scripts/bundle.mjs`，按插件类型取消对应注释：
++**95% 的插件用这个**：esbuild 全量 bundle，view 层用全局 shim 注入 SDK/React。
+ 
+ ```javascript
+ import * as esbuild from 'esbuild';
+@@ -101,18 +63,22 @@ mkdirSync(outDir, { recursive: true });
+ 
+ async function build() {
+ 
+-  // ── panel 插件：只需渲染层 ──────────────────────────────────────
++  // ── panel 插件：浏览器渲染层 ──────────────────────────────────
+   await esbuild.build({
+     entryPoints: [resolve(root, 'src/index.ts')],
+     bundle: true,
+     outfile: resolve(outDir, 'index.js'),
+     format: 'esm',
+     platform: 'browser',
+-    target: ['chrome110'],
+-    external: ['berrytrace-plugin-sdk'],   // ← 只有这一个！
++    target: ['es2022'],
++    jsxFactory: 'React.createElement',
++    jsxFragment: 'React.Fragment',
++    minify: false,
++    plugins: [cssPlugin, globalSdkPlugin, globalReactPlugin],
++    external: [],  // SDK/React/zustand 通过全局 shim 注入，无需 external
+   });
+ 
+-  // ── background / hybrid 插件：后台 Node.js 进程 ─────────────────
++  // ── background / hybrid 插件：Node.js 后台进程 ─────────────────
+   // await esbuild.build({
+   //   entryPoints: [resolve(root, 'src/background.ts')],
+   //   bundle: true,
+@@ -120,53 +86,25 @@ async function build() {
+   //   format: 'esm',
+   //   platform: 'node',
+   //   target: ['node20'],
+-  //   external: ['berrytrace-plugin-sdk'],   // ← 只有这一个！
++  //   external: ['berrytrace-plugin-sdk', 'electron'],  // 只 external 这两个！
++  //   banner: {
++  //     js: `import { createRequire as _cr } from 'module'; const require = _cr(import.meta.url);`,
++  //   },
+   // });
+-
+ }
+ 
+ build();
+ ```
+ 
+----
+-
+-## 按插件类型的构建需求
+-
+-| 插件类型 | 构建 index.js (browser) | 构建 background.js (node) |
+-|:---:|:---:|:---:|
+-| `panel` | ✅ | ✗ |
+-| `background` | ✗ | ✅ |
+-| `hybrid` | ✅ | ✅ |
+-| `main` | ✗ | ✅ |
+-
+----
+-
+-## 关键规则（AI checklist）
+-
+-1. **`external` 只放 `berrytrace-plugin-sdk`，其他任何包都不放**
+-2. native `.node` 模块：加入 `external` 并 `copyFileSync` 到 `dist/`
+-3. background/hybrid Node.js 构建：`platform: 'node'`，不写 `electron`
+-4. panel/hybrid 浏览器构建：`platform: 'browser'`，不可含 Node.js API
+-5. `berrytrace-plugin-sdk` 放 `devDependencies`（运行时由宿主提供）
+-6. 其他第三方包放 `dependencies`（开发时 npm install，构建时 bundle）
++> **view 构建不再需要 `external: ['berrytrace-plugin-sdk']`**——esbuild 插件会自动将 `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand` 替换为全局变量引用。
+ 
+ ---
+ 
+-## 常见错误
+-
+-| 错误信息 | 原因 | 修复 |
+-|------|------|------|
+-| `Cannot find package 'ws'` | `ws` 被错误放入 `external` | 从 external 移除，让 esbuild bundle |
+-| `Cannot find package 'berrytrace-plugin-sdk'` | SDK 没有 external | 加 `external: ['berrytrace-plugin-sdk']` |
+-| `.node file not found` | native 模块没 copyFile | 手动 `copyFileSync` 到 `dist/` |
+-| `electron is not defined` | background 里误用了 electron API | 改用 SDK（`sdk.filesystem`、`sdk.system` 等） |
+-
++## 特殊 bundle.mjs（第 2 类：有动态 require 的大型包）
+ 
+----
+-
+-## 标准 bundle.mjs
++适用于 `playwright-core`、`puppeteer` 等内部有大量懒加载的包。
+ 
+-复制以下内容到 `scripts/bundle.mjs`，修改 `entryPoints` 和 `outfile`：
++> **注意**：background 构建现在会自动将 `package.json` 的 `dependencies` 加入 external，无需手动列举。
+ 
+ ```javascript
+ import * as esbuild from 'esbuild';
+@@ -179,137 +117,118 @@ const root = resolve(__dirname, '..');
+ const outDir = resolve(root, 'dist');
+ mkdirSync(outDir, { recursive: true });
+ 
+-const external = ['berrytrace-plugin-sdk', 'electron'];
+-
+-const sdkShimPlugin = {
+-  name: 'sdk-shim',
++const nodeBuiltins = [
++  'fs', 'path', 'os', 'child_process', 'http', 'https', 'url', 'events',
++  'crypto', 'stream', 'util', 'net', 'tls', 'zlib', 'dns', 'readline',
++  'module', 'buffer', 'assert', 'constants', 'vm', 'async_hooks', 'tty',
++];
++
++const external = [
++  'berrytrace-plugin-sdk',
++  'electron',
++  ...nodeBuiltins,
++  ...nodeBuiltins.map(b => `node:${b}`),
++];
++
++// 拦截 .node 原生二进制（esbuild 解析阶段遇到时不报错）
++const nativeStubPlugin = {
++  name: 'native-stub',
+   setup(build) {
+-    build.onResolve({ filter: /^berrytrace-plugin-sdk$/ }, () => ({
+-      path: 'berrytrace-plugin-sdk', namespace: 'sdk-shim',
+-    }));
+-    build.onLoad({ filter: /.*/, namespace: 'sdk-shim' }, () => ({
+-      contents: `
+-function callApi(n, m, a, pid) {
+-  return window.electronAPI.callApi(n, m, a, pid);
+-}
+-function proxy(n, manual) {
+-  return new Proxy(manual || {}, {
+-    get(t, p) {
+-      if (typeof p !== 'string') return Reflect.get(t, p);
+-      if (p in t) return t[p];
+-      return (...a) => callApi(n, p, a);
+-    }
+-  });
+-}
+-export function createPluginSDK(pluginId) {
+-  return {
+-    storage: proxy('storage', {
+-      kv: proxy('storage', {
+-        get: (k, d) => callApi('storage', 'kv.get', [k, d], pluginId),
+-        set: (k, v) => callApi('storage', 'kv.set', [k, v], pluginId),
+-        delete: (k) => callApi('storage', 'kv.delete', [k], pluginId),
+-        clear: () => callApi('storage', 'kv.clear', [], pluginId),
+-      }),
+-      db: proxy('storage', {
+-        execute: (sql, p) => callApi('storage', 'db.execute', [sql, p], pluginId),
+-        run: (sql, p) => callApi('storage', 'db.run', [sql, p], pluginId),
+-      }),
+-    }),
+-    ai: proxy('ai', {
+-      chat: (o) => callApi('ai', 'chat', [o], pluginId),
+-      chatStream: (o, cb) => callApi('ai', 'chatStream', [o, cb], pluginId),
+-      embed: (t) => callApi('ai', 'embed', [t], pluginId),
+-      rerank: (q, d) => callApi('ai', 'rerank', [q, d], pluginId),
+-    }),
+-    filesystem: proxy('filesystem'),
+-    window: proxy('window', {
+-      create: (o) => callApi('window', 'create', [o], pluginId),
+-      close: (id) => callApi('window', 'close', [id], pluginId),
+-      minimize: () => callApi('window', 'minimize', [], pluginId),
+-      maximize: () => callApi('window', 'maximize', [], pluginId),
+-      resize: (w, h) => callApi('window', 'resize', [w, h], pluginId),
+-      startDrag: () => callApi('window', 'startDrag', [], pluginId),
+-      getState: (id) => callApi('window', 'getState', [id], pluginId),
+-      getAlwaysOnTop: () => callApi('window', 'getAlwaysOnTop', [], pluginId),
+-      toggleAlwaysOnTop: () => callApi('window', 'toggleAlwaysOnTop', [], pluginId),
+-    }),
+-    log: {
+-      info: (m) => callApi('log', 'info', [m], pluginId),
+-      warn: (m) => callApi('log', 'warn', [m], pluginId),
+-      error: (m) => callApi('log', 'error', [m], pluginId),
+-      debug: (m) => callApi('log', 'debug', [m], pluginId),
+-    },
+-    system: proxy('system'),
+-    dialog: proxy('dialog'),
+-    events: proxy('events'),
+-    commands: proxy('commands', {
+-      register: (o) => callApi('commands', 'register', [o], pluginId),
+-      unregister: (id) => callApi('commands', 'unregister', [id], pluginId),
+-      execute: (id, a) => callApi('commands', 'execute', [id, a], pluginId),
+-    }),
+-    hooks: proxy('hooks'),
+-    scheduler: proxy('scheduler'),
+-    search: proxy('search'),
+-    articles: proxy('articles'),
+-    localAi: proxy('local-ai'),
+-    publish: proxy('publish'),
+-    selectionMenu: proxy('selectionMenu'),
+-    mcp: proxy('mcp'),
+-    workspace: proxy('workspace'),
+-    context: proxy('context'),
+-    plugin: proxy('plugin'),
+-    user: proxy('user'),
+-  };
+-}
+-      `.trim(),
+-      loader: 'js',
+-    })),
++    build.onResolve({ filter: /\.node$/ }, args => ({ path: args.path, namespace: 'native-stub' }));
++    build.onLoad({ filter: /.*/, namespace: 'native-stub' }, () => ({ contents: `module.exports = {};`, loader: 'js' }));
+   },
+ };
+ 
+-async function build() {
+-  // ---- panel 插件只需要这一段 ----
+-  await esbuild.build({
+-    entryPoints: [resolve(root, 'src/renderer.tsx')],
+-    bundle: true,
+-    outfile: resolve(outDir, 'renderer.js'),
+-    format: 'esm',
+-    platform: 'browser',
+-    target: ['es2022'],
+-    plugins: [sdkShimPlugin],
+-  });
++await esbuild.build({
++  entryPoints: [resolve(root, 'src/index.ts')],
++  bundle: true,
++  outfile: resolve(outDir, 'index.js'),
++  format: 'esm',
++  platform: 'node',
++  target: ['node18'],
++  external,
++  plugins: [nativeStubPlugin],
++  banner: {
++    js: [
++      `import { createRequire as _cr } from 'module';`,
++      `import { fileURLToPath as _furl } from 'url';`,
++      `import { dirname as _dname } from 'path';`,
++      `const require = _cr(import.meta.url);`,
++      `const __filename = _furl(import.meta.url);`,
++      `const __dirname = _dname(__filename);`,
++    ].join(' '),
++  },
++});
+ 
+-  // ---- background / hybrid 插件需要这一段 ----
+-  // await esbuild.build({
+-  //   entryPoints: [resolve(root, 'src/background.ts')],
+-  //   bundle: true,
+-  //   outfile: resolve(outDir, 'background.js'),
+-  //   format: 'esm',
+-  //   platform: 'node',
+-  //   target: ['node20'],
+-  //   external,
+-  // });
++console.log('✅ dist/index.js built');
++console.log('ℹ️  node_modules 未内联，发布时用 berrytrace pack（含 files 字段）');
++```
++
++**对应的 plugin.json 必须加 `files` 字段**：
++
++```json
++{
++  "id": "com.berrytrace.plugin.xxx",
++  "files": [
++    "dist",
++    "node_modules",
++    "plugin.json",
++    "package.json"
++  ]
+ }
++```
+ 
+-build();
++> **为什么加 `files`？**
++> SDK `berrytrace pack` 默认只打包 `package.json` 直接 `dependencies` 里的包。
++> `playwright-core` 自身没有 `dependencies`，其懒加载的包（`bplist-creator` 等）靠 npm hoist 到上层，不在直接依赖列表里，会被漏掉。
++> 加了 `files` 字段后，SDK 直接按列表打包，跳过依赖过滤，整个 `node_modules` 全部包含。
++
++---
++
++## 特殊处理（第 3 类：原生 .node 二进制）
++
++```javascript
++import { copyFileSync, existsSync, mkdirSync } from 'fs';
++
++// 1. esbuild 中声明 external
++external: ['berrytrace-plugin-sdk', 'better-sqlite3']
++
++// 2. 构建后复制 .node 文件
++const platform = process.platform;
++const arch = process.arch;
++const srcNode = `node_modules/better-sqlite3/build/Release/better_sqlite3.node`;
++const binDir = resolve(root, 'dist/bin');
++mkdirSync(binDir, { recursive: true });
++if (existsSync(srcNode)) {
++  copyFileSync(srcNode, `${binDir}/better_sqlite3-${platform}-${arch}.node`);
++}
++```
++
++```typescript
++// 3. 代码里用相对路径加载
++const __dirname = dirname(fileURLToPath(import.meta.url));
++const nodePath = join(__dirname, 'bin', `better_sqlite3-${process.platform}-${process.arch}.node`);
++const Database = require(nodePath);
+ ```
+ 
+ ---
+ 
+ ## 按插件类型的构建需求
+ 
+-| 插件类型 | 构建 renderer.js | 构建 background.js |
++| 插件类型 | 构建 index.js (browser) | 构建 background.js / index.js (node) |
+ |:---:|:---:|:---:|
+-| `panel` | ✅ | 不需要 |
+-| `background` | 不需要 | ✅ |
++| `panel` | ✅ `platform: 'browser'` | ✗ |
++| `background` | ✗ | ✅ `platform: 'node'` |
+ | `hybrid` | ✅ | ✅ |
+-| `main` | 不需要 | ✅（不分离） |
++| `main` | ✗ | ✅（不分离） |
+ 
+ ---
+ 
+-## 关键规则
++## 常见错误
+ 
+-1. background 构建必须 `external: ['berrytrace-plugin-sdk', 'electron']`
+-2. renderer 构建必须用 `sdkShimPlugin` 处理裸包名（Import Maps 启用后可省略）
+-3. renderer 产物不可含 `fs`、`path`、`child_process` 等 Node.js API
+-4. panel 插件只需 renderer 构建，注释掉 background 构建部分
++| 错误信息 | 原因 | 修复 |
++|------|------|------|
++| `Cannot find package 'xxx'` | 该包有动态 require，esbuild 没有 bundle 进去 | 参考第 2 类方案：external + files 字段 |
++| `.node file not found` | native 模块没 copyFile | `copyFileSync` 到 `dist/bin/` |
++| `electron is not defined` | background 里误用了 electron API | 改用 SDK 对应方法 |
++| `ReferenceError: require is not defined` | ESM 格式用了 CJS require | 加 banner shim（见上方模板）|

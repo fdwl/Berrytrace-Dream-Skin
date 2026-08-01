@@ -1,0 +1,131 @@
+diff --git a/electron/services/db-migrations.ts b/electron/services/db-migrations.ts
+index fa4f183..f284b20 100644
+--- a/electron/services/db-migrations.ts
++++ b/electron/services/db-migrations.ts
+@@ -1,4 +1,4 @@
+-import { DatabaseSync } from 'node:sqlite'
++import type { DatabaseSync } from 'node:sqlite'
+ 
+ export interface Migration {
+   version: number;
+@@ -190,48 +190,12 @@ export function createGlobalTables(db: DatabaseSync): void {
+ }
+ 
+ export function createWorkspaceTables(db: DatabaseSync): void {
+-  // 0a. DbChatSession table
+-  db.exec(`
+-    CREATE TABLE IF NOT EXISTS DbChatSession (
+-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+-      remote_id INTEGER UNIQUE,
+-      uuid INTEGER UNIQUE,
+-      calendar_uuid INTEGER,
+-      user_id INTEGER,
+-      title TEXT,
+-      attribute TEXT,
+-      work_dir TEXT,
+-      created_at TEXT,
+-      updated_at TEXT,
+-      is_delete INTEGER DEFAULT 0,
+-      is_sync INTEGER DEFAULT 0,
+-      isPermanentSync INTEGER DEFAULT 0
+-    )
+-  `)
+-  db.exec(`CREATE INDEX IF NOT EXISTS idx_chatsession_uuid ON DbChatSession(uuid)`)
+-  db.exec(`CREATE INDEX IF NOT EXISTS idx_chatsession_work_dir ON DbChatSession(work_dir)`)
+-
+-  // 0b. DbChatLogs table
+-  db.exec(`
+-    CREATE TABLE IF NOT EXISTS DbChatLogs (
+-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+-      remote_id INTEGER UNIQUE,
+-      uuid INTEGER UNIQUE,
+-      calendar_uuid INTEGER,
+-      user_id INTEGER,
+-      session_uuid INTEGER,
+-      role TEXT,
+-      content TEXT,
+-      attribute TEXT,
+-      created_at TEXT,
+-      updated_at TEXT,
+-      is_delete INTEGER DEFAULT 0,
+-      is_sync INTEGER DEFAULT 0,
+-      isPermanentSync INTEGER DEFAULT 0
+-    )
+-  `)
+-  db.exec(`CREATE INDEX IF NOT EXISTS idx_chatlogs_uuid ON DbChatLogs(uuid)`)
+-  db.exec(`CREATE INDEX IF NOT EXISTS idx_chatlogs_session_uuid ON DbChatLogs(session_uuid)`)
++  /**
++   * ⚠️【架构彻底纯文件化解耦声明】
++   * 本地桌面 Agent 会话管理已 100% 改造重构为纯文件存储 (Pure File Storage)。
++   * 对应工作区隐藏目录下的 `.berrytrace/sessions/*.json` 与 `.berrytrace/history/*.messages.json`。
++   * 宿主数据库完全不建会话表，杜绝数据库 Migration 与锁表风险！
++   */
+ 
+   // 2. FtsFileIndex table (for workspace files search)
+   try {
+@@ -244,12 +208,30 @@ export function createWorkspaceTables(db: DatabaseSync): void {
+         file_type UNINDEXED,
+         workspace_path UNINDEXED,
+         modified_at UNINDEXED,
+-        tokenize = 'simple'
++        tokenize = 'unicode61'
+       )
+     `)
+     console.log('[DatabaseManager] FtsFileIndex virtual table initialized.')
+-  } catch (err) {
+-    console.error('[DatabaseManager] Failed to initialize FtsFileIndex:', err)
++  } catch (err: any) {
++    console.warn('[DatabaseManager] Initializing FtsFileIndex with unicode61 fallback:', err?.message || err);
++    try {
++      db.exec(`DROP TABLE IF EXISTS FtsFileIndex`);
++      db.exec(`
++        CREATE VIRTUAL TABLE IF NOT EXISTS FtsFileIndex 
++        USING fts5(
++          file_path,
++          file_name,
++          content,
++          file_type UNINDEXED,
++          workspace_path UNINDEXED,
++          modified_at UNINDEXED,
++          tokenize = 'unicode61'
++        )
++      `);
++      console.log('[DatabaseManager] Recreated FtsFileIndex virtual table successfully.');
++    } catch (retryErr) {
++      console.error('[DatabaseManager] Failed to initialize FtsFileIndex:', retryErr);
++    }
+   }
+ 
+   // 3. FtsVectorIndex table for local AI vector search
+@@ -275,12 +257,28 @@ export function createWorkspaceTables(db: DatabaseSync): void {
+         title,
+         content,
+         meta,
+-        tokenize = 'simple'
++        tokenize = 'unicode61'
+       )
+     `)
+     console.log('[DatabaseManager] FtsAgentIndex virtual table initialized.')
+-  } catch (err) {
+-    console.error('[DatabaseManager] Failed to initialize FtsAgentIndex:', err)
++  } catch (err: any) {
++    console.warn('[DatabaseManager] Initializing FtsAgentIndex with unicode61 fallback:', err?.message || err);
++    try {
++      db.exec(`DROP TABLE IF EXISTS FtsAgentIndex`);
++      db.exec(`
++        CREATE VIRTUAL TABLE IF NOT EXISTS FtsAgentIndex USING fts5(
++          entity_id,
++          entity_type,
++          title,
++          content,
++          meta,
++          tokenize = 'unicode61'
++        )
++      `);
++      console.log('[DatabaseManager] Recreated FtsAgentIndex virtual table successfully.');
++    } catch (retryErr) {
++      console.error('[DatabaseManager] Failed to initialize FtsAgentIndex:', retryErr);
++    }
+   }
+ 
+   // 5. doc_links, semantic_pairs, and graph_cache tables for 3D Knowledge Graph

@@ -1,0 +1,34 @@
+export interface ApiContext {
+  pluginId: string;
+  sender?: Electron.WebContents;
+  callbacks?: { onChunk?: (chunk: string) => void };
+  apiName?: string;
+}
+
+export interface PluginApiController {
+  execute(methodName: string, args: unknown[], context: ApiContext): Promise<unknown> | unknown;
+}
+
+export abstract class BaseApiController implements PluginApiController {
+  async execute(methodName: string, args: unknown[], context: ApiContext): Promise<unknown> {
+    const apiName = context.apiName;
+    const cleanMethodName = methodName.replace(/\./g, '_');
+    let fn: ((...args: unknown[]) => unknown) | undefined;
+    if (apiName) {
+      const apiPrefix = apiName.replace(/-/g, '_');
+      fn = (this as Record<string, unknown>)[`${apiPrefix}_${cleanMethodName}`] as ((...args: unknown[]) => unknown) | undefined;
+    }
+    if (!fn) {
+      fn = (this as Record<string, unknown>)[cleanMethodName] as ((...args: unknown[]) => unknown) | undefined;
+    }
+    if (typeof fn !== 'function') {
+      throw new Error(`Method ${methodName} (apiName: ${apiName}) not found on controller`);
+    }
+    const expectedArgsLength = fn.length - 1;
+    const paddedArgs = [...args];
+    while (paddedArgs.length < expectedArgsLength) {
+      paddedArgs.push(undefined);
+    }
+    return fn.call(this, ...paddedArgs, context);
+  }
+}

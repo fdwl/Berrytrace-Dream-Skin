@@ -1,0 +1,623 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { MOCK_ONLINE_ASSETS } from './types';
+import type { Asset } from './types';
+
+interface PluginItem {
+  id: string;
+  name: string;
+  version: string;
+  description?: string;
+  isActive: boolean;
+  isDevFolder: boolean;
+  isPinned?: boolean;
+  view?: string;
+  type?: string;
+  updateVersion?: string;
+  updateUrl?: string;
+  updateChangelog?: string;
+}
+
+interface SkillItem {
+  id?: string;
+  name: string;
+  displayName?: string;
+  description?: string;
+  source?: string;
+  [key: string]: string | number | boolean | undefined | null;
+}
+
+interface ToolItem {
+  id?: string;
+  name: string;
+  isInstalled: boolean;
+  description?: string;
+  [key: string]: string | number | boolean | undefined | null;
+}
+
+interface McpToolItem {
+  name: string;
+  displayName?: string;
+  description?: string;
+  pluginId?: string;
+  [key: string]: string | number | boolean | undefined | null;
+}
+
+interface PluginsManagementPanelProps {
+  onBack: () => void;
+  installedPlugins: PluginItem[];
+  installedSkills: SkillItem[];
+  installedTools: ToolItem[];
+  installedMcpTools: McpToolItem[];
+  simulatedInstalledIds: string[];
+  onUninstallMockAsset: (id: string) => void;
+  onUninstallSkill: (name: string) => void;
+  loadLocalData: () => Promise<void>;
+}
+
+export default function PluginsManagementPanel({
+  onBack,
+  installedPlugins,
+  installedSkills,
+  installedTools,
+  installedMcpTools,
+  simulatedInstalledIds,
+  onUninstallMockAsset,
+  onUninstallSkill,
+  loadLocalData,
+}: PluginsManagementPanelProps) {
+  const [activeTab, setActiveTab] = useState<Asset['type']>('skill');
+  const [activeMenuPluginId, setActiveMenuPluginId] = useState<string | null>(null);
+  const [updatingPluginIds, setUpdatingPluginIds] = useState<string[]>([]);
+  const [isCheckingAll, setIsCheckingAll] = useState(false);
+
+  // Click outside to close dropdown menu
+  useEffect(() => {
+    if (!activeMenuPluginId) return;
+    const handleDocumentClick = () => {
+      setActiveMenuPluginId(null);
+    };
+    document.addEventListener('click', handleDocumentClick);
+    return () => {
+      document.removeEventListener('click', handleDocumentClick);
+    };
+  }, [activeMenuPluginId]);
+
+  // Management view lists (all local installed items)
+  const managedPlugins = useMemo(() => installedPlugins, [installedPlugins]);
+  const managedSkills = useMemo(() => installedSkills, [installedSkills]);
+  const managedTools = useMemo(() => installedTools.filter(t => t.isInstalled), [installedTools]);
+  const managedMcps = useMemo(() => installedMcpTools, [installedMcpTools]);
+
+  // Actions for plugins
+  const handleTogglePlugin = async (id: string, currentlyActive: boolean) => {
+    try {
+      if (window.electronAPI?.plugins?.toggle) {
+        await window.electronAPI.plugins.toggle(id, !currentlyActive);
+      }
+      if (!currentlyActive && window.electronAPI?.plugins?.reload) {
+        await window.electronAPI.plugins.reload(id);
+      }
+      await loadLocalData();
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '切换插件状态失败');
+    }
+  };
+
+  const handleUninstallPlugin = async (id: string) => {
+    if (!confirm('确定要卸载该插件并删除其所有本地文件吗？')) return;
+    try {
+      if (window.electronAPI?.plugins?.uninstall) {
+        const success = await window.electronAPI.plugins.uninstall(id);
+        if (success) {
+          await loadLocalData();
+        } else {
+          alert('卸载插件失败');
+        }
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '卸载插件失败');
+    }
+  };
+
+  const handleReloadPlugin = async (id: string) => {
+    try {
+      if (window.electronAPI?.plugins?.reload) {
+        const success = await window.electronAPI.plugins.reload(id);
+        if (success) {
+          await loadLocalData();
+        } else {
+          alert('重载插件失败');
+        }
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '重载插件失败');
+    }
+  };
+
+  const handleCheckUpdateSingle = async (id: string) => {
+    if (!window.electronAPI?.plugins?.checkUpdateSingle) {
+      alert('当前版本不支持检查单个插件更新');
+      return;
+    }
+    try {
+      setUpdatingPluginIds(prev => [...prev, id]);
+      const res = await window.electronAPI.plugins.checkUpdateSingle(id);
+      if (res.success) {
+        if (res.updated) {
+          alert(`插件更新成功: ${res.message}`);
+        } else {
+          alert(res.message || '当前已是最新版本');
+        }
+        await loadLocalData();
+      } else {
+        alert(res.message || '检查更新失败');
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '检查更新失败');
+    } finally {
+      setUpdatingPluginIds(prev => prev.filter(x => x !== id));
+    }
+  };
+
+  const handleCheckUpdatesAll = async () => {
+    if (!window.electronAPI?.plugins?.checkUpdatesAll) {
+      alert('当前版本不支持检查更新');
+      return;
+    }
+    try {
+      setIsCheckingAll(true);
+      const res = await window.electronAPI.plugins.checkUpdatesAll();
+      if (res.success) {
+        alert('检查更新和静默安装完成');
+        await loadLocalData();
+      } else {
+        alert(res.error || '检查更新失败');
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '检查更新失败');
+    } finally {
+      setIsCheckingAll(false);
+    }
+  };
+
+  const handleUpdatePlugin = async (id: string, url: string) => {
+    if (!window.electronAPI?.plugins?.installFromUrl) return;
+    try {
+      setUpdatingPluginIds(prev => [...prev, id]);
+      const success = await window.electronAPI.plugins.installFromUrl(url);
+      if (!success) {
+        alert('触发插件更新失败');
+        setUpdatingPluginIds(prev => prev.filter(x => x !== id));
+      } else {
+        await loadLocalData();
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '触发插件更新失败');
+      setUpdatingPluginIds(prev => prev.filter(x => x !== id));
+    }
+  };
+
+  const handleLoadUnpacked = async () => {
+    try {
+      if (window.electronAPI?.plugins?.loadUnpacked) {
+        const res = await window.electronAPI.plugins.loadUnpacked();
+        if (res.success) {
+          await loadLocalData();
+        } else if (res.reason !== 'canceled') {
+          alert(res.reason || '加载解压插件失败');
+        }
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '加载解压插件失败');
+    }
+  };
+
+  const handleInstallPkgDialog = async () => {
+    if (!window.electronAPI?.plugins?.selectPkgFile || !window.electronAPI?.plugins?.verifyPkg || !window.electronAPI?.plugins?.confirmInstall) return;
+    try {
+      const res = await window.electronAPI.plugins.selectPkgFile();
+      if (res.success && res.filePath) {
+        const verifyRes = await window.electronAPI.plugins.verifyPkg(res.filePath);
+        if (verifyRes.success && verifyRes.tempDir && verifyRes.packagePath && verifyRes.manifest) {
+          const ok = await window.electronAPI.plugins.confirmInstall(
+            verifyRes.tempDir,
+            verifyRes.packagePath,
+            (verifyRes.manifest as { id: string }).id,
+            verifyRes.signature as string | undefined
+          );
+          if (ok) {
+            await loadLocalData();
+            alert('安装成功！');
+          } else {
+            alert('安装失败');
+          }
+        }
+      }
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : '选择插件包失败');
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onBack}
+            className="p-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded bg-transparent border-none cursor-pointer flex items-center justify-center transition-colors"
+            title="返回市场"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="19" y1="12" x2="5" y2="12" />
+              <polyline points="12 19 5 12 12 5" />
+            </svg>
+          </button>
+          <h2 className="text-sm font-semibold text-[var(--text-primary)]">已安装资源管理</h2>
+        </div>
+
+        {/* Dev Tools card trigger */}
+        <div className="flex items-center gap-2">
+          {activeTab === 'plugin' && (
+            <button
+              onClick={handleCheckUpdatesAll}
+              disabled={isCheckingAll}
+              className="px-2.5 py-1 text-[10px] text-[var(--color-brand)] border border-[var(--color-brand)]/20 bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer transition-all duration-200 flex items-center gap-1"
+            >
+              {isCheckingAll && (
+                <svg className="animate-spin h-2.5 w-2.5 text-[var(--color-brand)]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+              )}
+              {isCheckingAll ? '正在检查...' : '重新检查所有更新'}
+            </button>
+          )}
+          <button
+            onClick={handleLoadUnpacked}
+            className="px-2.5 py-1 text-[10px] text-[var(--text-secondary)] border border-[var(--border-light)] hover:border-[var(--border-hover)] bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer transition-all duration-200"
+          >
+            加载解压目录
+          </button>
+          <button
+            onClick={handleInstallPkgDialog}
+            className="px-2.5 py-1 text-[10px] text-[var(--text-secondary)] border border-[var(--border-light)] hover:border-[var(--border-hover)] bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer transition-all duration-200"
+          >
+            导入 btp 安装包
+          </button>
+        </div>
+      </div>
+
+      {/* Management tab selection */}
+      <div className="flex flex-col gap-4">
+        <div className="flex gap-2 border-b border-[var(--border-light)] pb-1">
+        {(['skill', 'tool', 'plugin', 'mcp'] as const).map(tab => {
+            const TAB_LABELS: Record<typeof tab, string> = {
+              skill: '技能',
+              tool: '工具',
+              plugin: '插件',
+              mcp: 'MCP',
+            };
+            return (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`pb-2 px-1 text-xs font-semibold tracking-wide border-none bg-transparent cursor-pointer transition-all duration-200 ${
+                  activeTab === tab
+                    ? 'text-[var(--color-brand)] border-b-2 border-[var(--color-brand)] border-solid'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                {TAB_LABELS[tab]}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Management List Section */}
+        <div className="flex flex-col gap-3">
+          {activeTab === 'plugin' && (
+            /* --- Plugin Management --- */
+            managedPlugins.length === 0 ? (
+              <div className="py-12 text-center text-xs text-[var(--text-tertiary)]">无已安装的插件</div>
+            ) : (
+              managedPlugins.map(p => (
+                <div key={`real-plugin-${p.id}`} className="flex flex-col p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex-1 flex flex-col gap-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{p.name}</span>
+                        <span className="text-[10px] text-[var(--text-tertiary)]">v{p.version}</span>
+                        {p.isDevFolder && <span className="text-[8px] bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1 rounded">Dev</span>}
+                      </div>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1 leading-relaxed">
+                        {p.description || '暂无描述信息'}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={p.isActive}
+                          onChange={() => handleTogglePlugin(p.id, p.isActive)}
+                          className="sr-only peer"
+                        />
+                        <div className="w-7 h-4 bg-neutral-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-gray-300 after:border-gray-300 after:border after:rounded-full after:h-[12px] after:w-[12px] after:transition-all peer-checked:bg-[var(--color-brand)] peer-checked:after:bg-white"></div>
+                      </label>
+
+                      {/* 更多菜单 */}
+                      <div className="relative" style={{ flexShrink: 0 }}>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setActiveMenuPluginId(activeMenuPluginId === p.id ? null : p.id);
+                          }}
+                          className="px-2 py-1 text-[10px] text-[var(--text-secondary)] border border-[var(--border-light)] hover:border-[var(--border-hover)] bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer transition-all duration-200 flex items-center gap-1"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="1" />
+                            <circle cx="19" cy="12" r="1" />
+                            <circle cx="5" cy="12" r="1" />
+                          </svg>
+                          <span>更多</span>
+                        </button>
+
+                        {activeMenuPluginId === p.id && (
+                          <div 
+                            className="absolute right-0 mt-1 w-32 bg-[var(--bg-card)] border border-[var(--border-light)] rounded-lg shadow-lg py-1 z-10 flex flex-col"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {!p.isDevFolder && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleCheckUpdateSingle(p.id);
+                                  setActiveMenuPluginId(null);
+                                }}
+                                disabled={updatingPluginIds.includes(p.id)}
+                                className="w-full text-left px-3 py-1.5 text-[11px] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] bg-transparent border-none cursor-pointer flex items-center gap-1.5 transition-colors"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                                </svg>
+                                <span>{updatingPluginIds.includes(p.id) ? '正在检查...' : '检查更新'}</span>
+                              </button>
+                            )}
+
+
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleReloadPlugin(p.id);
+                                  setActiveMenuPluginId(null);
+                                }}
+                                className="w-full text-left px-3 py-1.5 text-[11px] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] bg-transparent border-none cursor-pointer flex items-center gap-1.5 transition-colors"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                                </svg>
+                                <span>重载插件</span>
+                              </button>
+
+
+                            <div className="h-px bg-[var(--border-light)] my-1" />
+
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleUninstallPlugin(p.id);
+                                setActiveMenuPluginId(null);
+                              }}
+                              className="w-full text-left px-3 py-1.5 text-[11px] text-red-500 hover:bg-red-500/10 bg-transparent border-none cursor-pointer flex items-center gap-1.5 transition-colors"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                                <polyline points="3 6 5 6 21 6" />
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                              </svg>
+                              <span>卸载插件</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 发现更新 Banner */}
+                  {p.updateVersion && p.updateUrl && (
+                    <div 
+                      className="mt-3 p-3 rounded-lg border flex items-center justify-between gap-4"
+                      style={{
+                        background: 'var(--bg-brand-soft, rgba(99, 102, 241, 0.05))',
+                        border: '1px solid var(--border-light, rgba(99, 102, 241, 0.15))',
+                      }}
+                    >
+                      <div className="flex flex-col gap-1 text-left min-w-0 flex-1">
+                        <span className="text-[11px] font-semibold text-[var(--color-brand)]">
+                          发现新版本 v{p.updateVersion}
+                        </span>
+                        {p.updateChangelog && (
+                          <span className="text-[10px] text-[var(--text-secondary)] line-clamp-2 leading-relaxed">
+                            更新日志: {p.updateChangelog}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => handleUpdatePlugin(p.id, p.updateUrl!)}
+                        disabled={updatingPluginIds.includes(p.id)}
+                        className="px-3 py-1 text-[10px] font-semibold text-white bg-[var(--color-brand)] hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed rounded-md border-none cursor-pointer transition-all duration-200 flex items-center gap-1.5"
+                      >
+                        {updatingPluginIds.includes(p.id) && (
+                          <svg className="animate-spin h-2.5 w-2.5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                          </svg>
+                        )}
+                        {updatingPluginIds.includes(p.id) ? '正在更新' : '立即更新'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))
+            )
+          )}
+
+          {activeTab === 'skill' && (
+            /* --- Skills Management --- */
+            managedSkills.length === 0 && simulatedInstalledIds.filter(x => x.includes('skill')).length === 0 ? (
+              <div className="py-12 text-center text-xs text-[var(--text-tertiary)]">无已安装的技能</div>
+            ) : (
+              <>
+                {/* Real skills */}
+                {managedSkills.map(s => (
+                  <div key={`real-skill-${s.id}`} className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4">
+                    <div className="flex-1 flex flex-col gap-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{s.displayName}</span>
+                        <span className="text-[10px] text-[var(--text-tertiary)]">{s.source === 'builtin' ? '内置' : '外部'}</span>
+                      </div>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1">
+                        {s.description || '无描述'}
+                      </p>
+                    </div>
+                    {s.source !== 'builtin' && (
+                      <button
+                        onClick={() => onUninstallSkill(s.name)}
+                        className="px-2 py-1 text-[10px] text-red-500 hover:text-white border border-red-500/20 hover:border-red-500 bg-transparent hover:bg-red-500/10 rounded cursor-pointer transition-all duration-200"
+                      >
+                        删除
+                      </button>
+                    )}
+                  </div>
+                ))}
+
+                {/* Mock skills simulated */}
+                {MOCK_ONLINE_ASSETS.filter(a => a.type === 'skill' && simulatedInstalledIds.includes(a.id)).map(s => (
+                  <div key={`mock-skill-${s.id}`} className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4">
+                    <div className="flex-1 flex flex-col gap-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{s.displayName}</span>
+                        <span className="text-[10px] text-[var(--text-tertiary)]">模拟安装</span>
+                      </div>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1">
+                        {s.description}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => onUninstallMockAsset(s.id)}
+                      className="px-2 py-1 text-[10px] text-red-500 hover:text-white border border-red-500/20 hover:border-red-500 bg-transparent hover:bg-red-500/10 rounded cursor-pointer transition-all duration-200"
+                    >
+                      卸载
+                    </button>
+                  </div>
+                ))}
+              </>
+            )
+          )}
+
+          {activeTab === 'tool' && (
+            /* --- Tools Management --- */
+            managedTools.length === 0 && simulatedInstalledIds.filter(x => x.includes('tool')).length === 0 ? (
+              <div className="py-12 text-center text-xs text-[var(--text-tertiary)]">无已就绪的工具</div>
+            ) : (
+              <>
+                {/* Real tools */}
+                {managedTools.map(t => (
+                  <div key={`real-tool-${t.id}`} className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4">
+                    <div className="flex-1 flex flex-col gap-1 min-w-0">
+                      <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{t.name}</span>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1">{t.description}</p>
+                    </div>
+                    <span className="px-2 py-0.5 text-[9px] text-emerald-500 bg-emerald-500/5 border border-emerald-500/20 rounded">
+                      ● 已就绪
+                    </span>
+                  </div>
+                ))}
+
+                {/* Mock tools simulated */}
+                {MOCK_ONLINE_ASSETS.filter(a => a.type === 'tool' && simulatedInstalledIds.includes(a.id)).map(t => (
+                  <div key={`mock-tool-${t.id}`} className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4">
+                    <div className="flex-1 flex flex-col gap-1 min-w-0">
+                      <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{t.displayName}</span>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1">{t.description}</p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="px-2 py-0.5 text-[9px] text-emerald-500 bg-emerald-500/5 border border-emerald-500/20 rounded">
+                        ● 已就绪
+                      </span>
+                      <button
+                        onClick={() => onUninstallMockAsset(t.id)}
+                        className="p-1 text-red-500 hover:bg-red-500/10 rounded border-none bg-transparent cursor-pointer transition-colors"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                          <polyline points="3 6 5 6 21 6" />
+                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </>
+            )
+          )}
+
+          {activeTab === 'mcp' && (
+            /* --- MCP Management --- */
+            managedMcps.length === 0 && simulatedInstalledIds.filter(x => x.includes('mcp')).length === 0 ? (
+              <div className="py-12 text-center text-xs text-[var(--text-tertiary)]">无活跃的 MCP 工具</div>
+            ) : (
+              <>
+                {/* Real MCP tools listed individually matching settings */}
+                {managedMcps.map(t => {
+                  const isPluginMcp = t.pluginId && t.pluginId !== 'system' && t.pluginId !== 'berrytrace.host';
+                  return (
+                    <div key={t.name} className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4">
+                      <div className="flex-1 flex flex-col gap-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{t.name}</span>
+                          {t.displayName && t.displayName !== t.name && (
+                            <span className="text-[10px] text-[var(--text-tertiary)]">({t.displayName})</span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1">{t.description || '暂无描述信息'}</p>
+                        <span className="text-[9.5px] text-[var(--text-tertiary)] mt-0.5">
+                          {isPluginMcp ? `来自插件: ${t.pluginId} (不可直接删除)` : '系统内置'}
+                        </span>
+                      </div>
+                      <span className="px-2 py-0.5 text-[9px] text-emerald-500 bg-emerald-500/5 border border-emerald-500/20 rounded">
+                        ● 活跃
+                      </span>
+                    </div>
+                  );
+                })}
+
+                {/* Mock MCP simulated */}
+                {MOCK_ONLINE_ASSETS.filter(a => a.type === 'mcp' && simulatedInstalledIds.includes(a.id)).map(mcp => (
+                  <div key={mcp.id} className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4">
+                    <div className="flex-1 flex flex-col gap-1 min-w-0">
+                      <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{mcp.displayName}</span>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-1">{mcp.description}</p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="px-2 py-0.5 text-[9px] text-emerald-500 bg-emerald-500/5 border border-emerald-500/20 rounded">
+                        ● 运行中
+                      </span>
+                      <button
+                        onClick={() => onUninstallMockAsset(mcp.id)}
+                        className="p-1 text-red-500 hover:bg-red-500/10 rounded border-none bg-transparent cursor-pointer transition-colors"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                          <polyline points="3 6 5 6 21 6" />
+                          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </>
+            )
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

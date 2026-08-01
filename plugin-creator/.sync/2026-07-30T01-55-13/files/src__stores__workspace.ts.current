@@ -1,0 +1,1417 @@
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import { Model, Actions, DockLocation } from 'flexlayout-react';
+import type { IJsonModel , TabNode } from 'flexlayout-react';
+import type { FileEntry } from '../types/file-entry';
+import { useDashboardStore } from './dashboard';
+
+export interface TabConfig {
+  filePath?: string;
+  pluginId: string;
+  extension?: string;
+  articleId?: string;
+  sessionId?: string;
+  customParams?: Record<string, unknown>;
+}
+
+export interface LayoutNode {
+  type?: string;
+  id?: string;
+  name?: string;
+  component?: string;
+  config?: Record<string, unknown>;
+  children?: LayoutNode[];
+}
+
+export interface RibbonIconConfig {
+  id: string;
+  /** 图标：字符串 / 函数 / React 元素 / DOM 元素（Canvas/SVG 等） */
+  icon: string | (() => string) | React.ReactElement | (() => React.ReactElement) | HTMLElement | (() => HTMLElement);
+  title: string;
+  onClick: () => void;
+  onContextMenu?: (event: React.MouseEvent) => void;
+  pluginId?: string;
+  /** 窗口类型过滤：指定图标出现在哪些窗口，默认为 'mainWindow' */
+  windowScope?: string | string[];
+}
+
+export interface FolderContextMenuItem {
+  id: string;
+  label: string;
+  onClick: (folderPath: string) => void;
+  pluginId?: string;
+}
+
+export interface PendingOpenFileRequest {
+  filePath: string | undefined;
+  pluginId: string;
+  extension?: string;
+  articleId?: string;
+  sessionId?: string;
+  replaceActiveTab?: boolean;
+  inNewGroup?: boolean;
+  title?: string;
+  line?: number;
+  customParams?: Record<string, unknown>;
+}
+
+export interface SidebarPanelConfig {
+  id: string;
+  title: string;
+  icon?: string;
+  viewType?: string;
+  pluginId?: string;
+}
+
+export interface TabHistory {
+  stack: Array<{
+    filePath?: string;
+    pluginId: string;
+    extension?: string;
+    articleId?: string;
+    sessionId?: string;
+    title?: string;
+    customParams?: Record<string, unknown>;
+  }>;
+  index: number;
+}
+
+export interface WorkspaceActionConfig {
+  id: string;
+  pluginId: string;
+  label: string;
+  icon?: string;
+  showInToolbar?: boolean;
+  viewTypes?: string[];
+  extensions?: string[];
+  /** 在 action 之前或之后渲染分割线，用于分组 */
+  divider?: 'before' | 'after';
+  onClick: (params: {
+    tabId: string;
+    filePath?: string;
+    articleId?: string;
+    sessionId?: string;
+  }) => void;
+  isActive?: (params: {
+    tabId: string;
+    filePath?: string;
+    articleId?: string;
+    sessionId?: string;
+  }) => boolean;
+  isEnabled?: (params: {
+    tabId: string;
+    filePath?: string;
+    articleId?: string;
+    sessionId?: string;
+  }) => boolean;
+}
+
+export interface WorkspaceState {
+  layoutJson: IJsonModel;
+  showLeftSidebar: boolean;
+  showRightSidebar: boolean;
+  rightSidebarWidth: number;
+  activeTabId: string | null;
+  draggedPath: string | null;
+  isOverlayActive: boolean;
+  outlines: Record<string, Array<{ level: number; text: string; line?: number }>>;
+  properties: Record<string, Record<string, any>>;
+  registeredPanels: Record<string, SidebarPanelConfig[]>;
+  ribbonIcons: RibbonIconConfig[];
+  ribbonOrder: string[];
+  folderContextMenuItems: FolderContextMenuItem[];
+  /** 等待 FlexWorkspace 布局加载完成后再打开的文件请求（解决首次点击竞态问题） */
+  pendingOpenFile: PendingOpenFileRequest | null;
+  pendingJumps: Record<string, number>;
+
+  tabHistories: Record<string, TabHistory>;
+  modifiedTabs: Record<string, boolean>;
+  activeViews: Record<string, any>;
+  workspaceActions: WorkspaceActionConfig[];
+
+  scannedFiles: FileEntry[];
+  isScanning: boolean;
+  scannedCount: number;
+
+  currentWorkspaceId: string | null;
+  workspaceInstances: Record<string, {
+    layoutJson: IJsonModel;
+    activeTabId: string | null;
+    tabHistories: Record<string, TabHistory>;
+  }>;
+
+  // Actions
+  switchWorkspace: (workspaceId: string, initialLayout?: IJsonModel) => void;
+  registerRibbonIcon: (config: RibbonIconConfig) => void;
+  unregisterRibbonIcon: (id: string) => void;
+  setRibbonOrder: (order: string[]) => void;
+  /** 获取当前窗口类型的 Ribbon 图标 */
+  getRibbonIconsForCurrentWindow: () => RibbonIconConfig[];
+  registerFolderContextMenuItem: (config: FolderContextMenuItem) => void;
+  unregisterFolderContextMenuItem: (id: string) => void;
+  openWorkspaceTab: (filePath: string | undefined, pluginId: string, extension?: string, articleId?: string, sessionId?: string, replaceActiveTab?: boolean, title?: string, line?: number, customParams?: Record<string, unknown>) => void;
+  /** 兼容别名 */
+  openTab: (options: { filePath?: string; pluginId: string; extension?: string; articleId?: string; sessionId?: string; replaceActiveTab?: boolean; title?: string; line?: number; customParams?: Record<string, unknown> } | string, pluginId?: string) => void;
+  openTerminalTab: (initialCommand?: string, title?: string) => void;
+  createMarkdownTab: (title?: string) => void;
+  updateTabTitle: (tabId: string, newTitle: string) => void;
+  openWorkspaceTabInNewGroup: (filePath: string | undefined, pluginId: string, extension?: string, articleId?: string, sessionId?: string, line?: number) => void;
+  /** Open a URL in an internal browser tab within the workspace */
+  openBrowserTab: (url: string, title?: string) => void;
+  /** @deprecated Use openWorkspaceTab instead */
+  openFile: (filePath: string | undefined, pluginId: string, extension?: string, articleId?: string, sessionId?: string, replaceActiveTab?: boolean) => void;
+  closeTab: (tabId: string) => void;
+  closeTabs: (tabIds: string[]) => void;
+  updateLayoutJson: (json: IJsonModel) => void;
+  setActiveTabId: (tabId: string | null) => void;
+  toggleLeftSidebar: () => void;
+  setLeftSidebar: (show: boolean) => void;
+  toggleRightSidebar: () => void;
+  setRightSidebar: (show: boolean) => void;
+  setRightSidebarWidth: (width: number) => void;
+  setOutline: (tabId: string, outline: Array<{ level: number; text: string }>) => void;
+  removeOutline: (tabId: string) => void;
+  setProperties: (tabId: string, properties: Record<string, any>) => void;
+  removeProperties: (tabId: string) => void;
+  registerPanels: (tabId: string, panels: SidebarPanelConfig[]) => void;
+  removePanels: (tabId: string) => void;
+  resetWorkspace: () => void;
+  setDraggedPath: (path: string | null) => void;
+  renameFilePath: (oldPath: string, newPath: string) => void;
+  setPendingOpenFile: (req: PendingOpenFileRequest | null) => void;
+  consumePendingOpenFile: () => PendingOpenFileRequest | null;
+  splitActiveTab: (direction: 'right' | 'bottom') => void;
+  updateActiveTabInfo: (name: string, newConfig: Record<string, any>) => void;
+  updateTabName: (tabId: string, name: string) => void;
+  updateTabConfig: (tabId: string, configUpdates: Record<string, any>) => void;
+  setPendingJump: (tabId: string, line: number) => void;
+  clearPendingJump: (tabId: string) => void;
+
+  setTabModified: (tabId: string, isModified: boolean) => void;
+  setActiveView: (tabId: string, view: any) => void;
+  removeActiveView: (tabId: string) => void;
+  registerWorkspaceAction: (config: WorkspaceActionConfig) => void;
+  unregisterWorkspaceAction: (id: string) => void;
+  goBack: (tabId: string) => void;
+  goForward: (tabId: string) => void;
+
+  layoutLoaded: boolean;
+  setLayoutLoaded: (loaded: boolean) => void;
+}
+
+const defaultLayoutJson = {
+  global: {
+    tabEnableClose: true,
+    tabSetEnableTabStrip: true,
+    tabSetEnableMaximize: true,
+    tabEnableRenderOnDemand: false
+  },
+  layout: {
+    type: 'row',
+    weight: 100,
+    children: [
+      {
+        type: 'tabset',
+        weight: 100,
+        id: 'main-tabset',
+        children: []
+      }
+    ]
+  }
+};
+
+const getFileName = (pathStr: string) => {
+  if (!pathStr) return '未命名';
+  // Handle both Windows and POSIX separators
+  const parts = pathStr.split(/[/\\]/);
+  return parts[parts.length - 1];
+};
+
+/** 检查 layoutJson 中是否还有 Tab，没有则收起工作区 */
+function hideWorkspaceIfNoTabs(layoutJson: IJsonModel): void {
+  let hasTab = false;
+  try {
+    const model = Model.fromJson(layoutJson);
+    model.visitNodes((n) => {
+      if (n.getType() === 'tab') hasTab = true;
+    });
+  } catch { /* ignore parse errors */ }
+  if (!hasTab) {
+    import('./dashboard').then(({ useDashboardStore }) => {
+      // 避免刚刚打开工作区时的初始化竞态导致被误收起 (1000ms 冷却时间)
+      const openedAt = useDashboardStore.getState().workspaceOpenedAt || 0;
+      if (Date.now() - openedAt < 1000) {
+        console.log('[hideWorkspaceIfNoTabs] Skipping auto-hide (within 1000ms cooldown after workspace opened)');
+        return;
+      }
+
+      if (typeof window !== 'undefined' && window.electronAPI?.workspace?.updateMetadata) {
+        window.electronAPI.workspace.updateMetadata({
+          layoutJson,
+          activeTabId: null,
+          tabHistories: {}
+        }).catch((err: unknown) => {
+          console.warn('[hideWorkspaceIfNoTabs] Failed to save empty workspace layout:', err);
+        });
+      }
+      useDashboardStore.getState().hideWorkspace();
+    }).catch(() => {});
+  }
+}
+
+/**
+ * 执行 tab 的实际关闭操作（model 删除 + store 更新）。
+ * 不调用 view.beforeClose()，由调用方在调用前完成守卫检查。
+ */
+function doCloseTab(set: (partial: Partial<WorkspaceState>) => void, get: () => WorkspaceState, tabId: string): void {
+  const currentJson = get().layoutJson || defaultLayoutJson;
+  let model: Model;
+  try {
+    model = Model.fromJson(currentJson);
+  } catch (e) {
+    console.error('Failed to parse layout JSON on delete', e);
+    return;
+  }
+  const node = model.getNodeById(tabId);
+  if (!node) return;
+
+  const config = (node as any).getConfig() as { filePath?: string } | undefined;
+  const filePath = config?.filePath;
+  if (filePath && typeof window !== 'undefined' && window.electronAPI?.ipc?.send) {
+    window.electronAPI.ipc.send('workspace:file-closed', { filePath, timestamp: Date.now() });
+  }
+  if (typeof window !== 'undefined' && window.electronAPI?.callApi) {
+    window.electronAPI.callApi('terminal', 'close', [tabId]).catch(() => {});
+  }
+  model.doAction(Actions.deleteTab(tabId));
+  const updatedJson = model.toJson();
+
+  let nextActiveTabId: string | null = null;
+  const activeTabset = model.getActiveTabset();
+  if (activeTabset && activeTabset.getChildren().length > 0) {
+    const selectedTab = activeTabset.getSelectedNode();
+    if (selectedTab) nextActiveTabId = selectedTab.getId();
+  }
+  if (!nextActiveTabId) {
+    model.visitNodes((n) => {
+      if (n.getType() === 'tab' && !nextActiveTabId) nextActiveTabId = n.getId();
+    });
+  }
+
+  const nextOutlines = { ...get().outlines }; delete nextOutlines[tabId];
+  const nextPanels = { ...get().registeredPanels }; delete nextPanels[tabId];
+  const nextProperties = { ...get().properties }; delete nextProperties[tabId];
+  const nextHistories = { ...get().tabHistories }; delete nextHistories[tabId];
+  const nextModified = { ...get().modifiedTabs }; delete nextModified[tabId];
+  const nextActiveViews = { ...get().activeViews }; delete nextActiveViews[tabId];
+
+  set({ layoutJson: updatedJson, activeTabId: nextActiveTabId, outlines: nextOutlines, registeredPanels: nextPanels, properties: nextProperties, tabHistories: nextHistories, modifiedTabs: nextModified, activeViews: nextActiveViews });
+  hideWorkspaceIfNoTabs(updatedJson);
+}
+
+export const useWorkspaceStore = create<WorkspaceState>()(
+  persist(
+    (set, get) => ({
+      layoutJson: defaultLayoutJson,
+      showLeftSidebar: false,
+      showRightSidebar: false,
+      rightSidebarWidth: 240,
+      activeTabId: null,
+      isOverlayActive: false,
+      outlines: {},
+      properties: {},
+      registeredPanels: {},
+      ribbonIcons: [],
+      ribbonOrder: [],
+      folderContextMenuItems: [],
+      pendingOpenFile: null,
+      pendingJumps: {},
+      tabHistories: {},
+      modifiedTabs: {},
+      activeViews: {},
+      workspaceActions: [],
+      currentWorkspaceId: null,
+      workspaceInstances: {},
+      scannedFiles: [],
+      isScanning: false,
+      scannedCount: 0,
+
+      layoutLoaded: false,
+      setLayoutLoaded: (loaded) => set({ layoutLoaded: loaded }),
+
+      registerRibbonIcon: (config) => set((state) => {
+        const filtered = state.ribbonIcons.filter(x => x.id !== config.id);
+        return { ribbonIcons: [...filtered, config] };
+      }),
+
+      unregisterRibbonIcon: (id) => set((state) => ({
+        ribbonIcons: state.ribbonIcons.filter(x => x.id !== id)
+      })),
+
+      setRibbonOrder: (order) => set({ ribbonOrder: order }),
+
+      getRibbonIconsForCurrentWindow: () => {
+        const currentType = (window as any).__BERRYTRACE_WINDOW_TYPE__ || 'mainWindow';
+        const { ribbonIcons } = get();
+
+        return ribbonIcons.filter(icon => {
+          const scopes = icon.windowScope || 'mainWindow';
+          if (scopes === 'allWindow') return true;
+          const scopeArray = Array.isArray(scopes) ? scopes : [scopes];
+          return scopeArray.includes(currentType);
+        });
+      },
+
+      registerFolderContextMenuItem: (config) => set((state) => {
+        const filtered = state.folderContextMenuItems.filter(x => x.id !== config.id);
+        return { folderContextMenuItems: [...filtered, config] };
+      }),
+
+      unregisterFolderContextMenuItem: (id) => set((state) => ({
+        folderContextMenuItems: state.folderContextMenuItems.filter(x => x.id !== id)
+      })),
+
+      openWorkspaceTab: (filePath, pluginId, extension, articleId, sessionId, replaceActiveTab, title, line, customParams) => {
+        const isLoaded = get().layoutLoaded;
+        console.log(`[WorkspaceStore:openWorkspaceTab] Entry: filePath=${filePath}, pluginId=${pluginId}, extension=${extension}, layoutLoaded=${isLoaded}`);
+        if (!isLoaded) {
+          console.log(`[WorkspaceStore:openWorkspaceTab] Layout not loaded, queueing as pendingOpenFile`);
+          get().setPendingOpenFile({
+            filePath,
+            pluginId,
+            extension,
+            articleId,
+            sessionId,
+            replaceActiveTab,
+            inNewGroup: false,
+            title,
+            line,
+            customParams,
+          });
+          if (typeof window !== 'undefined') {
+            window.location.hash = '#/workspace';
+          }
+          return;
+        }
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        let model: Model;
+        try {
+          model = Model.fromJson(currentJson);
+        } catch (e) {
+          console.error('Failed to parse layout JSON, resetting to default', e);
+          model = Model.fromJson(defaultLayoutJson);
+        }
+
+        // 1. Check if the file is already open in any tab
+        let existingTabId: string | null = null;
+        model.visitNodes((node) => {
+          if (node.getType() === 'tab') {
+            const config = (node as TabNode).getConfig() as TabConfig | undefined;
+            if (config && (
+              (filePath && config.filePath === filePath) ||
+              (articleId && config.articleId === articleId) ||
+              (sessionId && config.sessionId === sessionId)
+            )) {
+              existingTabId = node.getId();
+            }
+            // For singleton plugin-views (no filePath/articleId/sessionId), deduplicate by pluginId
+            if (!existingTabId && !filePath && !articleId && !sessionId &&
+                config && config.pluginId === pluginId) {
+              existingTabId = node.getId();
+            }
+          }
+        });
+
+        if (existingTabId) {
+          console.log(`[WorkspaceStore:openWorkspaceTab] Found existing tab: ${existingTabId}. Selecting it.`);
+          model.doAction(Actions.selectTab(existingTabId));
+          set({
+            layoutJson: model.toJson(),
+            activeTabId: existingTabId
+          });
+          if (line) {
+            console.log(`[WorkspaceStore:openWorkspaceTab] Dispatching app:editor-jump-to-line for line: ${line}`);
+            window.dispatchEvent(new CustomEvent('app:editor-jump-to-line', {
+              detail: { filePath, tabId: existingTabId, line }
+            }));
+          }
+          return;
+        }
+
+        console.log(`[WorkspaceStore:openWorkspaceTab] Creating new tab for file: ${filePath}`);
+
+        // 2. Resolve document info
+        let fileName = '未命名.md';
+        if (title) {
+          fileName = title;
+        } else if (pluginId === 'system.terminal') {
+          if (customParams?.autoCommand && typeof customParams.autoCommand === 'string') {
+            const shortCmd = customParams.autoCommand.trim().split(' ')[0];
+            fileName = `终端 (${shortCmd})`;
+          } else {
+            const existingTerminalCount = Object.values(get().tabHistories).filter(hist => {
+              const current = hist?.stack?.[hist.index];
+              return current?.pluginId === 'system.terminal';
+            }).length;
+            fileName = existingTerminalCount > 0 ? `终端 ${existingTerminalCount + 1}` : '终端';
+          }
+        } else if (filePath) {
+          fileName = getFileName(filePath);
+        } else if (articleId) {
+          fileName = '云端文档.md';
+        } else if (sessionId) {
+          fileName = sessionId.startsWith('draft_') ? '未命名.md' : '临时编辑.md';
+        }
+
+        const activeTabId = get().activeTabId;
+        const activeNode = activeTabId ? model.getNodeById(activeTabId) : null;
+        const isActiveTabModified = activeTabId ? !!get().modifiedTabs[activeTabId] : false;
+
+        const nextHistories = { ...get().tabHistories };
+        let targetTabId: string;
+
+        if (replaceActiveTab && activeNode && !isActiveTabModified) {
+          // Replace current document in the active tab!
+          targetTabId = activeNode.getId();
+
+          const history = nextHistories[targetTabId] || { stack: [], index: -1 };
+          const newStack = history.stack.slice(0, history.index + 1);
+          newStack.push({ filePath, pluginId, extension, articleId, sessionId, title, customParams });
+          nextHistories[targetTabId] = {
+            stack: newStack,
+            index: newStack.length - 1
+          };
+
+          model.doAction(
+            Actions.updateNodeAttributes(targetTabId, {
+              name: fileName,
+              config: { filePath, pluginId, extension, articleId, sessionId, customParams }
+            })
+          );
+
+          if (line) {
+            get().setPendingJump(targetTabId, line);
+          }
+
+          if (filePath && typeof window !== 'undefined' && window.electronAPI?.ipc?.send) {
+            window.electronAPI.ipc.send('workspace:file-opened', {
+              filePath,
+              timestamp: Date.now()
+            });
+          }
+          if (filePath && typeof window !== 'undefined' && window.electronAPI?.workspace?.addRecentDocument) {
+            window.electronAPI.workspace.addRecentDocument(filePath, fileName);
+          }
+        } else {
+          // Create a brand new tab with stable tabId
+          targetTabId = `tab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+          if (line) {
+            get().setPendingJump(targetTabId, line);
+          }
+
+          nextHistories[targetTabId] = {
+            stack: [{ filePath, pluginId, extension, articleId, sessionId, title, customParams }],
+            index: 0
+          };
+
+          let parentId = 'main-tabset';
+          const activeTabset = model.getActiveTabset();
+          if (activeTabset) {
+            parentId = activeTabset.getId();
+          } else {
+            model.visitNodes((node) => {
+              if (node.getType() === 'tabset') {
+                parentId = node.getId();
+              }
+            });
+          }
+
+          model.doAction(
+            Actions.addTab(
+              {
+                type: 'tab',
+                id: targetTabId,
+                name: fileName,
+                component: 'plugin-view',
+                config: { filePath, pluginId, extension, articleId, sessionId, customParams }
+              },
+              parentId,
+              DockLocation.CENTER,
+              -1,
+              true // select
+            )
+          );
+
+          if (filePath && typeof window !== 'undefined' && window.electronAPI?.ipc?.send) {
+            window.electronAPI.ipc.send('workspace:file-opened', {
+              filePath,
+              timestamp: Date.now()
+            });
+          }
+          if (filePath && typeof window !== 'undefined' && window.electronAPI?.workspace?.addRecentDocument) {
+            window.electronAPI.workspace.addRecentDocument(filePath, fileName);
+          }
+        }
+
+        set({
+          layoutJson: model.toJson(),
+          activeTabId: targetTabId,
+          tabHistories: nextHistories
+        });
+      },
+
+      updateTabTitle: (tabId: string, newTitle: string) => {
+        if (!tabId || !newTitle) return;
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        try {
+          const model = Model.fromJson(currentJson);
+          const node = model.getNodeById(tabId);
+          if (node) {
+            model.doAction(Actions.updateNodeAttributes(tabId, { name: newTitle }));
+            set({ layoutJson: model.toJson() });
+          }
+        } catch (err) {
+          console.warn(`[WorkspaceStore:updateTabTitle] Failed to update tab title for ${tabId}:`, err);
+        }
+      },
+
+      openTab: (options: any, pluginId?: string) => {
+        if (options && typeof options === 'object') {
+          const { filePath, pluginId: pId, extension, articleId, sessionId, replaceActiveTab, title, line, customParams } = options;
+          get().openWorkspaceTab(filePath, pId || pluginId || '', extension, articleId, sessionId, replaceActiveTab, title, line, customParams);
+        } else {
+          get().openWorkspaceTab(options, pluginId || '', undefined, undefined, undefined, false, undefined, undefined, undefined);
+        }
+      },
+
+      openTerminalTab: (initialCommand?: string, title?: string, autoRun: boolean = true) => {
+        const sessionId = `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        get().openWorkspaceTab(
+          undefined,
+          'system.terminal',
+          undefined,
+          undefined,
+          sessionId,
+          false,
+          title || '终端',
+          undefined,
+          initialCommand ? { initialCommand, autoCommand: autoRun ? initialCommand : undefined } : undefined
+        );
+      },
+
+      createMarkdownTab: (title?: string) => {
+        const timestamp = Date.now();
+        const docTitle = title || `未命名.md`;
+        const sessionId = `new_md_${timestamp}`;
+        const virtualPath = `${docTitle.endsWith('.md') ? docTitle : `${docTitle}.md`}`;
+        get().openWorkspaceTab(
+          virtualPath,
+          'system.workspace-blank',
+          'md',
+          undefined,
+          sessionId,
+          false,
+          docTitle
+        );
+      },
+
+      openWorkspaceTabInNewGroup: (filePath, pluginId, extension, articleId, sessionId, line) => {
+        const isLoaded = get().layoutLoaded;
+        if (!isLoaded) {
+          get().setPendingOpenFile({
+            filePath,
+            pluginId,
+            extension,
+            articleId,
+            sessionId,
+            inNewGroup: true,
+            line
+          });
+          if (typeof window !== 'undefined') {
+            window.location.hash = '#/workspace';
+          }
+          return;
+        }
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        let model: Model;
+        try {
+          model = Model.fromJson(currentJson);
+        } catch (e) {
+          console.error('Failed to parse layout JSON for new group', e);
+          model = Model.fromJson(defaultLayoutJson);
+        }
+
+        // 1. Check if the file is already open
+        let existingTabId: string | null = null;
+        model.visitNodes((node) => {
+          if (node.getType() === 'tab') {
+            const config = (node as TabNode).getConfig() as TabConfig | undefined;
+            if (config && (
+              (filePath && config.filePath === filePath) ||
+              (articleId && config.articleId === articleId) ||
+              (sessionId && config.sessionId === sessionId)
+            )) {
+              existingTabId = node.getId();
+            }
+          }
+        });
+
+        if (existingTabId) {
+          model.doAction(Actions.selectTab(existingTabId));
+          set({
+            layoutJson: model.toJson(),
+            activeTabId: existingTabId
+          });
+          if (line) {
+            window.dispatchEvent(new CustomEvent('app:editor-jump-to-line', {
+              detail: { filePath, tabId: existingTabId, line }
+            }));
+          }
+          return;
+        }
+
+        const tabId = `tab_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+        if (line) {
+          get().setPendingJump(tabId, line);
+        }
+
+        let fileName = '未命名.md';
+        if (filePath) {
+          fileName = getFileName(filePath);
+        } else if (articleId) {
+          fileName = '云端文档.md';
+        } else if (sessionId) {
+          fileName = sessionId.startsWith('draft_') ? '未命名.md' : '临时编辑.md';
+        }
+
+        const nextHistories = { ...get().tabHistories };
+        nextHistories[tabId] = {
+          stack: [{ filePath, pluginId, extension, articleId, sessionId }],
+          index: 0
+        };
+
+        let parentId = 'main-tabset';
+        const activeTabset = model.getActiveTabset();
+        if (activeTabset) {
+          parentId = activeTabset.getId();
+        } else {
+          model.visitNodes((node) => {
+            if (node.getType() === 'tabset') {
+              parentId = node.getId();
+            }
+          });
+        }
+
+        model.doAction(
+          Actions.addTab(
+            {
+              type: 'tab',
+              id: tabId,
+              name: fileName,
+              component: 'plugin-view',
+              config: { filePath, pluginId, extension, articleId, sessionId }
+            },
+            parentId,
+            DockLocation.RIGHT,
+            -1,
+            true
+          )
+        );
+
+        if (filePath && typeof window !== 'undefined' && window.electronAPI?.workspace?.addRecentDocument) {
+          window.electronAPI.workspace.addRecentDocument(filePath, fileName);
+        }
+        if (filePath && typeof window !== 'undefined' && window.electronAPI?.ipc?.send) {
+          window.electronAPI.ipc.send('workspace:file-opened', {
+            filePath,
+            timestamp: Date.now()
+          });
+        }
+
+        set({
+          layoutJson: model.toJson(),
+          activeTabId: tabId,
+          tabHistories: nextHistories
+        });
+      },
+
+      openFile: (filePath, pluginId, extension, articleId, sessionId, replaceActiveTab) => {
+        get().openWorkspaceTab(filePath, pluginId, extension, articleId, sessionId, replaceActiveTab);
+      },
+
+      openBrowserTab: (url, title) => {
+        console.log(`[openBrowserTab] url="${url}" title="${title}" hash=${typeof window !== 'undefined' ? window.location.hash : 'N/A'}`);
+        const isLoaded = get().layoutLoaded;
+        const tabId = `browser_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const displayTitle = title || url;
+
+        if (!isLoaded) {
+          console.log(`[openBrowserTab] Not in workspace → setting pending + navigating to #/workspace`);
+          get().setPendingOpenFile({
+            filePath: url,
+            pluginId: 'system.browser',
+            extension: 'url',
+            inNewGroup: false,
+            title: displayTitle,
+            customParams: { initialUrl: url },
+          });
+          if (typeof window !== 'undefined') {
+            window.location.hash = '#/workspace';
+          }
+          return;
+        }
+
+        console.log(`[openBrowserTab] In workspace → creating browser tab id=${tabId}`);
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        let model: Model;
+        try {
+          model = Model.fromJson(currentJson);
+        } catch (e) {
+          console.error('[openBrowserTab] Failed to parse layout JSON, resetting to default', e);
+          model = Model.fromJson(defaultLayoutJson);
+        }
+
+        let parentId = 'main-tabset';
+        const activeTabset = model.getActiveTabset();
+        if (activeTabset) {
+          parentId = activeTabset.getId();
+        } else {
+          model.visitNodes((node) => {
+            if (node.getType() === 'tabset') {
+              parentId = node.getId();
+            }
+          });
+        }
+
+        model.doAction(
+          Actions.addTab(
+            {
+              type: 'tab',
+              id: tabId,
+              name: displayTitle,
+              component: 'browser-panel',
+              config: { customParams: { initialUrl: url } }
+            },
+            parentId,
+            DockLocation.CENTER,
+            -1,
+            true
+          )
+        );
+
+        set({
+          layoutJson: model.toJson(),
+          activeTabId: tabId,
+        });
+      },
+
+      closeTab: (tabId) => {
+        const view = get().activeViews?.[tabId];
+        if (view && typeof view.beforeClose === 'function') {
+          const result = view.beforeClose();
+          if (result instanceof Promise) {
+            result.then((res) => {
+              if (res === false) return;
+              if (typeof res === 'string') {
+                if (!window.confirm(res)) return;
+              }
+              doCloseTab(set, get, tabId);
+            });
+            return;
+          }
+          if (result === false) return;
+          if (typeof result === 'string' && !window.confirm(result)) return;
+        }
+        doCloseTab(set, get, tabId);
+      },
+
+      closeTabs: (tabIds) => {
+        if (tabIds.length === 0) return;
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        let model: Model;
+        try {
+          model = Model.fromJson(currentJson);
+        } catch (e) {
+          console.error('Failed to parse layout JSON on delete', e);
+          return;
+        }
+
+        const nextOutlines = { ...get().outlines };
+        const nextPanels = { ...get().registeredPanels };
+        const nextProperties = { ...get().properties };
+        const nextHistories = { ...get().tabHistories };
+        const nextModified = { ...get().modifiedTabs };
+        const nextActiveViews = { ...get().activeViews };
+
+        for (const tabId of tabIds) {
+          const node = model.getNodeById(tabId);
+          if (node) {
+            const config = (node as any).getConfig() as { filePath?: string } | undefined;
+            const filePath = config?.filePath;
+            if (filePath && typeof window !== 'undefined' && window.electronAPI?.ipc?.send) {
+              window.electronAPI.ipc.send('workspace:file-closed', {
+                filePath,
+                timestamp: Date.now()
+              });
+            }
+            if (typeof window !== 'undefined' && window.electronAPI?.callApi) {
+              window.electronAPI.callApi('terminal', 'close', [tabId]).catch(() => {});
+            }
+            model.doAction(Actions.deleteTab(tabId));
+          }
+          delete nextOutlines[tabId];
+          delete nextPanels[tabId];
+          delete nextProperties[tabId];
+          delete nextHistories[tabId];
+          delete nextModified[tabId];
+          delete nextActiveViews[tabId];
+        }
+
+        const updatedJson = model.toJson();
+
+        // Determine the next active tab if any
+        let nextActiveTabId: string | null = null;
+        const activeTabset = model.getActiveTabset();
+        if (activeTabset && activeTabset.getChildren().length > 0) {
+          const selectedTab = activeTabset.getSelectedNode();
+          if (selectedTab) {
+            nextActiveTabId = selectedTab.getId();
+          }
+        }
+
+        if (!nextActiveTabId) {
+          // Try to find any remaining tab in the layout
+          model.visitNodes((n) => {
+            if (n.getType() === 'tab' && !nextActiveTabId) {
+              nextActiveTabId = n.getId();
+            }
+          });
+        }
+
+        set({
+          layoutJson: updatedJson,
+          activeTabId: nextActiveTabId,
+          outlines: nextOutlines,
+          registeredPanels: nextPanels,
+          properties: nextProperties,
+          tabHistories: nextHistories,
+          modifiedTabs: nextModified,
+          activeViews: nextActiveViews
+        });
+        hideWorkspaceIfNoTabs(updatedJson);
+      },
+
+      updateLayoutJson: (json) => {
+        // Track the currently active tab from the incoming model update
+        let activeTabId: string | null = null;
+        try {
+          const model = Model.fromJson(json);
+          const activeTabset = model.getActiveTabset();
+          if (activeTabset) {
+            const selectedNode = activeTabset.getSelectedNode();
+            if (selectedNode) {
+              activeTabId = selectedNode.getId();
+            }
+          }
+          if (!activeTabId) {
+            // Find any tab
+            model.visitNodes((n) => {
+              if (n.getType() === 'tab' && !activeTabId) {
+                activeTabId = n.getId();
+              }
+            });
+          }
+        } catch (e) {
+          console.error('Failed to parse layout json in updateLayoutJson', e);
+        }
+
+        set({
+          layoutJson: json,
+          activeTabId: activeTabId || get().activeTabId
+        });
+        hideWorkspaceIfNoTabs(json);
+      },
+
+      setActiveTabId: (tabId) => {
+        if (!tabId) {
+          set({ activeTabId: null });
+          return;
+        }
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        let model: Model;
+        try {
+          model = Model.fromJson(currentJson);
+        } catch {
+          return;
+        }
+
+        const node = model.getNodeById(tabId);
+        if (node) {
+          model.doAction(Actions.selectTab(tabId));
+          set({
+            layoutJson: model.toJson(),
+            activeTabId: tabId
+          });
+        } else {
+          set({ activeTabId: tabId });
+        }
+      },
+
+      toggleLeftSidebar: () => set((state) => ({ showLeftSidebar: !state.showLeftSidebar })),
+      setLeftSidebar: (show) => set({ showLeftSidebar: show }),
+      toggleRightSidebar: () => set((state) => ({ showRightSidebar: !state.showRightSidebar })),
+      setRightSidebar: (show) => set({ showRightSidebar: show }),
+      setRightSidebarWidth: (width) => set({ rightSidebarWidth: width }),
+      setOutline: (tabId, outline) => set((state) => ({
+        outlines: { ...state.outlines, [tabId]: outline }
+      })),
+      removeOutline: (tabId) => set((state) => {
+        const next = { ...state.outlines };
+        delete next[tabId];
+        return { outlines: next };
+      }),
+      setProperties: (tabId, properties) => set((state) => ({
+        properties: { ...state.properties, [tabId]: properties }
+      })),
+      removeProperties: (tabId) => set((state) => {
+        const next = { ...state.properties };
+        delete next[tabId];
+        return { properties: next };
+      }),
+      registerPanels: (tabId, panels) => set((state) => ({
+        registeredPanels: { ...state.registeredPanels, [tabId]: panels }
+      })),
+      removePanels: (tabId) => set((state) => {
+        const next = { ...state.registeredPanels };
+        delete next[tabId];
+        return { registeredPanels: next };
+      }),
+      resetWorkspace: () => set({ layoutJson: defaultLayoutJson, activeTabId: null, outlines: {}, properties: {}, registeredPanels: {}, pendingJumps: {}, layoutLoaded: false }),
+      draggedPath: null,
+      setDraggedPath: (path) => set({ draggedPath: path }),
+      setPendingOpenFile: (req) => set({ pendingOpenFile: req }),
+      consumePendingOpenFile: () => {
+        const req = get().pendingOpenFile;
+        if (req) set({ pendingOpenFile: null });
+        return req;
+      },
+      setPendingJump: (tabId, line) => set((state) => ({
+        pendingJumps: { ...state.pendingJumps, [tabId]: line }
+      })),
+      clearPendingJump: (tabId) => set((state) => {
+        const next = { ...state.pendingJumps };
+        delete next[tabId];
+        return { pendingJumps: next };
+      }),
+      renameFilePath: (oldPath, newPath) => {
+        const isPathAffected = (filePath: string, oPath: string) => {
+          const normFile = filePath.replace(/\\/g, '/');
+          const normOld = oPath.replace(/\\/g, '/');
+          if (normFile === normOld) return true;
+          return normFile.startsWith(normOld + '/');
+        };
+
+        const getNewPath = (filePath: string, oPath: string, nPath: string) => {
+          const normFile = filePath.replace(/\\/g, '/');
+          const normOld = oPath.replace(/\\/g, '/');
+          if (normFile === normOld) return nPath;
+          const suffix = filePath.slice(oPath.length);
+          return nPath + suffix;
+        };
+
+        const updateTabsInLayout = (node: LayoutNode): LayoutNode => {
+          if (!node) return node;
+          if (node.type === 'tab') {
+            const config = node.config || {};
+            const filePath = config.filePath as string | undefined;
+            if (filePath && isPathAffected(filePath, oldPath)) {
+              const nextFilePath = getNewPath(filePath, oldPath, newPath);
+              const nextFileName = getFileName(nextFilePath);
+              const nextExtension = nextFilePath.split('.').pop() || '';
+              const nextId = isPathAffected(node.id || '', oldPath) ? nextFilePath : node.id;
+              return {
+                ...node,
+                id: nextId,
+                name: nextFileName,
+                config: {
+                  ...config,
+                  filePath: nextFilePath,
+                  extension: nextExtension
+                }
+              };
+            }
+            return node;
+          }
+          if (node.children && Array.isArray(node.children)) {
+            return {
+              ...node,
+              children: node.children.map((child: LayoutNode) => updateTabsInLayout(child))
+            };
+          }
+          return node;
+        };
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        const nextLayout = currentJson.layout ? updateTabsInLayout(currentJson.layout as LayoutNode) : currentJson.layout;
+        const nextJson = {
+          ...currentJson,
+          layout: nextLayout
+        };
+
+        const activeTabId = get().activeTabId;
+        let nextActiveTabId = activeTabId;
+        if (activeTabId && isPathAffected(activeTabId, oldPath)) {
+          nextActiveTabId = getNewPath(activeTabId, oldPath, newPath);
+        }
+
+        const outlines = get().outlines;
+        const nextOutlines = { ...outlines };
+        const registeredPanels = get().registeredPanels;
+        const nextPanels = { ...registeredPanels };
+        const properties = get().properties;
+        const nextProperties = { ...properties };
+
+        Object.keys(outlines).forEach(key => {
+          if (isPathAffected(key, oldPath)) {
+            const newKey = getNewPath(key, oldPath, newPath);
+            nextOutlines[newKey] = outlines[key];
+            delete nextOutlines[key];
+          }
+        });
+
+        Object.keys(registeredPanels).forEach(key => {
+          if (isPathAffected(key, oldPath)) {
+            const newKey = getNewPath(key, oldPath, newPath);
+            nextPanels[newKey] = registeredPanels[key];
+            delete nextPanels[key];
+          }
+        });
+
+        Object.keys(properties).forEach(key => {
+          if (isPathAffected(key, oldPath)) {
+            const newKey = getNewPath(key, oldPath, newPath);
+            nextProperties[newKey] = properties[key];
+            delete nextProperties[key];
+          }
+        });
+
+        set({
+          layoutJson: nextJson,
+          activeTabId: nextActiveTabId,
+          outlines: nextOutlines,
+          registeredPanels: nextPanels,
+          properties: nextProperties
+        });
+      },
+
+      splitActiveTab: (direction) => {
+        const activeTabId = get().activeTabId;
+        if (!activeTabId) return;
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        let model: Model;
+        try {
+          model = Model.fromJson(currentJson);
+        } catch (e) {
+          console.error('Failed to parse layout JSON for split', e);
+          return;
+        }
+
+        const activeNode = model.getNodeById(activeTabId);
+        if (!activeNode) return;
+
+        const config = (activeNode as any).getConfig() as {
+          filePath?: string;
+          pluginId: string;
+          extension?: string;
+          articleId?: string;
+          sessionId?: string;
+        } | undefined;
+
+        if (!config) return;
+
+        // Generate a new unique sessionId/tabId for the split tab
+        const newSessionId = (config.sessionId || config.filePath || config.articleId || 'tab') + '-split-' + Date.now();
+        const tabId = newSessionId;
+        const fileName = (activeNode as any).getName();
+
+        let parentId = 'main-tabset';
+        const parentNode = activeNode.getParent();
+        if (parentNode) {
+          parentId = parentNode.getId();
+        }
+
+        const dockLocation = direction === 'right' ? DockLocation.RIGHT : DockLocation.BOTTOM;
+
+        model.doAction(
+          Actions.addTab(
+            {
+              type: 'tab',
+              id: tabId,
+              name: fileName,
+              component: 'plugin-view',
+              config: {
+                filePath: config.filePath,
+                pluginId: config.pluginId,
+                extension: config.extension,
+                articleId: config.articleId,
+                sessionId: newSessionId
+              }
+            },
+            parentId,
+            dockLocation,
+            -1,
+            true
+          )
+        );
+
+        const updatedJson = model.toJson();
+        set({
+          layoutJson: updatedJson,
+          activeTabId: tabId
+        });
+      },
+
+      updateActiveTabInfo: (name: string, newConfig: Record<string, any>) => {
+        const activeTabId = get().activeTabId;
+        if (!activeTabId) return;
+
+        const updateTabsInLayout = (node: LayoutNode): LayoutNode => {
+          if (!node) return node;
+          if (node.type === 'tab' && node.id === activeTabId) {
+            return {
+              ...node,
+              name: name,
+              config: {
+                ...node.config,
+                ...newConfig
+              }
+            };
+          }
+          if (node.children && Array.isArray(node.children)) {
+            return {
+              ...node,
+              children: node.children.map((child: LayoutNode) => updateTabsInLayout(child))
+            };
+          }
+          return node;
+        };
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        const nextLayout = currentJson.layout ? updateTabsInLayout(currentJson.layout as LayoutNode) : currentJson.layout;
+        const nextJson = {
+          ...currentJson,
+          layout: nextLayout
+        };
+
+        set({
+          layoutJson: nextJson
+        });
+      },
+
+      updateTabName: (tabId, name) => {
+        const updateTabsInLayout = (node: LayoutNode): LayoutNode => {
+          if (!node) return node;
+          if (node.type === 'tab' && node.id === tabId) {
+            return {
+              ...node,
+              name: name
+            };
+          }
+          if (node.children && Array.isArray(node.children)) {
+            return {
+              ...node,
+              children: node.children.map((child: LayoutNode) => updateTabsInLayout(child))
+            };
+          }
+          return node;
+        };
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        const nextLayout = currentJson.layout ? updateTabsInLayout(currentJson.layout as LayoutNode) : currentJson.layout;
+        const nextJson = {
+          ...currentJson,
+          layout: nextLayout
+        };
+
+        set({
+          layoutJson: nextJson
+        });
+      },
+
+      updateTabConfig: (tabId, configUpdates) => {
+        const updateTabsInLayout = (node: LayoutNode): LayoutNode => {
+          if (!node) return node;
+          if (node.type === 'tab' && node.id === tabId) {
+            const currentConfig = node.config || {};
+            const currentCustomParams = (currentConfig as any).customParams || {};
+            const nextCustomParams = {
+              ...currentCustomParams,
+              ...(configUpdates.customParams || {})
+            };
+            return {
+              ...node,
+              config: {
+                ...currentConfig,
+                ...configUpdates,
+                customParams: nextCustomParams
+              }
+            };
+          }
+          if (node.children && Array.isArray(node.children)) {
+            return {
+              ...node,
+              children: node.children.map((child: LayoutNode) => updateTabsInLayout(child))
+            };
+          }
+          return node;
+        };
+
+        const currentJson = get().layoutJson || defaultLayoutJson;
+        const nextLayout = currentJson.layout ? updateTabsInLayout(currentJson.layout as LayoutNode) : currentJson.layout;
+        const nextJson = {
+          ...currentJson,
+          layout: nextLayout
+        };
+
+        set({
+          layoutJson: nextJson
+        });
+      },
+
+      setTabModified: (tabId, isModified) => set((state) => ({
+        modifiedTabs: { ...state.modifiedTabs, [tabId]: isModified }
+      })),
+
+      setActiveView: (tabId, view) => set((state) => ({
+        activeViews: { ...state.activeViews, [tabId]: view }
+      })),
+
+      removeActiveView: (tabId) => set((state) => {
+        const next = { ...state.activeViews };
+        delete next[tabId];
+        return { activeViews: next };
+      }),
+
+      registerWorkspaceAction: (config) => set((state) => {
+        const filtered = state.workspaceActions.filter(x => x.id !== config.id);
+        return { workspaceActions: [...filtered, config] };
+      }),
+
+      unregisterWorkspaceAction: (id) => set((state) => ({
+        workspaceActions: state.workspaceActions.filter(x => x.id !== id)
+      })),
+
+      goBack: (tabId) => {
+        const histories = { ...get().tabHistories };
+        const history = histories[tabId];
+        if (history && history.index > 0) {
+          history.index--;
+          const doc = history.stack[history.index];
+
+          const currentJson = get().layoutJson || defaultLayoutJson;
+          const model = Model.fromJson(currentJson);
+
+          const fileName = doc.title || (doc.filePath ? getFileName(doc.filePath) : (doc.articleId ? '云端文档.md' : '未命名.md'));
+          model.doAction(
+            Actions.updateNodeAttributes(tabId, {
+              name: fileName,
+              config: {
+                filePath: doc.filePath,
+                pluginId: doc.pluginId,
+                extension: doc.extension,
+                articleId: doc.articleId,
+                sessionId: doc.sessionId
+              }
+            })
+          );
+
+          set({
+            layoutJson: model.toJson(),
+            tabHistories: histories
+          });
+        }
+      },
+
+      goForward: (tabId) => {
+        const histories = { ...get().tabHistories };
+        const history = histories[tabId];
+        if (history && history.index < history.stack.length - 1) {
+          history.index++;
+          const doc = history.stack[history.index];
+
+          const currentJson = get().layoutJson || defaultLayoutJson;
+          const model = Model.fromJson(currentJson);
+
+          const fileName = doc.title || (doc.filePath ? getFileName(doc.filePath) : (doc.articleId ? '云端文档.md' : '未命名.md'));
+          model.doAction(
+            Actions.updateNodeAttributes(tabId, {
+              name: fileName,
+              config: {
+                filePath: doc.filePath,
+                pluginId: doc.pluginId,
+                extension: doc.extension,
+                articleId: doc.articleId,
+                sessionId: doc.sessionId
+              }
+            })
+          );
+
+          set({
+            layoutJson: model.toJson(),
+            tabHistories: histories
+          });
+        }
+      },
+
+      switchWorkspace: (workspaceId, initialLayout) => {
+        const current = get().currentWorkspaceId;
+        const currentLayout = get().layoutJson;
+        const currentActiveTab = get().activeTabId;
+
+        const nextInstances = { ...get().workspaceInstances };
+        if (current) {
+          nextInstances[current] = {
+            layoutJson: currentLayout,
+            activeTabId: currentActiveTab,
+            tabHistories: get().tabHistories
+          };
+        }
+
+        const targetInstance = nextInstances[workspaceId] || {
+          layoutJson: initialLayout || defaultLayoutJson,
+          activeTabId: null,
+          tabHistories: {}
+        };
+
+        set({
+          currentWorkspaceId: workspaceId,
+          workspaceInstances: nextInstances,
+          layoutJson: targetInstance.layoutJson,
+          activeTabId: targetInstance.activeTabId,
+          tabHistories: targetInstance.tabHistories,
+          layoutLoaded: false
+        });
+      }
+    }),
+    {
+      name: 'berrytrace-workspace-layout',
+      partialize: (state) => ({
+        showLeftSidebar: state.showLeftSidebar,
+        showRightSidebar: state.showRightSidebar,
+        rightSidebarWidth: state.rightSidebarWidth
+      })
+    }
+  )
+);
+
+if (typeof window !== 'undefined') {
+  (window as any).useWorkspaceStore = useWorkspaceStore;
+}
+

@@ -1,0 +1,218 @@
+import { ipcMain, BrowserWindow, net } from 'electron';
+import type { PluginManager } from './plugin-manager';
+import { broadcastAgentStepUpdate } from './plugin-event-bus';
+
+/**
+ * @module plugin-ipc-agent
+ * 职责：Agent kernel 管理、连接测试、dispatch-task 任务派发
+ * 从 plugin-ipc.ts 拆分（P4 重构），保持职责单一。
+ */
+export function registerAgentIpcHandlers(pm: PluginManager): void {
+  ipcMain.handle('plugins:ensure-loaded', async (_event, id: string) => {
+    // 退出流程中，快速返回 null，避免 Vite HMR 触发的重载 IPC 阻塞 app.quit()
+    if (pm.isDestroyed()) {
+      console.log(`[PluginIPC] PluginManager destroyed, skipping ensure-loaded for: ${id}`);
+      return null;
+    }
+    const t0 = Date.now();
+    console.log(`[PluginIPC] 🔍 plugins:ensure-loaded request for: ${id}`);
+    await pm.init();
+    console.log(`[PluginIPC] 🔍 pm.init completed for ${id} (+${Date.now() - t0}ms), calling pm.ensurePluginLoaded...`);
+    const result = await pm.ensurePluginLoaded(id);
+    console.log(`[PluginIPC] 🔍 plugins:ensure-loaded result for ${id}: ${result ? `manifest(id=${result.id})` : 'NULL'} (total=${Date.now() - t0}ms)`);
+    return result;
+  });
+
+
+  // Agent IPC Handlers
+  ipcMain.handle('agent:test-connection', async (_event, options: {
+    provider: string;
+    model?: string;
+    apiKey?: string;
+    baseUrl?: string;
+  }) => {
+    try {
+      const baseUrl = options.baseUrl?.trim() || '';
+      if (!baseUrl) {
+        return { success: false, error: 'API 地址 (Base URL) 不能为空' };
+      }
+      
+      // Construct the models endpoint URL
+      let modelsUrl = baseUrl;
+      if (!modelsUrl.endsWith('/models')) {
+        modelsUrl = modelsUrl.endsWith('/') ? `${modelsUrl}models` : `${modelsUrl}/models`;
+      }
+      
+      const headers: Record<string, string> = {
+        'Accept': 'application/json',
+      };
+      if (options.apiKey?.trim()) {
+        headers['Authorization'] = `Bearer ${options.apiKey.trim()}`;
+      }
+      
+      console.log(`[PluginIPC] Testing connection to: ${modelsUrl}`);
+      
+      const response = await net.fetch(modelsUrl, {
+        method: 'GET',
+        headers,
+      });
+      
+      if (!response.ok) {
+        const text = await response.text();
+        return { success: false, error: `HTTP ${response.status}: ${text || response.statusText}` };
+      }
+      
+      const data = await response.json() as any;
+      let modelsList: string[] = [];
+      if (data && Array.isArray(data.data)) {
+        modelsList = data.data.map((m: any) => m.id);
+      } else if (data && Array.isArray(data)) {
+        modelsList = data.map((m: any) => typeof m === 'string' ? m : m.id || m.name);
+      }
+      
+      modelsList = modelsList.filter(Boolean);
+      
+      return { success: true, models: modelsList };
+    } catch (err: any) {
+      console.error('[PluginIPC] Test connection error:', err);
+      return { success: false, error: err.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('agent:ensure-kernel', async () => {
+    await pm.init();
+    const kernelPluginId = await pm.ensureAgentKernelRunning();
+    return kernelPluginId !== null;
+  });
+
+  ipcMain.handle('agent:get-kernel-status', async () => {
+    await pm.init();
+    const targetPluginId = pm.getAgentKernelPluginId();
+    const isRunning = targetPluginId ? pm.isBackgroundPluginRunning(targetPluginId) : false;
+    return {
+      isRunning,
+      pluginId: targetPluginId,
+    };
+  });
+
+  ipcMain.on('agent:dispatch-task', async (_event, payload: any) => {
+    try {
+      const { WorkflowIntentRouter } = await import('./workflow-intent-router');
+      const intentResult = WorkflowIntentRouter.getInstance().matchIntent(payload.task);
+      if (intentResult.matched && intentResult.workflowId) {
+        console.log(`[plugin-ipc] Intent matched workflow: ${intentResult.workflowId}. Routing dispatch to workflow execution.`);
+
+        const broadcast = (stepUpdate: any) => {
+          broadcastAgentStepUpdate(stepUpdate);
+        };
+
+        // 1. 发送开始事件
+        broadcast({
+          sessionId: payload.sessionId,
+          turnId: payload.turnId,
+          status: 'started',
+          currentStep: 0,
+          message: `🔍 已识别到匹配的工作流: "${intentResult.workflowName || intentResult.workflowId}"。准备执行...`
+        });
+
+        // 2. 监听本地进展并桥接
+        const { WorkflowEngine } = await import('./workflow-engine');
+        const progressHandler = (progressPayload: any) => {
+          if (!progressPayload || progressPayload.workflowId !== intentResult.workflowId) return;
+
+          let agentStatus: any = 'running';
+          let message = '';
+          let toolName = undefined;
+          let toolDisplayName = undefined;
+
+          switch (progressPayload.event) {
+            case 'workflow_started':
+              agentStatus = 'thinking';
+              message = `🚀 启动工作流「${intentResult.workflowName || intentResult.workflowId}」...`;
+              break;
+            case 'step_started':
+              agentStatus = 'calling_tool';
+              toolName = progressPayload.stepId || '';
+              toolDisplayName = progressPayload.stepName || toolName;
+              message = `⏳ 正在执行步骤: ${toolDisplayName}`;
+              break;
+            case 'step_success':
+              agentStatus = 'tool_result';
+              toolName = progressPayload.stepId || '';
+              toolDisplayName = progressPayload.stepName || toolName;
+              message = `✅ 步骤 "${toolDisplayName}" 执行成功（耗时 ${progressPayload.durationMs}ms）。`;
+              break;
+            case 'step_failed':
+              agentStatus = 'error';
+              toolName = progressPayload.stepId || '';
+              toolDisplayName = progressPayload.stepName || toolName;
+              message = `❌ 步骤 "${toolDisplayName}" 执行失败: ${progressPayload.error}`;
+              break;
+            case 'workflow_completed':
+              agentStatus = progressPayload.success ? 'completed' : 'error';
+              message = progressPayload.success 
+                ? `🏁 工作流执行成功！总耗时 ${progressPayload.totalDurationMs}ms。`
+                : `🏁 工作流执行失败: ${progressPayload.error}`;
+              
+              // 移除监听器
+              process.nextTick(() => {
+                WorkflowEngine.getInstance().removeListener('step-progress', progressHandler);
+              });
+              break;
+          }
+
+          broadcast({
+            sessionId: payload.sessionId,
+            turnId: payload.turnId,
+            status: agentStatus,
+            currentStep: (progressPayload.stepIndex ?? 0) + 1,
+            totalSteps: progressPayload.totalSteps,
+            toolName,
+            toolDisplayName,
+            message,
+          });
+        };
+
+        WorkflowEngine.getInstance().on('step-progress', progressHandler);
+
+        // 3. 执行工作流
+        WorkflowEngine.getInstance().execute(intentResult.workflowId, intentResult.extractedParams || {}, 'direct').catch(err => {
+          console.error('[plugin-ipc] Failed to execute matched workflow:', err);
+          broadcast({
+            sessionId: payload.sessionId,
+            turnId: payload.turnId,
+            status: 'error',
+            currentStep: 0,
+            message: `❌ 执行工作流失败: ${err?.message || err}`
+          });
+          WorkflowEngine.getInstance().removeListener('step-progress', progressHandler);
+        });
+
+        return;
+      }
+
+      const { ApiDispatcher } = await import('./api-dispatcher');
+      await ApiDispatcher.getInstance().dispatch(
+        'generic-ui',
+        'ai',
+        'runAgentTask',
+        [payload],
+        undefined,
+        _event.sender
+      );
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[plugin-ipc] Failed to dispatch agent task:', err);
+      // 向 renderer 发送 error 状态，避免 AgentChat UI 永远卡在等待状态
+      const sessionId = payload?.sessionId;
+      if (sessionId) {
+        broadcastAgentStepUpdate({
+          sessionId,
+          status: 'error',
+          currentStep: 0,
+          message: `任务派发失败：${errMsg}`,
+        });
+      }
+    }
+  });
+}

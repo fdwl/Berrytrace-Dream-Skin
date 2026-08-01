@@ -1,0 +1,42 @@
+diff --git a/src/main.tsx b/src/main.tsx
+index b512edc..99486ad 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -1,4 +1,5 @@
+ import React, { StrictMode } from 'react'
++import * as LucideReact from 'lucide-react'
+ import * as ReactDOMClient from 'react-dom/client'
+ import { createRoot } from 'react-dom/client'
+ import { flushSync } from 'react-dom'
+@@ -26,12 +27,20 @@ import { TypeName, ResponseType } from './utils/type_name'
+ import { BaseModel, RespStatus, OpType } from './services/base_model'
+ import * as publish_bridge from './services/publish_bridge'
+ import { computeMenstruationWords, computeCalendarEventWords, splitWords } from './utils/words';
++import { Terminal } from 'xterm'
++import { FitAddon } from 'xterm-addon-fit'
++import { Tooltip as ReactTooltip } from 'react-tooltip'
++import 'react-tooltip/dist/react-tooltip.css'
+ 
+ // 暴露 Vite 环境变量与核心工具给插件与全局使用
+ if (typeof window !== 'undefined') {
+   (window as any).React = React;
+   (window as any).ReactDOM = { ...ReactDOMClient, flushSync };
+   (window as any).Zustand = Zustand;
++  // 供插件 renderer 使用的图标库（无打包工具的插件通过 window.__lucide 访问）
++  (window as any).__lucide = LucideReact;
++  (window as any).XTerm = { Terminal, FitAddon };
++  (window as any).ReactTooltip = ReactTooltip;
+ 
+   (window as any).__VITE_WEB_APP__ = import.meta.env.VITE_WEB_APP;
+   (window as any).__VITE_CONFIG__ = {
+@@ -86,6 +95,10 @@ if (isMac) {
+   document.documentElement.classList.add('platform-linux')
+ }
+ 
++if (useAppStore.getState().sidebarCollapsed) {
++  document.documentElement.classList.add('sidebar-collapsed')
++}
++
+ // 全局绑定 textarea 的 Esc 快捷键以取消聚焦，除非含有 'not-bind' 类名（使用事件代理以支持动态 DOM 节点）
+ document.addEventListener('keydown', (event) => {
+   const target = event.target as HTMLElement | null

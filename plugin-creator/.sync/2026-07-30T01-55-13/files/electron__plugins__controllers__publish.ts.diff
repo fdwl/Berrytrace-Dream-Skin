@@ -1,0 +1,42 @@
+diff --git a/electron/plugins/controllers/publish.ts b/electron/plugins/controllers/publish.ts
+index efe1f63..e893b6a 100644
+--- a/electron/plugins/controllers/publish.ts
++++ b/electron/plugins/controllers/publish.ts
+@@ -4,8 +4,10 @@ import { cache as electronCache } from '../../config/index';
+ setStorageBackend(electronCache);
+ 
+ import { httpService } from '../../../src/services/http';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { ElectronAuthManager } from '../../services/auth-manager';
++import { ShareFileService, type ShareRecord } from '../../services/share-file-service';
+ 
+ /**
+  * PublishController - 临时发布/分享文档功能
+@@ -226,7 +228,6 @@ export class PublishController extends BaseApiController {
+    */
+   publish_getShareByPath(args: { filePath: string; workspacePath: string }, _context: ApiContext) {
+     const { filePath, workspacePath } = args;
+-    const { ShareFileService } = require('../../services/share-file-service');
+     return ShareFileService.getInstance().getShareByPath(workspacePath, filePath);
+   }
+ 
+@@ -236,8 +237,7 @@ export class PublishController extends BaseApiController {
+    */
+   publish_addOrUpdateShare(args: { filePath: string; workspacePath: string; record: Record<string, unknown> }, _context: ApiContext) {
+     const { filePath, workspacePath, record } = args;
+-    const { ShareFileService } = require('../../services/share-file-service');
+-    ShareFileService.getInstance().addOrUpdateShare(workspacePath, filePath, record as any);
++    ShareFileService.getInstance().addOrUpdateShare(workspacePath, filePath, record as unknown as ShareRecord);
+     return { success: true };
+   }
+ 
+@@ -247,7 +247,6 @@ export class PublishController extends BaseApiController {
+    */
+   publish_removeShare(args: { filePath: string; workspacePath: string }, _context: ApiContext) {
+     const { filePath, workspacePath } = args;
+-    const { ShareFileService } = require('../../services/share-file-service');
+     const result = ShareFileService.getInstance().removeShare(workspacePath, filePath);
+     return { success: result };
+   }

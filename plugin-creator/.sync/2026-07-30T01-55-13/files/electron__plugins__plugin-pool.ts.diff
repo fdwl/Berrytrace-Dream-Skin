@@ -1,0 +1,71 @@
+diff --git a/electron/plugins/plugin-pool.ts b/electron/plugins/plugin-pool.ts
+index 6f2d6d0..8bd6faf 100644
+--- a/electron/plugins/plugin-pool.ts
++++ b/electron/plugins/plugin-pool.ts
+@@ -60,6 +60,8 @@ export class PluginPool {
+    * 此锁进一步保证 Host ready 后插件按顺序逐一加载。
+    */
+   private loadLock: Promise<void> = Promise.resolve();
++  /** app 正在退出，killHost 时设置，阻止 exit 回调触发崩溃恢复重启 */
++  private isShuttingDown = false;
+ 
+   private constructor() {}
+ 
+@@ -225,11 +227,18 @@ export class PluginPool {
+    * 软卸载（pool:unload）无法处理卡死的 Host，必须直接 kill 整个进程。
+    * Host exit handler 会统一清理所有池内插件并触发看门狗恢复。
+    */
+-  public killHost(): void {
++  public killHost(shuttingDown = false): void {
++    if (shuttingDown) {
++      this.isShuttingDown = true;
++    }
+     if (this.hostProc) {
+-      console.log('[PluginPool] Force-killing Host process (watchdog requested)');
++      console.log(`[PluginPool] Force-killing Host process (shuttingDown=${shuttingDown})`);
++      this.clearIdleTimer();
++      // 释放所有等待中的 unloadResolvers，避免退出时挂起
++      for (const resolve of this.unloadResolvers.values()) resolve();
++      this.unloadResolvers.clear();
+       this.hostProc.kill();
+-      // exit handler 会处理后续清理和恢复
++      // exit handler 会处理后续清理；shuttingDown=true 时跳过崩溃恢复
+     }
+   }
+ 
+@@ -258,7 +267,7 @@ export class PluginPool {
+ 
+     // 将宿主 node_modules 注入 NODE_PATH，确保池内插件及其 spawn 的子进程
+     // (如 tts-server.cjs / stt-server.cjs) 能解析宿主依赖 (sherpa-onnx-node 等)
+-    const hostNodeModules = join(app.getAppPath(), 'node_modules');
++    const hostNodeModules = join(__dirname, '..', 'node_modules');
+     const existingNodePath = process.env.NODE_PATH || '';
+     const nodePath = existingNodePath
+       ? `${hostNodeModules}${delimiter}${existingNodePath}`
+@@ -394,16 +403,24 @@ export class PluginPool {
+ 
+     // Host 进程退出
+     this.hostProc.on('exit', (code: number | null) => {
+-      console.log(`[PluginPool] Host process EXITED with code ${code}`);
++      console.log(`[PluginPool] Host process EXITED with code ${code} (shuttingDown=${this.isShuttingDown})`);
+       this.hostReady = false;
+       this.hostProc = null;
+       this.loadLock = Promise.resolve(); // 重置加载锁
+ 
+-      // 清理池内插件注册并触发看门狗崩溃恢复。
++      // 清理池内插件注册
+       const crashedPluginIds = Array.from(this.entries.keys());
+       this.entries.clear();
+       this.pooledHandlers.clear();
+       this.unloadResolvers.clear();
++
++      // 退出流程中：跳过看门狗崩溃恢复，避免退出阶段重启插件进程
++      if (this.isShuttingDown) {
++        console.log(`[PluginPool] Skipping watchdog crash recovery for ${crashedPluginIds.length} plugins (app is shutting down).`);
++        return;
++      }
++
++      // 正常崩溃：触发看门狗恢复
+       for (const pluginId of crashedPluginIds) {
+         PluginWatchdog.getInstance().handleCrash(pluginId, code);
+       }

@@ -1,0 +1,116 @@
+diff --git a/electron/plugins/controllers/browser.ts b/electron/plugins/controllers/browser.ts
+index 9e4178c..2431ca8 100644
+--- a/electron/plugins/controllers/browser.ts
++++ b/electron/plugins/controllers/browser.ts
+@@ -1,5 +1,6 @@
+ import { ipcMain } from 'electron';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { ElectronMainWindow } from '../../windows/main-window';
+ import { BrowserViewManager } from '../../windows/browser-view-manager';
+ 
+@@ -23,19 +24,21 @@ export class BrowserController extends BaseApiController {
+     const tabId = await this._prepareWorkspace(mainWindow);
+     const bvm = BrowserViewManager.getInstance();
+ 
+-    // 如果 BrowserViewManager 中还没有这个 Tab 的 View（Tab 是新创建的），稍等片刻让 React 侧完成 bounds 上报
+     if (!bvm.hasView(tabId)) {
+       console.warn(`[BrowserController] WebContentsView for tabId=${tabId} not yet registered, waiting...`);
+-      await new Promise<void>((resolve) => {
+-        const timer = setTimeout(resolve, 3000);
++      const ready = await new Promise<boolean>((resolve) => {
++        const timer = setTimeout(() => resolve(false), 5000);
+         const check = setInterval(() => {
+           if (bvm.hasView(tabId)) {
+             clearInterval(check);
+             clearTimeout(timer);
+-            resolve();
++            resolve(true);
+           }
+         }, 100);
+       });
++      if (!ready) {
++        throw new Error(`[BrowserController] WebContentsView for tabId=${tabId} 未在 5s 内就绪，浏览器标签可能创建失败`);
++      }
+     }
+ 
+     let result: any = null;
+@@ -158,6 +161,77 @@ export class BrowserController extends BaseApiController {
+     }
+   }
+ 
++  /**
++   * 检测系统已安装的本地浏览器
++   */
++  async browser_detectBrowsers(): Promise<any> {
++    const { detectInstalledBrowsers } = await import('../../services/browser-cookie-import');
++    return detectInstalledBrowsers();
++  }
++
++  /**
++   * 将网页抓取/注释/截图临时保存为文件，用于 ChatInput 附件块
++   */
++  async browser_saveTempAttachment(params: { filename: string; content: string; isBase64?: boolean }): Promise<{ ok: boolean; filePath: string; relativePath: string }> {
++    const fs = await import('node:fs/promises');
++    const path = await import('node:path');
++    const os = await import('node:os');
++    const { app } = await import('electron');
++
++    try {
++      const tmpDir = path.join(app.getPath('userData'), 'tmp_attachments');
++      await fs.mkdir(tmpDir, { recursive: true });
++      const filePath = path.join(tmpDir, params.filename);
++
++      if (params.isBase64) {
++        const base64Data = params.content.replace(/^data:image\/\w+;base64,/, '');
++        const buffer = Buffer.from(base64Data, 'base64');
++        await fs.writeFile(filePath, buffer);
++      } else {
++        await fs.writeFile(filePath, params.content, 'utf-8');
++      }
++
++      return { ok: true, filePath, relativePath: filePath };
++    } catch (err: any) {
++      console.error('[BrowserController] saveTempAttachment error:', err);
++      throw err;
++    }
++  }
++
++  /**
++   * 从指定的本地浏览器导入 Cookie 到 workspace session
++   */
++  async browser_importCookiesFromBrowser(params: { family: string; profile?: string }): Promise<any> {
++    const { importCookiesFromBrowser } = await import('../../services/browser-cookie-import');
++    return importCookiesFromBrowser(params.family as any, params.profile);
++  }
++
++  /**
++   * 一键从所有识别到的本地浏览器导入 Cookie
++   */
++  async browser_importCookiesFromAllBrowsers(): Promise<any> {
++    const { importCookiesFromAllBrowsers } = await import('../../services/browser-cookie-import');
++    return importCookiesFromAllBrowsers();
++  }
++
++
++  /**
++   * 从 JSON 文件导入 Cookie 到 workspace session
++   */
++  async browser_importCookiesFromFile(params: { filePath?: string }): Promise<any> {
++    const { pickCookieFile, importCookiesFromFile } = await import('../../services/browser-cookie-import');
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++    let file = params?.filePath;
++    if (!file) {
++      file = (await pickCookieFile(mainWindow)) || undefined;
++    }
++    if (!file) {
++      return { ok: false, reason: 'canceled' };
++    }
++    return importCookiesFromFile(file);
++  }
++
++
+   /** 缓存 prepared 状态，避免同一 session 中重复预热 */
+   private _preparedAt = 0;
+   private _lastTabId = '';

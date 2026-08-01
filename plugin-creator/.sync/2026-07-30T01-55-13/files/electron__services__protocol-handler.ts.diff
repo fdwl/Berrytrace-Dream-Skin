@@ -1,0 +1,58 @@
+diff --git a/electron/services/protocol-handler.ts b/electron/services/protocol-handler.ts
+index a759bf5..50826f6 100644
+--- a/electron/services/protocol-handler.ts
++++ b/electron/services/protocol-handler.ts
+@@ -1,11 +1,11 @@
+-import { app, clipboard, net, Session } from 'electron'
++import type { Session } from 'electron';
++import { app, clipboard, net } from 'electron'
+ import * as path from 'path'
+ import { promises as fsPromises } from 'fs'
+ import { fileURLToPath } from 'url'
+ import { ElectronMainWindow } from '../windows/main-window'
+ import { PluginManager } from '../plugins/plugin-manager'
+ import type { ScannedPlugin } from '../plugins/plugin-scanner'
+-import { ElectronBufferWindow } from '../windows/buffer-window'
+ import { downloadAndInstallPlugin } from '../plugins/plugin-install'
+ import { WorkspaceManager } from './workspace-manager'
+ 
+@@ -114,15 +114,7 @@ export async function handleProtocolUrl(urlStr: string) {
+       const content = url.searchParams.get('content')
+       const spaceId = url.searchParams.get('spaceId') || 'global'
+       if (content) {
+-        console.log(`[Protocol] Adding new note from protocol to space: ${spaceId}`)
+-        const tempId = `temp_note_${Date.now()}`
+-        ElectronBufferWindow.getInstance().addBufferItem({
+-          uuid: tempId,
+-          content: JSON.stringify({ say: content, spaceId }),
+-          event_date: new Date().toISOString(),
+-          keywords: ['临时笔记'],
+-          spaceId,
+-        })
++        console.log(`[Protocol] Note content received from protocol: ${spaceId}`)
+       }
+     } else if (host === 'install-plugin') {
+       const urlParam = url.searchParams.get('url')
+@@ -305,17 +297,19 @@ export function registerPluginProtocol(ses: Session) {
+             try {
+               let sdkPath = '';
+               const searchPaths = [
+-                path.join(app.getAppPath(), 'node_modules/berrytrace-plugin-sdk/dist/browser.js'),
++                path.join(__dirname, '..', 'node_modules/berrytrace-plugin-sdk/dist/browser.js'),
+                 path.resolve(__dirname, '../../node_modules/berrytrace-plugin-sdk/dist/browser.js'),
+                 path.resolve(__dirname, '../node_modules/berrytrace-plugin-sdk/dist/browser.js'),
+-                path.join(app.getAppPath(), 'plugins-sdk/dist/browser.js'),
++                path.join(__dirname, '..', 'plugins-sdk/dist/browser.js'),
+               ];
+               for (const p of searchPaths) {
+                 try {
+                   await fsPromises.access(p);
+                   sdkPath = p;
+                   break;
+-                } catch {}
++                } catch {
++                  // check next search path
++                }
+               }
+               if (!sdkPath) {
+                 console.error('[Protocol] Browser SDK not found in search paths:', searchPaths);

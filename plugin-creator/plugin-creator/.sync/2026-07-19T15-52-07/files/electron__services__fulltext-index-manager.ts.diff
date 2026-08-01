@@ -1,0 +1,84 @@
+diff --git a/electron/services/fulltext-index-manager.ts b/electron/services/fulltext-index-manager.ts
+index b604144..c16f2fc 100644
+--- a/electron/services/fulltext-index-manager.ts
++++ b/electron/services/fulltext-index-manager.ts
+@@ -17,7 +17,7 @@ import {
+   extractFileContent,
+   getSupportedExts,
+ } from './fulltext-file-parsers.js'
+-import { SKILLS_DIR, PLUGINS_DIR } from '../config/paths'
++import { SKILLS_DIR, PLUGINS_DIR, FULLTEXT_CONFIG } from '../config/paths'
+ 
+ export interface IndexProgress {
+   status: 'idle' | 'pending' | 'building' | 'paused' | 'error' | 'done'
+@@ -419,16 +419,22 @@ export class FullTextIndexManager {
+           console.warn(`[FullTextIndex] Empty content extracted or failed to extract content: ${filePath}`)
+         }
+ 
++        // 截断存入 FTS5 数据库的文本上限，防止巨型文档膨胀内存与数据库
++        const maxChars = FULLTEXT_CONFIG.FTS_MAX_CHARS
++        const indexContent = (content && content.length > maxChars) ? content.slice(0, maxChars) : (content || '')
+         const fileName = basename(filePath)
+ 
+         // 插入新索引 (存储 relativePath 并且 file_type 去除点前缀)
+         wsDb.prepare(`
+           INSERT INTO FtsFileIndex (file_path, file_name, content, file_type, workspace_path, modified_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+-        `).run(relativePath, fileName, content || '', ext.slice(1), workspacePath, mtime)
++        `).run(relativePath, fileName, indexContent, ext.slice(1), workspacePath, mtime)
+ 
+         console.log(`[FullTextIndex] Updated index (incremental): ${relativePath} (${content?.length || 0} chars)`)
+         updatedCount++
++
++        // 礼让 Electron 主线程事件循环，防止连续大文件处理导致 UI 卡顿
++        await new Promise(resolve => setTimeout(resolve, FULLTEXT_CONFIG.YIELD_INTERVAL_MS))
+       } catch (err) {
+         console.error(`[FullTextIndex] Failed to update index for ${filePath}:`, err)
+         errorCount++
+@@ -458,12 +464,42 @@ export class FullTextIndexManager {
+   // 文件解析本身是 I/O 密集型任务，异步处理已足够
+ 
+   /**
+-   * 异步解析文件内容（使用异步队列，避免阻塞主进程）
++   * 异步解析文件内容（大文件分级索引策略）
++   * - 普通文件 (<= FULLTEXT_CONFIG.LARGE_FILE_THRESHOLD): 提取全量文本内容
++   * - 大型文档 (> 10MB 且 <= 300MB): 不提取数百兆全量原始文本，而是提炼【目录大纲+结构摘要】存入 FTS5 索引
++   * - 超大二进制 (> 300MB): 跳过文本索引
+    */
+   private async extractFileContentAsync(filePath: string, ext: string): Promise<string> {
+-    // 直接调用 extractFileContent（已经是异步的）
+-    // 如果需要更复杂的异步处理，可以在这里添加队列逻辑
+-    return extractFileContent(filePath, ext)
++    try {
++      let fileSize = 0
++      try {
++        const stats = await fs.promises.stat(filePath)
++        fileSize = stats.size
++      } catch (err) {
++        console.warn(`[FullTextIndex] Stat failed for ${filePath}, skipping:`, err)
++        return ''
++      }
++
++      // 超大文件 (> MAX_FILE_SIZE)，跳过索引
++      if (fileSize > FULLTEXT_CONFIG.MAX_FILE_SIZE) {
++        console.warn(`[FullTextIndex] Skipping huge file (>${(FULLTEXT_CONFIG.MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB): ${filePath}`)
++        return ''
++      }
++
++      // 大型文档 (> LARGE_FILE_THRESHOLD 且 <= MAX_FILE_SIZE)：提炼大纲作为索引文本
++      if (fileSize > FULLTEXT_CONFIG.LARGE_FILE_THRESHOLD) {
++        console.log(`[FullTextIndex] Large document detected (${(fileSize / 1024 / 1024).toFixed(2)}MB), extracting outline index for: ${filePath}`)
++        const { extractDocumentOutline } = await import('./fulltext-file-parsers.js')
++        const outlineRes = await extractDocumentOutline(filePath)
++        const outlineTitles = outlineRes.outline.map(o => `${o.title} (Page ${o.page || 1})`).join('\n')
++        return `[Large Document Outline / 大文档结构大纲 - Total Pages: ${outlineRes.totalPages || 0}]\n${outlineTitles}`
++      }
++
++      return await extractFileContent(filePath, ext)
++    } catch (err) {
++      console.error(`[FullTextIndex] extractFileContentAsync error for ${filePath}:`, err)
++      return ''
++    }
+   }
+ 
+   // ==================== 启动与自动构建 ====================

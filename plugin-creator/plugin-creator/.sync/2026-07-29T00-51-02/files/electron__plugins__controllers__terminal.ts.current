@@ -1,0 +1,722 @@
+import { app } from 'electron';
+import type { ChildProcess } from 'child_process';
+import { spawn as childSpawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import type { ApiContext } from './api-context';
+import { BaseApiController } from './api-context';
+import { getShellPath } from './system';
+import { OSC133Wrapper } from '../../services/pty/osc133-wrapper';
+import { extractLastOscTitle, detectAgentStatusFromTitle, type AgentTitleStatus } from '../../services/pty/agent-title-detector';
+import { createRequire } from 'module';
+const requireFn = createRequire(import.meta.url);
+
+interface IPtyProcess {
+  pid: number;
+  /** Current foreground process name (node-pty exposes this via OS-level syscall). */
+  readonly process?: string;
+  write(data: string): void;
+  resize(columns: number, rows: number): void;
+  kill(signal?: string): void;
+  onData(callback: (data: string) => void): { dispose(): void };
+  onExit(callback: (event: { exitCode: number; signal?: number }) => void): { dispose(): void };
+}
+
+interface IPtyModule {
+  spawn(file: string, args: string[] | string, options: unknown): IPtyProcess;
+}
+
+let pty: IPtyModule | null = null;
+try {
+  // Try to load native node-pty
+  pty = requireFn('node-pty') as IPtyModule;
+  console.log('[TerminalController] Successfully loaded node-pty native module.');
+} catch (err) {
+  console.warn('[TerminalController] Failed to load node-pty. Falling back to standard child_process.spawn:', err);
+}
+
+export interface TerminalStatusPayload {
+  sessionId: string;
+  isBusy: boolean;
+  isTuiMode?: boolean;
+  foregroundProcess?: string;
+  lastExitCode?: number;
+}
+
+export class TerminalController extends BaseApiController {
+  private ptySessions = new Map<string, IPtyProcess>();
+  private fallbackSessions = new Map<string, ChildProcess>();
+  private sessionBuffers = new Map<string, string[]>();
+  private sessionRawBuffers = new Map<string, string[]>();
+  private oscWrappers = new Map<string, OSC133Wrapper>();
+  private sessionStatus = new Map<string, TerminalStatusPayload>();
+  private sessionTitleStatus = new Map<string, AgentTitleStatus>();
+  private quietTimers = new Map<string, NodeJS.Timeout>();
+  private tuiModeMap = new Map<string, boolean>();
+  private lastWriteTimes = new Map<string, number>();
+  /** Sessions intentionally closed by the user or unmount cleanup — suppress their onExit IPC events. */
+  private closedSessions = new Set<string>();
+  /** Shell basename per session (e.g. 'zsh') — compared against proc.process to detect child processes (orca pattern). */
+  private sessionShellNames = new Map<string, string>();
+  /** Periodic foreground-process scan intervals — stopped on close/exit. */
+  private foregroundScanIntervals = new Map<string, ReturnType<typeof setInterval>>();
+
+  private snapshotsLoaded = false;
+  private snapshotSaveTimer: NodeJS.Timeout | null = null;
+
+  private getSnapshotFilePath(): string {
+    return path.join(app.getPath('userData'), 'terminal_snapshots.json');
+  }
+
+  private loadDiskSnapshots() {
+    if (this.snapshotsLoaded) return;
+    this.snapshotsLoaded = true;
+    try {
+      const file = this.getSnapshotFilePath();
+      if (fs.existsSync(file)) {
+        const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        if (data && typeof data === 'object') {
+          for (const [sid, buf] of Object.entries(data)) {
+            if (Array.isArray(buf)) {
+              this.sessionRawBuffers.set(sid, buf as string[]);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[TerminalController] Failed to load terminal snapshots from disk:', err);
+    }
+  }
+
+  private saveDiskSnapshotsDebounced() {
+    if (this.snapshotSaveTimer) clearTimeout(this.snapshotSaveTimer);
+    this.snapshotSaveTimer = setTimeout(() => {
+      try {
+        const data: Record<string, string[]> = {};
+        for (const [sid, buf] of this.sessionRawBuffers.entries()) {
+          data[sid] = buf.slice(-100);
+        }
+        fs.writeFileSync(this.getSnapshotFilePath(), JSON.stringify(data, null, 2), 'utf-8');
+      } catch (err) {
+        console.warn('[TerminalController] Failed to save terminal snapshots to disk:', err);
+      }
+    }, 1000);
+  }
+
+  private updateStatus(
+    sessionId: string,
+    isBusy: boolean,
+    exitCode?: number,
+    sender?: Electron.WebContents,
+    extra?: { isTuiMode?: boolean; foregroundProcess?: string }
+  ) {
+    const prev = this.sessionStatus.get(sessionId);
+    const isTuiMode = extra?.isTuiMode ?? this.tuiModeMap.get(sessionId) ?? prev?.isTuiMode ?? false;
+    const foregroundProcess = extra?.foregroundProcess ?? prev?.foregroundProcess;
+
+    if (
+      !prev ||
+      prev.isBusy !== isBusy ||
+      prev.isTuiMode !== isTuiMode ||
+      prev.foregroundProcess !== foregroundProcess ||
+      exitCode !== undefined
+    ) {
+      const payload: TerminalStatusPayload = {
+        sessionId,
+        isBusy,
+        isTuiMode,
+        foregroundProcess,
+        lastExitCode: exitCode ?? prev?.lastExitCode,
+      };
+      this.sessionStatus.set(sessionId, payload);
+      if (sender && !sender.isDestroyed()) {
+        sender.send(`terminal:status:${sessionId}`, payload);
+      }
+    }
+  }
+
+  async getStatus(sessionId: string): Promise<TerminalStatusPayload> {
+    return this.sessionStatus.get(sessionId) || { sessionId, isBusy: false, isTuiMode: false };
+  }
+
+  async getAllStatus(): Promise<Record<string, TerminalStatusPayload>> {
+    const result: Record<string, TerminalStatusPayload> = {};
+    for (const [sid, status] of this.sessionStatus.entries()) {
+      result[sid] = status;
+    }
+    return result;
+  }
+
+  async create(cols: number, rows: number, initialCwd?: string, persistentSessionId?: string | ApiContext, contextArg?: ApiContext) {
+    let persistentId: string | undefined = undefined;
+    let context: ApiContext = contextArg as ApiContext;
+
+    if (typeof persistentSessionId === 'string' && persistentSessionId.trim()) {
+      persistentId = persistentSessionId.trim();
+    } else if (persistentSessionId && typeof persistentSessionId === 'object' && 'sender' in persistentSessionId) {
+      context = persistentSessionId as ApiContext;
+    }
+
+    this.loadDiskSnapshots();
+
+    const sessionId = persistentId || `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    // --- WARM REATTACH CHECK ---
+    const existingPty = this.ptySessions.get(sessionId);
+    const existingFallback = this.fallbackSessions.get(sessionId);
+
+    if (existingPty || existingFallback) {
+      console.log(`[TerminalController] Warm reattaching to live terminal session=${sessionId}`);
+
+      // Flush stored raw output buffer to renderer so xterm restores previous output
+      const rawBuf = this.sessionRawBuffers.get(sessionId) || [];
+      if (context?.sender && !context.sender.isDestroyed()) {
+        for (const chunk of rawBuf) {
+          context.sender.send(`terminal:data:${sessionId}`, chunk);
+        }
+      }
+
+      // Re-send current status
+      const status = this.sessionStatus.get(sessionId);
+      if (status && context?.sender && !context.sender.isDestroyed()) {
+        context.sender.send(`terminal:status:${sessionId}`, status);
+      }
+
+      // Resize live process to new dimensions
+      if (existingPty && cols && rows) {
+        try {
+          existingPty.resize(cols, rows);
+        } catch (_e) {
+          // ignore
+        }
+      }
+
+      return sessionId;
+    }
+
+    // --- COLD START / SPAWN NEW PROCESS ---
+    const isWin = process.platform === 'win32';
+    const shell = isWin ? 'powershell.exe' : (process.env.SHELL || '/bin/zsh');
+    const args = isWin ? [] : ['-l'];
+
+    // Clear stale buffer history from previous exited sessions on cold start
+    this.sessionBuffers.delete(sessionId);
+    this.sessionRawBuffers.delete(sessionId);
+    // Unmark any previous intentional-close for this session id so onExit fires normally
+    this.closedSessions.delete(sessionId);
+
+    // 1. Resolve Workspace Path for CWD
+    let cwd = initialCwd || app.getPath('home');
+    if (!initialCwd) {
+      try {
+        const { WorkspaceManager } = await import('../../services/workspace-manager');
+        const wsPath = WorkspaceManager.getInstance().getPathForWebContents(context?.sender || null);
+        if (wsPath) {
+          cwd = wsPath;
+        }
+      } catch (e) {
+        console.warn('[TerminalController] Failed to resolve workspace path:', e);
+      }
+    }
+
+    // 2. Prepare Environment Variables (Delete Electron-specific flags so child shells run cleanly)
+    const globalPrefix = path.join(app.getPath('home'), '.berrytrace', 'npm-global');
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: getShellPath(),
+      npm_config_prefix: globalPrefix,
+      TERM: 'xterm-256color',
+      COLORTERM: 'truecolor',
+      TERM_PROGRAM: 'BerryTrace',
+    };
+    delete env.ELECTRON_RUN_AS_NODE;
+    delete env.ELECTRON_NO_ASAR;
+    delete env.NODE_ENV;
+
+    console.log(`[TerminalController:create] Cold start spawn session=${sessionId} shell=${shell} args=${JSON.stringify(args)} cwd=${cwd} cols=${cols} rows=${rows}`);
+
+    if (pty) {
+      // 3a. Spawn Native PTY
+      try {
+        const safeCols = Math.max(10, Number(cols) || 80);
+        const safeRows = Math.max(2, Number(rows) || 24);
+        const ptyProcess = pty.spawn(shell, args, {
+          name: 'xterm-256color',
+          cols: safeCols,
+          rows: safeRows,
+          cwd,
+          env: env as Record<string, string>,
+        });
+
+        console.log(`[TerminalController:spawn] Native PTY spawned successfully for session=${sessionId}, pid=${ptyProcess.pid}`);
+
+        const oscWrapper = new OSC133Wrapper();
+        this.oscWrappers.set(sessionId, oscWrapper);
+
+        oscWrapper.on('command-start', () => this.updateStatus(sessionId, true, undefined, context?.sender));
+        oscWrapper.on('command-output-start', () => this.updateStatus(sessionId, true, undefined, context?.sender));
+        oscWrapper.on('ready', () => {
+          this.sessionTitleStatus.delete(sessionId);
+          this.updateStatus(sessionId, false, undefined, context?.sender);
+        });
+        oscWrapper.on('command-finished', ({ exitCode }) => {
+          this.sessionTitleStatus.delete(sessionId);
+          this.updateStatus(sessionId, false, exitCode, context?.sender);
+        });
+
+        ptyProcess.onData((data: string) => {
+          // 1. Detect TUI Alternate Screen Buffer escape codes (\x1b[?1049h / \x1b[?47h)
+          if (data.includes('\x1b[?1049h') || data.includes('\x1b[?47h')) {
+            this.tuiModeMap.set(sessionId, true);
+            this.updateStatus(sessionId, true, undefined, context?.sender, { isTuiMode: true });
+          } else if (data.includes('\x1b[?1049l') || data.includes('\x1b[?47l')) {
+            this.tuiModeMap.set(sessionId, false);
+            this.updateStatus(sessionId, false, undefined, context?.sender, { isTuiMode: false });
+          }
+
+          // 2. Extract OSC 0/1/2 Title and detect AI Agent execution status (orca pattern: detectAgentStatusFromTitle)
+          const oscTitle = extractLastOscTitle(data);
+          if (oscTitle) {
+            const titleStatus = detectAgentStatusFromTitle(oscTitle);
+            if (titleStatus !== null) {
+              this.sessionTitleStatus.set(sessionId, titleStatus);
+              if (titleStatus === 'working' || titleStatus === 'permission') {
+                this.updateStatus(sessionId, true, undefined, context?.sender);
+              } else if (titleStatus === 'idle') {
+                this.updateStatus(sessionId, false, undefined, context?.sender);
+              }
+            }
+          }
+
+          const cleanData = oscWrapper.processOutput(data);
+          this.appendSessionBuffer(sessionId, cleanData, data);
+
+          const isTui = this.tuiModeMap.get(sessionId) || false;
+
+          // TUI mode: any output chunk means the TUI is actively working/redrawing → busy.
+          if (isTui) {
+            this.updateStatus(sessionId, true, undefined, context?.sender, { isTuiMode: true });
+          }
+
+          if (this.quietTimers.has(sessionId)) {
+            clearTimeout(this.quietTimers.get(sessionId)!);
+          }
+
+          // Quiet settlement delay:
+          // NOTE: We REMOVED `data.includes('\x1b[?25h')` (Show Cursor)!
+          // VT100 `\x1b[?25h` is constantly emitted by readline, cursor blinks, and interactive prompts.
+          // Treating it as a trigger for a 180ms quiet timer caused premature/oscillating idle transitions!
+          // Orca uses 350ms for TUI settlement and 600ms for non-TUI settlement.
+          const quietDelay = isTui ? 350 : 600;
+          const timer = setTimeout(() => {
+            const stillTui = this.tuiModeMap.get(sessionId) ?? false;
+            if (!stillTui) {
+              // Non-TUI: do NOT declare idle if OSC title explicitly indicates working/permission (orca pattern)
+              const currentTitleStatus = this.sessionTitleStatus.get(sessionId);
+              if (currentTitleStatus === 'working' || currentTitleStatus === 'permission') {
+                return;
+              }
+
+              // Non-TUI: do NOT declare idle if a child process is still running (orca: proc.process !== shellName).
+              const liveFg = ptyProcess.process;
+              const sName = this.sessionShellNames.get(sessionId) ?? '';
+              if (liveFg && sName && liveFg !== sName) return;
+            }
+            // TUI mode or settled non-TUI command: allow quiet timer to fire → declare idle.
+            this.updateStatus(sessionId, false, undefined, context?.sender);
+          }, quietDelay);
+          this.quietTimers.set(sessionId, timer);
+
+          if (context?.sender && !context.sender.isDestroyed()) {
+            context.sender.send(`terminal:data:${sessionId}`, cleanData);
+          }
+        });
+
+        ptyProcess.onExit((event: { exitCode: number; signal?: number }) => {
+          const wasIntentionallyClosed = this.closedSessions.has(sessionId);
+          console.warn(`[TerminalController:onExit] Session=${sessionId} (pid=${ptyProcess.pid}) exited with code=${event.exitCode}, signal=${event.signal}, intentionallyClosed=${wasIntentionallyClosed}`);
+          this.ptySessions.delete(sessionId);
+          this.oscWrappers.delete(sessionId);
+          this.sessionTitleStatus.delete(sessionId);
+          if (this.quietTimers.has(sessionId)) {
+            clearTimeout(this.quietTimers.get(sessionId)!);
+            this.quietTimers.delete(sessionId);
+          }
+          if (this.foregroundScanIntervals.has(sessionId)) {
+            clearInterval(this.foregroundScanIntervals.get(sessionId)!);
+            this.foregroundScanIntervals.delete(sessionId);
+          }
+          this.sessionShellNames.delete(sessionId);
+          // Do NOT send terminal:exit if this session was intentionally closed (user close / orphan cleanup)
+          // This prevents the exit notification from poisoning a newly-spawned session with the same id
+          if (wasIntentionallyClosed) {
+            this.closedSessions.delete(sessionId);
+            return;
+          }
+          this.updateStatus(sessionId, false, event.exitCode, context?.sender);
+          if (context?.sender && !context.sender.isDestroyed()) {
+            context.sender.send(`terminal:exit:${sessionId}`, event.exitCode);
+          }
+        });
+
+        this.ptySessions.set(sessionId, ptyProcess);
+        // Store shell name for proc.process comparison (orca: hasChildProcesses pattern)
+        this.sessionShellNames.set(sessionId, path.basename(shell));
+        // Start 750ms periodic foreground scan to override stale quiet-timer readings
+        this.startForegroundScan(sessionId, ptyProcess, context?.sender);
+        return sessionId;
+      } catch (err) {
+        console.error('[TerminalController] Failed to spawn PTY, falling back to standard spawn:', err);
+      }
+    }
+
+    // 3b. Fallback: Spawn standard child_process
+    const proc = childSpawn(shell, [], {
+      cwd,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    proc.stdout?.on('data', (data: Buffer) => {
+      const str = data.toString('utf-8');
+      this.appendSessionBuffer(sessionId, str, str);
+      if (context?.sender && !context.sender.isDestroyed()) {
+        context.sender.send(`terminal:data:${sessionId}`, str);
+      }
+    });
+
+    proc.stderr?.on('data', (data: Buffer) => {
+      const str = data.toString('utf-8');
+      this.appendSessionBuffer(sessionId, str, str);
+      if (context?.sender && !context.sender.isDestroyed()) {
+        context.sender.send(`terminal:data:${sessionId}`, str);
+      }
+    });
+
+    proc.on('close', (code) => {
+      console.log(`[TerminalController] Fallback session=${sessionId} exited with code=${code}`);
+      if (context?.sender && !context.sender.isDestroyed()) {
+        context.sender.send(`terminal:exit:${sessionId}`, code);
+      }
+      this.fallbackSessions.delete(sessionId);
+    });
+
+    this.fallbackSessions.set(sessionId, proc);
+    return sessionId;
+  }
+
+  async attach(sessionId: string, context?: ApiContext) {
+    console.log(`[TerminalController:attach] Replaying buffer for session=${sessionId}`);
+    const rawBuf = this.sessionRawBuffers.get(sessionId) || [];
+    if (context?.sender && !context.sender.isDestroyed()) {
+      for (const chunk of rawBuf) {
+        context.sender.send(`terminal:data:${sessionId}`, chunk);
+      }
+    }
+    const status = this.sessionStatus.get(sessionId);
+    if (status && context?.sender && !context.sender.isDestroyed()) {
+      context.sender.send(`terminal:status:${sessionId}`, status);
+    }
+    return true;
+  }
+
+  private appendSessionBuffer(sessionId: string, cleanData: string, rawData?: string) {
+    if (!this.sessionBuffers.has(sessionId)) {
+      this.sessionBuffers.set(sessionId, []);
+    }
+    const buf = this.sessionBuffers.get(sessionId)!;
+    const lines = cleanData.split(/\r?\n/);
+    buf.push(...lines);
+    if (buf.length > 500) {
+      buf.splice(0, buf.length - 500);
+    }
+
+    if (!this.sessionRawBuffers.has(sessionId)) {
+      this.sessionRawBuffers.set(sessionId, []);
+    }
+    const rawBuf = this.sessionRawBuffers.get(sessionId)!;
+    rawBuf.push(rawData || cleanData);
+    if (rawBuf.length > 200) {
+      rawBuf.splice(0, rawBuf.length - 200);
+    }
+
+    this.saveDiskSnapshotsDebounced();
+  }
+
+  /**
+   * Get recent terminal output lines for a terminal session.
+   */
+  async getOutput(sessionId: string, maxLines = 100): Promise<string> {
+    const buf = this.sessionBuffers.get(sessionId);
+    if (!buf || buf.length === 0) return '';
+    const slice = buf.slice(-Math.abs(maxLines));
+    // Strip ANSI escape codes for clean AI reading
+    // eslint-disable-next-line no-control-regex
+    const cleanText = slice.join('\n').replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
+    return cleanText;
+  }
+
+  /**
+   * List all active terminal sessions.
+   */
+  async listSessions(): Promise<Array<{ sessionId: string; type: string }>> {
+    const list: Array<{ sessionId: string; type: string }> = [];
+    for (const id of this.ptySessions.keys()) {
+      list.push({ sessionId: id, type: 'pty' });
+    }
+    for (const id of this.fallbackSessions.keys()) {
+      list.push({ sessionId: id, type: 'fallback' });
+    }
+    return list;
+  }
+
+  async write(sessionId: string, data: string) {
+    // Record written data into session buffer for complete history
+    this.appendSessionBuffer(sessionId, `> ${data}`);
+
+    // If writing input containing newline/enter, mark session status as busy
+    if (data.includes('\r') || data.includes('\n')) {
+      this.updateStatus(sessionId, true);
+    }
+
+    // Normalize \n to \r for PTY input compatibility (Enter key in terminal PTY is \r)
+    const ptyData = data.replace(/\r?\n/g, '\r');
+
+    // Write to PTY
+    const ptySession = this.ptySessions.get(sessionId);
+    if (ptySession) {
+      ptySession.write(ptyData);
+      return;
+    }
+
+    // Write to standard spawn stdin
+    const fallbackSession = this.fallbackSessions.get(sessionId);
+    if (fallbackSession && fallbackSession.stdin && !fallbackSession.stdin.destroyed) {
+      fallbackSession.stdin.write(data);
+    }
+  }
+
+  async resize(sessionId: string, cols: number, rows: number) {
+    const ptySession = this.ptySessions.get(sessionId);
+    if (ptySession) {
+      try {
+        const safeCols = Math.max(10, Number(cols) || 80);
+        const safeRows = Math.max(2, Number(rows) || 24);
+        ptySession.resize(safeCols, safeRows);
+      } catch (err) {
+        console.warn(`[TerminalController] Resize session=${sessionId} failed:`, err);
+      }
+    }
+  }
+
+  async close(sessionId: string) {
+    const stack = new Error().stack?.split('\n').slice(1, 4).join(' <- ');
+    console.log(`[TerminalController:close] Closing session=${sessionId}, caller trace: ${stack}`);
+    this.sessionBuffers.delete(sessionId);
+    this.sessionRawBuffers.delete(sessionId);
+    this.sessionTitleStatus.delete(sessionId);
+    this.saveDiskSnapshotsDebounced();
+
+    const ptySession = this.ptySessions.get(sessionId);
+    if (ptySession) {
+      if (this.foregroundScanIntervals.has(sessionId)) {
+        clearInterval(this.foregroundScanIntervals.get(sessionId)!);
+        this.foregroundScanIntervals.delete(sessionId);
+      }
+      this.sessionShellNames.delete(sessionId);
+      // Mark BEFORE kill() so the onExit callback sees it and suppresses terminal:exit IPC
+      this.closedSessions.add(sessionId);
+      try {
+        ptySession.kill();
+      } catch (_e) {
+        // ignore
+      }
+      this.ptySessions.delete(sessionId);
+      return;
+    }
+
+    const fallbackSession = this.fallbackSessions.get(sessionId);
+    if (fallbackSession) {
+      this.closedSessions.add(sessionId);
+      try {
+        fallbackSession.kill();
+      } catch (_e) {
+        // ignore
+      }
+      this.fallbackSessions.delete(sessionId);
+    }
+  }
+
+  async getCwd(sessionId: string) {
+    const session = this.ptySessions.get(sessionId);
+    if (!session) return null;
+    const pid = session.pid;
+    if (!pid) return null;
+
+    if (process.platform === 'darwin') {
+      try {
+        const { execSync } = await import('child_process');
+        const output = execSync(`lsof -a -d cwd -p ${pid} -Fn`, { encoding: 'utf-8' });
+        const lines = output.split('\n');
+        const cwdLine = lines.find(line => line.startsWith('n'));
+        if (cwdLine) {
+          return cwdLine.substring(1).trim();
+        }
+      } catch (_err) {
+        // Silent warning since it might query right during process transitions
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Send control key sequence for interactive TUI prompts (e.g. inquirer, clack, vim)
+   */
+  async sendControlKey(sessionId: string, key: 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight' | 'Enter' | 'Tab' | 'Space' | 'Escape' | 'Ctrl+C') {
+    const sequence = OSC133Wrapper.formatControlKey(key);
+    await this.write(sessionId, sequence);
+    return true;
+  }
+
+  /**
+   * Get current OSC 133 prompt ready status for terminal session
+   */
+  async getPromptState(sessionId: string) {
+    const wrapper = this.oscWrappers.get(sessionId);
+    return wrapper ? wrapper.getState() : { isPromptReady: true, inCommandOutput: false };
+  }
+
+  /**
+   * Get accurate real-time process info for a terminal session.
+   * Fast path: node-pty's proc.process (OS-level foreground process name).
+   * Deep path: ps -axo pid=,ppid=,stat=,comm= scan to find descendants with `+` in stat.
+   * Ported from orca's local-pty-provider hasChildProcesses / getForegroundProcess + posix-pty-process-groups pattern.
+   */
+  async getProcessInfo(sessionId: string): Promise<{
+    foregroundProcess: string | null;
+    hasChildProcesses: boolean;
+    isBusy: boolean;
+    isTuiMode: boolean;
+  }> {
+    const proc = this.ptySessions.get(sessionId);
+    if (!proc) {
+      return { foregroundProcess: null, hasChildProcesses: false, isBusy: false, isTuiMode: false };
+    }
+    const shellName = this.sessionShellNames.get(sessionId) ?? '';
+    // node-pty exposes .process = current foreground process name (OS syscall, accurate)
+    const fgProcess = proc.process ?? null;
+    const isTuiMode = this.tuiModeMap.get(sessionId) ?? false;
+    let hasChildProcesses = !!(fgProcess && shellName && fgProcess !== shellName);
+    let resolvedFg = fgProcess;
+
+    // Deep scan via ps for POSIX — mirrors orca's posix foreground detection
+    if (process.platform !== 'win32' && proc.pid) {
+      try {
+        const psResult = await this.scanPsForPid(proc.pid);
+        if (psResult.foregroundProcess) resolvedFg = psResult.foregroundProcess;
+        hasChildProcesses = psResult.hasChildProcesses;
+      } catch {
+        // ps failed — fall back to proc.process result
+      }
+    }
+
+    return {
+      foregroundProcess: resolvedFg,
+      hasChildProcesses,
+      isBusy: hasChildProcesses || isTuiMode,
+      isTuiMode,
+    };
+  }
+
+  /**
+   * 750ms periodic scan using node-pty's proc.process (same cadence as orca).
+   * Overrides a spurious idle state when a child process is still in the foreground.
+   * Does NOT clear busy state — that remains the quiet timer's and OSC133's job.
+   */
+  private startForegroundScan(sessionId: string, proc: IPtyProcess, sender?: Electron.WebContents): void {
+    const interval = setInterval(() => {
+      if (!this.ptySessions.has(sessionId)) {
+        clearInterval(interval);
+        this.foregroundScanIntervals.delete(sessionId);
+        return;
+      }
+      const shellName = this.sessionShellNames.get(sessionId) ?? '';
+      const fgProcess = proc.process ?? null;
+      const hasChild = !!(fgProcess && shellName && fgProcess !== shellName);
+      const isTui = this.tuiModeMap.get(sessionId) ?? false;
+      const current = this.sessionStatus.get(sessionId);
+
+      if (hasChild && !isTui && current?.isBusy === false) {
+        // Non-TUI child process detected but status says idle — correct it.
+        // TUI apps (vim, htop) can legitimately be open and idle (waiting for input).
+        this.updateStatus(sessionId, true, undefined, sender, { foregroundProcess: fgProcess ?? undefined, isTuiMode: isTui });
+      } else if (current?.foregroundProcess !== fgProcess) {
+        // Foreground process changed — update name without changing busy flag
+        this.updateStatus(sessionId, current?.isBusy ?? false, undefined, sender, { foregroundProcess: fgProcess ?? undefined, isTuiMode: isTui });
+      }
+    }, 750);
+    this.foregroundScanIntervals.set(sessionId, interval);
+  }
+
+  /**
+   * Run `ps -axo pid=,ppid=,stat=,comm=` and return the foreground descendant of shellPid.
+   * Uses the `+` flag in the stat column to identify which process holds the terminal foreground.
+   * Mirrors orca's resolveAgentForegroundProcessFromPs + posix-pty-process-groups logic.
+   */
+  private async scanPsForPid(shellPid: number): Promise<{
+    foregroundProcess: string | null;
+    hasChildProcesses: boolean;
+  }> {
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(execFile);
+    const result = await execAsync('ps', ['-axo', 'pid=,ppid=,stat=,comm='], {
+      timeout: 3000,
+      maxBuffer: 1024 * 1024,
+    });
+    const stdout = typeof result.stdout === 'string' ? result.stdout : (result.stdout as unknown as Buffer).toString('utf-8');
+    const rows = this.parsePsRows(stdout);
+    const descendants = this.getPsDescendants(rows, shellPid);
+    if (descendants.length === 0) {
+      return { foregroundProcess: null, hasChildProcesses: false };
+    }
+    // Prefer processes holding terminal foreground (`+` in stat) — orca: candidateScore pattern
+    const fgRows = descendants.filter(d => d.stat.includes('+'));
+    const top = fgRows[0] ?? descendants[0];
+    return {
+      foregroundProcess: top?.comm ?? null,
+      hasChildProcesses: true,
+    };
+  }
+
+  private parsePsRows(output: string): Array<{ pid: number; ppid: number; stat: string; comm: string }> {
+    const rows: Array<{ pid: number; ppid: number; stat: string; comm: string }> = [];
+    for (const line of output.split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/);
+      if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), stat: m[3], comm: m[4].trim() });
+    }
+    return rows;
+  }
+
+  private getPsDescendants(
+    rows: Array<{ pid: number; ppid: number; stat: string; comm: string }>,
+    rootPid: number
+  ): Array<{ pid: number; ppid: number; stat: string; comm: string; depth: number }> {
+    const byParent = new Map<number, Array<{ pid: number; ppid: number; stat: string; comm: string }>>();
+    for (const r of rows) {
+      const arr = byParent.get(r.ppid) ?? [];
+      arr.push(r);
+      byParent.set(r.ppid, arr);
+    }
+    const result: Array<{ pid: number; ppid: number; stat: string; comm: string; depth: number }> = [];
+    const stack = (byParent.get(rootPid) ?? []).map(r => ({ ...r, depth: 1 }));
+    while (stack.length > 0) {
+      const item = stack.pop()!;
+      result.push(item);
+      for (const child of byParent.get(item.pid) ?? []) {
+        stack.push({ ...child, depth: item.depth + 1 });
+      }
+    }
+    return result;
+  }
+}

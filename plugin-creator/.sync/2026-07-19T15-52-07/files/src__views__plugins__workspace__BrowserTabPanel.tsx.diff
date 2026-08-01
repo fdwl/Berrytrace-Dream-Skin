@@ -1,0 +1,571 @@
+diff --git a/src/views/plugins/workspace/BrowserTabPanel.tsx b/src/views/plugins/workspace/BrowserTabPanel.tsx
+index 57f1a3e..258b034 100644
+--- a/src/views/plugins/workspace/BrowserTabPanel.tsx
++++ b/src/views/plugins/workspace/BrowserTabPanel.tsx
+@@ -1,213 +1,48 @@
+-import { useEffect, useRef, useState } from 'react';
++/**
++ * BrowserTabPanel — WebContentsView 架构下的浏览器 Tab 面板
++ *
++ * 迁移自 <webview> 标签方案。
++ * 本组件只负责：
++ *   1. 渲染工具栏（地址栏、导航按钮）
++ *   2. 渲染占位 div，通过 ResizeObserver 同步区域坐标给主进程
++ *   3. 工具栏操作通过 IPC 通知主进程 BrowserViewManager 执行
++ *   4. 监听主进程 browser-view:event 更新工具栏状态（URL/Title/Loading）
++ *
++ * 外部网页内容由主进程 BrowserViewManager 管理的 WebContentsView 渲染，
++ * 与本渲染进程完全隔离，崩溃不传播到主窗口。
++ */
++
++import { useEffect, useRef, useState, useCallback } from 'react';
+ import { useWorkspaceStore } from '../../../stores/workspace';
+ import { useAppStore } from '../../../stores/app';
+ import { useDashboardStore } from '../../../stores/dashboard';
+ 
+-declare global {
+-  namespace JSX {
+-    interface IntrinsicElements {
+-      webview: React.DetailedHTMLProps<
+-        React.HTMLAttributes<HTMLElement> & {
+-          src?: string;
+-          style?: React.CSSProperties;
+-          preload?: string;
+-          nodeintegration?: string;
+-          webpreferences?: string;
+-          allowpopups?: string;
+-          useragent?: string;
+-        },
+-        HTMLElement
+-      >;
+-    }
+-  }
+-}
+-
+ interface BrowserTabPanelProps {
+   tabId: string;
+   visible: boolean;
+   customParams?: Record<string, any>;
+ }
+ 
+-// Registry of all active webviews: tabId -> webview element ref
+-const webviewRegistry = new Map<string, any>();
++// IPC channel 常量（与 browser-view-manager.ts BVC 保持一致）
++const BVC_NAVIGATE = 'browser-view:navigate';
++const BVC_EVENT    = 'browser-view:event';
++const BVC_SYNC     = 'browser-view:request-sync-bounds';
++const BVC_SET_BOUNDS = 'browser-view:set-bounds';
+ 
+-// Listen to browser actions globally in the renderer process
++// 模块级监听器：workspace-browser:prepare（工作区预热）
++// 当主进程发起 browser_action 时，AppLayout 处理 workspace-browser:prepare，
++// 本模块只需在 Tab 创建后把实际 tabId 传回给主进程。
+ if (typeof window !== 'undefined' && window.electronAPI?.ipc?.on) {
+   window.electronAPI.ipc.on('workspace-browser:action', async (data: any) => {
+-    const { actionId, action, params } = data;
+-    try {
+-      const store = useWorkspaceStore.getState();
+-      let targetTabId = store.activeTabId;
+-
+-      // Check if current active tab is registered as a browser webview
+-      let isBrowserActive = false;
+-      if (targetTabId) {
+-        const activeWebview = webviewRegistry.get(targetTabId);
+-        if (activeWebview) {
+-          isBrowserActive = true;
+-        }
+-      }
+-
+-      // If no browser tab is currently active, find the first available browser tab
+-      if (!isBrowserActive) {
+-        const firstTabId = Array.from(webviewRegistry.keys())[0];
+-        if (firstTabId) {
+-          store.setActiveTabId(firstTabId);
+-          targetTabId = firstTabId;
+-        } else {
+-          // No browser tab open at all, open a new one
+-          const newTabId = `browser_${Date.now()}`;
+-          store.openWorkspaceTab(
+-            undefined,
+-            'system.browser',
+-            undefined,
+-            undefined,
+-            newTabId,
+-            false,
+-            '浏览器',
+-            undefined,
+-            { initialUrl: action === 'open' ? params.url : 'https://www.google.com' }
+-          );
+-
+-          // Wait for mount and registration (max 2 seconds)
+-          let mounted = false;
+-          for (let i = 0; i < 20; i++) {
+-            await new Promise((r) => setTimeout(r, 100));
+-            if (webviewRegistry.has(newTabId)) {
+-              targetTabId = newTabId;
+-              mounted = true;
+-              break;
+-            }
+-          }
+-          if (!mounted) {
+-            throw new Error('Failed to open and mount workspace browser tab');
+-          }
+-        }
+-      }
+-
+-      const webview = webviewRegistry.get(targetTabId!);
+-      if (!webview) {
+-        throw new Error('Webview element not found for tab: ' + targetTabId);
+-      }
+-
+-      let result: any = null;
+-      if (action === 'open') {
+-        const { url } = params;
+-        webview.loadURL(url);
+-        result = { url: webview.getURL() };
+-      } else if (action === 'click') {
+-        const { x, y, selector } = params;
+-        await webview.executeJavaScript(`
+-          (() => {
+-            let el = null;
+-            if (${JSON.stringify(selector)}) {
+-              el = document.querySelector(${JSON.stringify(selector)});
+-            } else if (typeof ${x} === 'number' && typeof ${y} === 'number') {
+-              el = document.elementFromPoint(${x}, ${y});
+-            }
+-            if (el) {
+-              const rect = el.getBoundingClientRect();
+-              const cx = rect.left + rect.width / 2;
+-              const cy = rect.top + rect.height / 2;
+-              const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+-              el.dispatchEvent(new MouseEvent('mousedown', opts));
+-              el.dispatchEvent(new MouseEvent('mouseup', opts));
+-              el.click();
+-              if (document.activeElement instanceof HTMLElement) {
+-                document.activeElement.blur();
+-              }
+-              if (el instanceof HTMLElement) {
+-                el.focus();
+-              }
+-              return true;
+-            }
+-            return false;
+-          })()
+-        `);
+-        result = { success: true };
+-      } else if (action === 'type') {
+-        const { text, selector } = params;
+-        await webview.executeJavaScript(`
+-          (() => {
+-            let el = null;
+-            if (${JSON.stringify(selector)}) {
+-              el = document.querySelector(${JSON.stringify(selector)});
+-            } else {
+-              el = document.activeElement;
+-            }
+-            if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
+-              if (el instanceof HTMLElement) {
+-                el.focus();
+-              }
+-              if (el.isContentEditable) {
+-                el.textContent = ${JSON.stringify(text)};
+-              } else {
+-                el.value = ${JSON.stringify(text)};
+-              }
+-              el.dispatchEvent(new Event('input', { bubbles: true }));
+-              el.dispatchEvent(new Event('change', { bubbles: true }));
+-              return true;
+-            }
+-            return false;
+-          })()
+-        `);
+-        result = { success: true };
+-      } else if (action === 'scroll') {
+-        const { direction, px } = params;
+-        const scrollAmount = direction === 'up' ? -(px || 500) : (px || 500);
+-        await webview.executeJavaScript(`window.scrollBy({ top: ${scrollAmount}, behavior: 'auto' })`);
+-        result = { success: true };
+-      } else if (action === 'eval') {
+-        result = await webview.executeJavaScript(params.code);
+-      } else if (action === 'state') {
+-        const text = await webview.executeJavaScript(`document.body?.innerText || ''`);
+-        const title = await webview.executeJavaScript(`document.title || ''`);
+-        const url = webview.getURL();
+-        result = { text, title, url };
+-      } else if (action === 'screenshot') {
+-        const nativeImg = await webview.capturePage();
+-        const base64 = nativeImg.toPNG().toString('base64');
+-        result = { base64 };
+-      } else if (action === 'back') {
+-        if (webview.canGoBack()) {
+-          webview.goBack();
+-          result = { success: true, url: webview.getURL() };
+-        } else {
+-          result = { success: false, reason: 'Cannot go back' };
+-        }
+-      } else if (action === 'wait') {
+-        const { selector, ms } = params;
+-        if (selector) {
+-          const startTime = Date.now();
+-          let found = false;
+-          while (Date.now() - startTime < 10000) {
+-            const exists = await webview.executeJavaScript(`!!document.querySelector(${JSON.stringify(selector)})`);
+-            if (exists) {
+-              found = true;
+-              break;
+-            }
+-            await new Promise(r => setTimeout(r, 200));
+-          }
+-          result = { success: found };
+-        } else if (typeof ms === 'number') {
+-          await new Promise(r => setTimeout(r, ms));
+-          result = { success: true };
+-        }
+-      } else {
+-        throw new Error('Unknown browser action: ' + action);
+-      }
+-
+-      window.electronAPI.ipc.send(`workspace-browser:result:${actionId}`, { result });
+-    } catch (err: any) {
+-      window.electronAPI.ipc.send(`workspace-browser:result:${actionId}`, {
+-        error: err.message || String(err)
+-      });
+-    }
++    // 在 WebContentsView 架构下，浏览器操作直接在主进程执行，
++    // 渲染进程不再处理 workspace-browser:action 消息。
++    // 保留监听器占位以避免 IPC 未读警告。
++    console.log('[BrowserTabPanel] workspace-browser:action received (no-op in WebContentsView mode):', data?.action);
+   });
+ }
+ 
+ export default function BrowserTabPanel({ tabId, visible, customParams }: BrowserTabPanelProps) {
+-  const webviewRef = useRef<any>(null);
++  const placeholderRef = useRef<HTMLDivElement>(null);
+   const theme = useAppStore(state => state.theme);
+   const isOverlayActive = useWorkspaceStore(state => state.isOverlayActive);
+   const workspaceVisible = useDashboardStore(state => state.workspaceVisible);
+@@ -219,120 +54,152 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+   const [canGoBack, setCanGoBack] = useState(false);
+   const [canGoForward, setCanGoForward] = useState(false);
+ 
++  // 内容区是否真正可见（工具栏所属逻辑）
++  const contentVisible = visible && workspaceVisible && !isOverlayActive;
+ 
+-
+-  // Chromium prefers-color-scheme emulation
+-  const webPreferences = `prefersColorScheme=${theme === 'dark' ? 'dark' : 'light'}`;
+-
+-  // 1. Initial mounting and event listener wiring
++  // ── 1. 通知主进程创建 WebContentsView（组件 mount 时）────────────────────────
+   useEffect(() => {
+-    const webview = webviewRef.current;
+-    if (!webview) {
+-      console.log(`[BrowserTabPanel:${tabId}] Webview ref is null on useEffect`);
+-      return;
++    if (window.electronAPI?.ipc) {
++      window.electronAPI.ipc.send('browser-view:create', { tabId, url: initialUrl });
++      console.log(`[BrowserTabPanel:${tabId}] Sent browser-view:create url=${initialUrl}`);
+     }
+-    webviewRegistry.set(tabId, webview);
+-    console.log(`[BrowserTabPanel:${tabId}] Webview ref attached. initialUrl=${initialUrl}`);
+-
+-    const handleStartLoading = () => setIsLoading(true);
+-    const handleStopLoading = () => {
+-      setIsLoading(false);
+-      try {
+-        setCanGoBack(webview.canGoBack());
+-        setCanGoForward(webview.canGoForward());
+-      } catch (err) {
+-        console.warn('[BrowserTabPanel] Failed to update nav state:', err);
++    return () => {
++      // Tab 关闭时通知主进程销毁 WebContentsView
++      if (window.electronAPI?.ipc) {
++        window.electronAPI.ipc.send('browser-view:destroy', { tabId });
++        console.log(`[BrowserTabPanel:${tabId}] Sent browser-view:destroy`);
+       }
+     };
++  }, [tabId]);
+ 
+-    const handleNavigate = (e: any) => {
+-      setAddress(e.url);
+-      setInputAddress(e.url);
+-      useWorkspaceStore.getState().updateTabConfig(tabId, {
+-        customParams: { initialUrl: e.url }
++  // ── 2. ResizeObserver 同步占位区域坐标给主进程（Throttle 16ms）────────────────
++  useEffect(() => {
++    const placeholder = placeholderRef.current;
++    if (!placeholder) return;
++
++    let rafId: number | null = null;
++    const syncBounds = () => {
++      const rect = placeholder.getBoundingClientRect();
++      window.electronAPI?.ipc?.send(BVC_SET_BOUNDS, {
++        tabId,
++        x:       Math.round(rect.x),
++        y:       Math.round(rect.y),
++        width:   Math.round(rect.width),
++        height:  Math.round(rect.height),
++        visible: contentVisible && rect.width > 10 && rect.height > 10,
+       });
+     };
+ 
+-    // Update Tab Title when webpage changes it
+-    const handleTitleUpdated = (e: any) => {
+-      const title = e.title;
+-      if (title && title.trim()) {
+-        useWorkspaceStore.getState().updateTabName(tabId, title);
+-      }
++    const throttledSync = () => {
++      if (rafId !== null) return;
++      rafId = requestAnimationFrame(() => {
++        rafId = null;
++        syncBounds();
++      });
+     };
+ 
+-    webview.addEventListener('did-start-loading', handleStartLoading);
+-    webview.addEventListener('did-stop-loading', handleStopLoading);
+-    webview.addEventListener('did-navigate', handleNavigate);
+-    webview.addEventListener('did-navigate-in-page', handleNavigate);
+-    webview.addEventListener('page-title-updated', handleTitleUpdated);
+-
+-    return () => {
+-      webviewRegistry.delete(tabId);
+-      webview.removeEventListener('did-start-loading', handleStartLoading);
+-      webview.removeEventListener('did-stop-loading', handleStopLoading);
+-      webview.removeEventListener('did-navigate', handleNavigate);
+-      webview.removeEventListener('did-navigate-in-page', handleNavigate);
+-      webview.removeEventListener('page-title-updated', handleTitleUpdated);
+-    };
+-  }, [tabId]);
++    const observer = new ResizeObserver(throttledSync);
++    observer.observe(placeholder);
+ 
++    // 立即同步一次
++    syncBounds();
+ 
++    // 监听主进程主动请求同步（窗口 resize/move 兜底）
++    const unsubSync = window.electronAPI?.ipc?.on(BVC_SYNC, (payload: { tabId: string }) => {
++      if (payload.tabId === tabId) syncBounds();
++    });
+ 
++    return () => {
++      observer.disconnect();
++      if (rafId !== null) cancelAnimationFrame(rafId);
++      unsubSync?.();
++    };
++  }, [tabId, contentVisible]);
+ 
++  // ── 3. Tab 可见性变化时通知主进程显示/隐藏 ────────────────────────────────────
++  useEffect(() => {
++    if (!placeholderRef.current) return;
++    const rect = placeholderRef.current.getBoundingClientRect();
++    window.electronAPI?.ipc?.send(BVC_SET_BOUNDS, {
++      tabId,
++      x:       Math.round(rect.x),
++      y:       Math.round(rect.y),
++      width:   Math.round(rect.width),
++      height:  Math.round(rect.height),
++      visible: contentVisible && rect.width > 10 && rect.height > 10,
++    });
++  }, [tabId, contentVisible]);
++
++  // ── 4. 监听主进程事件推送（URL/Title/Loading/快捷键）────────────────────────────
++  useEffect(() => {
++    const unsubEvent = window.electronAPI?.ipc?.on(BVC_EVENT, (event: { tabId: string; type: string; data: any }) => {
++      if (event.tabId !== tabId) return;
++
++      switch (event.type) {
++        case 'url':
++          setAddress(event.data);
++          setInputAddress(event.data);
++          // 同步 Tab 配置（供 session re-hydration 使用）
++          useWorkspaceStore.getState().updateTabConfig(tabId, { customParams: { initialUrl: event.data } });
++          break;
++        case 'title':
++          if (event.data?.trim()) {
++            useWorkspaceStore.getState().updateTabName(tabId, event.data);
++          }
++          break;
++        case 'loading':
++          setIsLoading(event.data);
++          break;
++        case 'nav-state':
++          setCanGoBack(event.data.canGoBack);
++          setCanGoForward(event.data.canGoForward);
++          break;
++        case 'crashed':
++          setIsLoading(false);
++          console.warn(`[BrowserTabPanel:${tabId}] WebContentsView crashed:`, event.data);
++          break;
++        case 'shortcut':
++          if (event.data === 'close-tab') {
++            useWorkspaceStore.getState().closeTab(tabId);
++          } else if (event.data === 'focus-address') {
++            document.querySelector<HTMLInputElement>(`#browser-address-${tabId}`)?.focus();
++          }
++          break;
++        case 'new-window':
++          // 在新 Tab 中打开
++          useWorkspaceStore.getState().openWorkspaceTab(
++            undefined, 'system.browser', undefined, undefined, undefined, false, '浏览器',
++            undefined, { initialUrl: event.data }
++          );
++          break;
++      }
++    });
+ 
+-  const handleGoBack = () => {
+-    const webview = webviewRef.current;
+-    if (webview && webview.canGoBack()) {
+-      webview.goBack();
+-    }
+-  };
++    return () => { unsubEvent?.(); };
++  }, [tabId]);
+ 
+-  const handleGoForward = () => {
+-    const webview = webviewRef.current;
+-    if (webview && webview.canGoForward()) {
+-      webview.goForward();
+-    }
+-  };
++  // ── 工具栏操作 → IPC → 主进程 BrowserViewManager ───────────────────────────────
+ 
+-  const handleReload = () => {
+-    const webview = webviewRef.current;
+-    if (webview) {
+-      webview.reload();
+-    }
+-  };
++  const sendNav = useCallback((action: string, data?: string) => {
++    window.electronAPI?.ipc?.send(BVC_NAVIGATE, { tabId, action, data });
++  }, [tabId]);
+ 
+-  const handleGoHome = () => {
+-    const webview = webviewRef.current;
+-    if (webview) {
+-      webview.loadURL('https://www.google.com').catch((err: any) => {
+-        if (err.code !== 'ERR_ABORTED') {
+-          console.warn('[BrowserTabPanel] Home navigation failed:', err);
+-        }
+-      });
+-    }
+-  };
++  const handleGoBack    = () => sendNav('back');
++  const handleGoForward = () => sendNav('forward');
++  const handleReload    = () => isLoading ? sendNav('stop') : sendNav('reload');
++  const handleGoHome    = () => sendNav('load', 'https://www.google.com');
+ 
+   const handleNavigateSubmit = (e: React.FormEvent) => {
+     e.preventDefault();
+     let url = inputAddress.trim();
+     if (!url) return;
+-
+     const isUrl = /^(https?:\/\/)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(:\d+)?(\/\S*)?$/.test(url);
+     if (!isUrl) {
+       url = `https://www.google.com/search?q=${encodeURIComponent(url)}`;
+     } else if (!/^https?:\/\//i.test(url)) {
+       url = `https://${url}`;
+     }
+-
+-    const webview = webviewRef.current;
+-    if (webview) {
+-      webview.loadURL(url).catch((err: any) => {
+-        if (err.code !== 'ERR_ABORTED') {
+-          console.warn('[BrowserTabPanel] URL navigation failed:', err);
+-        }
+-      });
+-    }
++    sendNav('load', url);
+   };
+ 
+   const handleOpenExternal = () => {
+@@ -374,23 +241,15 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+         <button
+           onClick={handleReload}
+           className="p-1 rounded text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
+-          title="重新加载"
++          title={isLoading ? '停止' : '重新加载'}
+         >
+           {isLoading ? (
+-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="animate-spin">
+-              <line x1="12" y1="2" x2="12" y2="6" />
+-              <line x1="12" y1="18" x2="12" y2="22" />
+-              <line x1="4.93" y1="4.93" x2="7.76" y2="7.76" />
+-              <line x1="16.24" y1="16.24" x2="19.07" y2="19.07" />
+-              <line x1="2" y1="12" x2="6" y2="12" />
+-              <line x1="18" y1="12" x2="22" y2="12" />
+-              <line x1="4.93" y1="19.07" x2="7.76" y2="16.24" />
+-              <line x1="16.24" y1="7.76" x2="19.07" y2="4.93" />
++            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
++              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+             </svg>
+           ) : (
+-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+-              <path d="M23 4v6h-6" />
+-              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
++            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className={isLoading ? 'animate-spin' : ''}>
++              <path d="M23 4v6h-6" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+             </svg>
+           )}
+         </button>
+@@ -409,6 +268,7 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+         {/* Address Input Bar */}
+         <form onSubmit={handleNavigateSubmit} className="flex-1 flex items-center gap-1.5 px-3.5 py-1 rounded-lg bg-[var(--bg-input,rgba(0,0,0,0.1))] border border-[var(--border-light)] focus-within:border-[var(--color-brand)] focus-within:ring-1 focus-within:ring-[var(--color-brand)] transition-all h-6">
+           <input
++            id={`browser-address-${tabId}`}
+             type="text"
+             value={inputAddress}
+             onChange={(e) => setInputAddress(e.target.value)}
+@@ -425,38 +285,27 @@ export default function BrowserTabPanel({ tabId, visible, customParams }: Browse
+         >
+           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+             <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+-            <polyline points="15 3 21 3 21 9" />
+-            <line x1="10" y1="14" x2="21" y2="3" />
++            <polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+           </svg>
+         </button>
+       </div>
+ 
+-      {/* Webview Container */}
++      {/* WebContentsView 占位区域 — 主进程 WebContentsView 叠加在此处 */}
+       <div
++        ref={placeholderRef}
+         className="flex-1 relative"
+         style={{
+-          visibility: (isOverlayActive || !workspaceVisible) ? 'hidden' : 'visible',
+-          pointerEvents: (isOverlayActive || !workspaceVisible) ? 'none' : 'auto'
++          // 工作区面板隐藏或 overlay 激活时，通知主进程隐藏 WebContentsView
++          visibility: contentVisible ? 'visible' : 'hidden',
++          background: 'transparent',
+         }}
+       >
+-        <webview
+-          ref={webviewRef}
+-          src={initialUrl}
+-          className="w-full h-full border-none"
+-          allowpopups={true}
+-          preload={(() => {
+-            const rawPath = (window.electronAPI as any)?.webviewPreloadPath;
+-            if (!rawPath) return undefined;
+-            if (rawPath.startsWith('file://')) return rawPath;
+-            const formatted = rawPath.replace(/\\/g, '/');
+-            return `file://${formatted.startsWith('/') ? '' : '/'}${formatted}`;
+-          })()}
+-          webpreferences={webPreferences}
+-          style={{
+-            visibility: (isOverlayActive || !workspaceVisible) ? 'hidden' : 'visible',
+-            pointerEvents: (isOverlayActive || !workspaceVisible) ? 'none' : 'auto'
+-          }}
+-        />
++        {/* 仅在加载中时显示占位提示（WebContentsView 遮挡时不可见，作为备用） */}
++        {isLoading && (
++          <div className="absolute inset-0 flex items-center justify-center text-[var(--text-tertiary)] text-xs pointer-events-none">
++            <span>加载中...</span>
++          </div>
++        )}
+       </div>
+     </div>
+   );

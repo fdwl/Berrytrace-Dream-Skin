@@ -1,0 +1,14 @@
+diff --git a/electron/plugins/workflow-runner.ts b/electron/plugins/workflow-runner.ts
+index ff8d717..4bbbc31 100644
+--- a/electron/plugins/workflow-runner.ts
++++ b/electron/plugins/workflow-runner.ts
+@@ -1,7 +1,8 @@
+ import Store from 'electron-store';
+ import * as fs from 'fs';
+ import { join } from 'path';
+-import chokidar, { FSWatcher } from 'chokidar';
++import type { FSWatcher } from 'chokidar';
++import chokidar from 'chokidar';
+ 
+ export interface WorkflowRule {
+   id: string;

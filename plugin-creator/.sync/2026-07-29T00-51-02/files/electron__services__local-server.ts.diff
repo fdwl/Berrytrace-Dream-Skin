@@ -1,0 +1,84 @@
+diff --git a/electron/services/local-server.ts b/electron/services/local-server.ts
+index 77d61ac..25f78fe 100644
+--- a/electron/services/local-server.ts
++++ b/electron/services/local-server.ts
+@@ -1,5 +1,6 @@
+-import { createServer, IncomingMessage, ServerResponse, Server } from 'http'
+-import { app } from 'electron'
++import type { IncomingMessage, ServerResponse, Server } from 'http';
++import { createServer } from 'http'
++import { app, BrowserWindow } from 'electron'
+ import { ElectronMainWindow } from '../windows/main-window'
+ import { PluginManager } from '../plugins/plugin-manager'
+ import { ElectronBufferWindow } from '../windows/buffer-window'
+@@ -76,6 +77,22 @@ export class ElectronLocalServer {
+         return
+       }
+ 
++      // Route /mcp/* requests directly to McpGateway (handles token & SSE)
++      if (pathname.startsWith('/mcp')) {
++        const { McpGateway } = require('../plugins/mcp-gateway')
++        McpGateway.getInstance().handleHttpRequest(req, res, url).then((handled: boolean) => {
++          if (!handled) {
++            res.writeHead(404, { 'Content-Type': 'application/json' })
++            res.end(JSON.stringify({ error: 'MCP route not found' }))
++          }
++        }).catch((err: any) => {
++          console.error('[LocalServer] Error in McpGateway:', err)
++          res.writeHead(500, { 'Content-Type': 'application/json' })
++          res.end(JSON.stringify({ error: err.message }))
++        })
++        return
++      }
++
+       // Security check for all other routes
+       const authHeader = req.headers['authorization'] || req.headers['Authorization']
+       const expectedAuth = `Bearer ${this.token}`
+@@ -118,6 +135,36 @@ export class ElectronLocalServer {
+         return
+       }
+ 
++      if (pathname === '/reload-plugin') {
++        const pluginId = url.searchParams.get('id')
++        if (pluginId) {
++          console.log(`[LocalServer] Reloading plugin: ${pluginId}`)
++          const pm = PluginManager.getInstance()
++          pm.reloadPlugin(pluginId).then((reloaded) => {
++            if (reloaded) {
++              BrowserWindow.getAllWindows().forEach(win => {
++                if (!win.isDestroyed()) {
++                  win.webContents.send('plugin:hot-reloaded', { pluginId, timestamp: Date.now() })
++                }
++              })
++              res.writeHead(200, { 'Content-Type': 'application/json' })
++              res.end(JSON.stringify({ success: true }))
++            } else {
++              res.writeHead(500, { 'Content-Type': 'application/json' })
++              res.end(JSON.stringify({ error: 'Plugin reload returned false (busy or skipped)' }))
++            }
++          }).catch((err) => {
++            console.error('[LocalServer] Failed to reload plugin:', err)
++            res.writeHead(500, { 'Content-Type': 'application/json' })
++            res.end(JSON.stringify({ error: String(err) }))
++          })
++        } else {
++          res.writeHead(400, { 'Content-Type': 'application/json' })
++          res.end(JSON.stringify({ error: 'Missing plugin id' }))
++        }
++        return
++      }
++
+       if (pathname === '/install-plugin') {
+         const pluginUrl = url.searchParams.get('url')
+         if (pluginUrl) {
+@@ -335,7 +382,9 @@ export class ElectronLocalServer {
+       try {
+         const tokenFilePath = join(app.getPath('home'), '.berrytrace', 'local_server.json')
+         unlinkSync(tokenFilePath)
+-      } catch {}
++      } catch {
++        // ignore
++      }
+     }
+   }
+ }

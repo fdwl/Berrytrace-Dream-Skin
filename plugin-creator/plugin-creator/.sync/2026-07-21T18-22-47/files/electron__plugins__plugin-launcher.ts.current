@@ -1,0 +1,815 @@
+import { app, ipcMain, utilityProcess, BrowserWindow, MessageChannelMain } from 'electron';
+import { join, dirname, delimiter } from 'path';
+import { promises as fs } from 'fs';
+import { pathToFileURL } from 'url';
+import { fork } from 'child_process';
+import { createRequire } from 'module';
+import { PluginManifest } from './plugin-verifier';
+import { dispatchPluginApiCall } from './api-dispatcher';
+import { McpHost } from './mcp-host';
+import { HookRegistry } from './hook-registry';
+import { EventSubscriptionRegistry } from './event-subscription-registry';
+import { addLog } from '../services/logger';
+import { PluginWatchdog } from './plugin-watchdog';
+import { IPluginProcess, UtilityProcessAdapter, ChildProcessAdapter, PooledProcessAdapter } from './plugin-process-adapter';
+import { PluginPool } from './plugin-pool';
+import { PluginIsolationPolicy } from './plugin-isolation-policy';
+
+/**
+ * 解析宿主 app 的 node_modules 目录路径。
+ *
+ * - 开发环境：项目根目录下的 node_modules
+ * - 打包环境：app.getAppPath() 指向 app.asar，node_modules 在同级目录或 asar.unpacked 中
+ *
+ * 将此路径注入到插件子进程的 NODE_PATH，使插件能够解析
+ * berrytrace-plugin-sdk 等宿主依赖，即使插件安装在 ~/.berrytrace/plugins/。
+ */
+function resolveHostNodeModulesPath(): string {
+  return join(app.getAppPath(), 'node_modules');
+}
+
+export class PluginLauncher {
+  private static instance: PluginLauncher;
+  /** 插件进程注册表（适配器模式：屏蔽 utilityProcess / child_process.fork 差异） */
+  private backgroundProcesses = new Map<string, IPluginProcess>();
+  /**
+   * 原始进程句柄（utilityProcess 或 child_process.ChildProcess），仅用于 stdout/stderr/exit/error
+   * 等非通信事件监听。通信统一走 backgroundProcesses 中的 IPluginProcess。
+   * 两种进程类型的 stdio/event API 结构一致，用 any 避免联合类型方法签名摩擦。
+   */
+  private rawUtilityProcesses = new Map<string, any>();
+  private activeAgentSessions = new Set<string>();
+  private mainPlugins = new Map<string, any>();
+  private busyPlugins = new Set<string>();
+  private sessionToPluginMap = new Map<string, string>();
+  private stderrBuffers = new Map<string, string[]>();
+
+  private registeredForwarders = new Set<string>();
+
+  private constructor() {
+    this.initIpcListeners();
+    PluginWatchdog.getInstance().setGetLastErrorLogsFn((id) => this.getLastErrorLogs(id));
+  }
+
+  private initIpcListeners() {
+    ipcMain.on('renderer-ready', (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!win) return;
+      this.establishDirectPortsForWindow(win);
+    });
+  }
+
+  private establishDirectPortsForWindow(win: BrowserWindow) {
+    console.log(`[PluginLauncher] Establishing direct MessagePorts for window`);
+    for (const [pluginId, proc] of this.backgroundProcesses.entries()) {
+      const channel = new MessageChannelMain();
+      const port1 = channel.port1;
+      const port2 = channel.port2;
+
+      // Transfer Port1 to the Renderer
+      win.webContents.postMessage('plugin:connect-port', { type: 'plugin:connect-port', pluginId }, [port1]);
+      
+      // Transfer Port2 to the Plugin Process
+      proc.sendMessage({ type: 'plugin:connect-port', pluginId }, [port2]);
+      console.log(`[PluginLauncher] Sent direct MessagePorts for "${pluginId}"`);
+    }
+  }
+
+  private establishDirectPortForPlugin(pluginId: string, proc: IPluginProcess) {
+    import('../windows/main-window').then(({ ElectronMainWindow }) => {
+      const win = ElectronMainWindow.getInstance().getWindow();
+      if (!win || win.isDestroyed()) {
+        console.warn(`[PluginLauncher] Cannot establish direct port for "${pluginId}": main window not available`);
+        return;
+      }
+      const channel = new MessageChannelMain();
+      const port1 = channel.port1;
+      const port2 = channel.port2;
+
+      win.webContents.postMessage('plugin:connect-port', { type: 'plugin:connect-port', pluginId }, [port1]);
+      proc.sendMessage({ type: 'plugin:connect-port', pluginId }, [port2]);
+      console.log(`[PluginLauncher] Established direct port for newly started plugin "${pluginId}"`);
+    }).catch(err => {
+      console.error(`[PluginLauncher] Failed to import ElectronMainWindow:`, err);
+    });
+  }
+
+
+  public registerInteractionForwarders(eventNames: string[]): void {
+    for (const eventName of eventNames) {
+      if (this.registeredForwarders.has(eventName)) continue;
+      this.registeredForwarders.add(eventName);
+
+      ipcMain.on(eventName, async (_event, payload: unknown) => {
+        console.log(`[PluginLauncher] Received interaction event "${eventName}" from renderer. Forwarding to background processes...`);
+        const { PluginManager } = await import('./plugin-manager.js');
+        const subscribers = EventSubscriptionRegistry.getInstance().getSubscribers(eventName);
+        for (const pluginId of subscribers) {
+          const proc = this.backgroundProcesses.get(pluginId);
+          if (proc) {
+            proc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+            PluginManager.getInstance().recordPluginActivity(pluginId);
+          } else {
+            // 仅在插件启用时才唤醒
+            if (!PluginManager.getInstance().isPluginEnabled(pluginId)) {
+              continue;
+            }
+            console.log(`[PluginLauncher] Waking up background plugin "${pluginId}" due to interaction event "${eventName}"`);
+            const ctx = {
+              action: 'normal' as const,
+              loadMode: 'normal' as const,
+              updatedAt: new Date().toISOString(),
+              trigger: {
+                eventName,
+                payload
+              }
+            };
+            PluginManager.getInstance().ensurePluginLoaded(pluginId, ctx).then(() => {
+              const startedProc = this.backgroundProcesses.get(pluginId);
+              if (startedProc) {
+                console.log(`[PluginLauncher] Replaying trigger event "${eventName}" to newly started background plugin "${pluginId}"`);
+                startedProc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+              }
+            }).catch(err => {
+              console.error(`[PluginLauncher] Failed to wake up plugin "${pluginId}" for event "${eventName}":`, err);
+            });
+          }
+        }
+      });
+    }
+  }
+
+  public static getInstance(): PluginLauncher {
+    if (!PluginLauncher.instance) {
+      PluginLauncher.instance = new PluginLauncher();
+    }
+    return PluginLauncher.instance;
+  }
+
+  public getLastErrorLogs(pluginId: string): string {
+    const buf = this.stderrBuffers.get(pluginId) || [];
+    return buf.join('\n');
+  }
+
+  public isPluginBusy(pluginId: string): boolean {
+    if (this.busyPlugins.has(pluginId)) return true;
+    for (const [sessId, pId] of this.sessionToPluginMap.entries()) {
+      if (pId === pluginId) return true;
+    }
+    return false;
+  }
+
+  public getBackgroundProcesses() {
+    return this.backgroundProcesses;
+  }
+
+  public getActiveAgentSessions() {
+    return this.activeAgentSessions;
+  }
+
+  public isBackgroundPluginRunning(pluginId: string): boolean {
+    return this.backgroundProcesses.has(pluginId);
+  }
+
+  public hasActiveAgentSessions(): boolean {
+    return this.activeAgentSessions.size > 0;
+  }
+
+
+
+  public emitToBackgroundPlugin(pluginId: string, eventName: string, payload: unknown): void {
+    const proc = this.backgroundProcesses.get(pluginId);
+    if (proc) {
+      proc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+    }
+  }
+
+  /**
+   * 看门狗使用：强制 kill 单个插件进程（不自动重启，由看门狗决定重启策略）。
+   *
+   * 池化插件特殊处理：PooledProcessAdapter.kill() 只是软卸载（发 pool:unload），
+   * 无法终止卡死的 Host 进程。因此池化插件的心跳/CPU 超时 kill 需直接杀整个 Host。
+   * Host exit 后由 PluginPool 统一清理所有池内插件并触发看门狗恢复。
+   */
+  public killBackgroundPlugin(pluginId: string): void {
+    const proc = this.backgroundProcesses.get(pluginId);
+    if (!proc) return;
+    console.log(`[PluginLauncher:killBackgroundPlugin] Force-killing "${pluginId}"`);
+
+    if (proc instanceof PooledProcessAdapter) {
+      // 池化插件：kill 单个 adapter 无意义（Host 共享），直接杀整个 Host 进程。
+      // Host exit 后由 PluginPool.exit handler 统一清理所有池内插件并触发 handleCrash。
+      PluginPool.getInstance().killHost();
+      return; // exit handler 负责后续清理，此处不重复操作
+    }
+
+    proc.kill();
+    this.backgroundProcesses.delete(pluginId);
+    this.rawUtilityProcesses.delete(pluginId);
+    HookRegistry.getInstance().unregisterBackgroundProcess(pluginId);
+    ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+  }
+
+  /**
+   * 根据插件声明的 processIsolation 等级选择底层进程类型。
+   *
+   * - required：child_process.fork（纯 Node.js，无 Electron 运行时开销，节省 ~50MB/个）
+   * - recommended：utilityProcess（Electron 原生，可降级到 C 池）
+   * - optional：C 池共享进程（由 PluginPool 管理）
+   *
+   * 两种独立进程类型都通过 IPluginProcess 适配器暴露给上层，调用方无感知。
+   *
+   * @see docs/plugin-process-isolation-analysis.md 6.3.1
+   */
+  private createPluginProcess(
+    pluginId: string,
+    mainJsPath: string,
+    manifest: PluginManifest,
+    context?: any,
+  ): { proc: IPluginProcess; raw: any } {
+    const isolation = manifest.processIsolation ?? 'optional';
+    const lifecycleContext = JSON.stringify(
+      context || { action: 'normal', loadMode: 'normal', updatedAt: new Date().toISOString() }
+    );
+
+    // 区分开发和生产环境，设置严格隔离的 NODE_PATH 寻址
+    const { PluginManager } = require('./plugin-manager.js');
+    const scanned = PluginManager.getInstance().getPlugin(pluginId);
+    const isDev = scanned?.isDevFolder === true;
+
+    const hostNodeModules = resolveHostNodeModulesPath();
+    let nodePath = '';
+
+    if (isDev && scanned) {
+      // 开发隔离沙箱：提供开发插件本身的 node_modules，以及宿主 node_modules 以仿真生产并载入 SDK
+      const devPluginNodeModules = join(scanned.path, 'node_modules');
+      nodePath = `${devPluginNodeModules}${delimiter}${hostNodeModules}`;
+      console.log(`[PluginLauncher] [Sandbox] NODE_PATH for dev plugin "${pluginId}": ${nodePath}`);
+    } else {
+      // 生产包：前置携带的 node_modules，后置宿主 node_modules 供兜底
+      const prodPluginNodeModules = join(scanned ? scanned.path : dirname(mainJsPath), 'node_modules');
+      const existingNodePath = process.env.NODE_PATH || '';
+      nodePath = existingNodePath
+        ? `${prodPluginNodeModules}${delimiter}${hostNodeModules}${delimiter}${existingNodePath}`
+        : `${prodPluginNodeModules}${delimiter}${hostNodeModules}`;
+      console.log(`[PluginLauncher] [Prod] NODE_PATH for plugin "${pluginId}": ${nodePath}`);
+    }
+
+    const pluginEnv = {
+      ...process.env,
+      NODE_PATH: nodePath,
+      BERRYTRACE_LIFECYCLE_CONTEXT: lifecycleContext,
+    };
+
+    if (isolation === 'required') {
+      const maxOldSpace = this.getMaxOldSpaceSize(pluginId, manifest);
+      console.log(`[PluginLauncher] Spawning utilityProcess for required plugin "${pluginId}" (max-old-space-size=${maxOldSpace}MB)`);
+      const child = utilityProcess.fork(mainJsPath, [], {
+        serviceName: `plugin-${pluginId}`,
+        stdio: 'pipe',
+        execArgv: [`--max-old-space-size=${maxOldSpace}`],
+        env: pluginEnv,
+      });
+      return { proc: new UtilityProcessAdapter(child), raw: child };
+    }
+
+    // recommended / optional 默认：utilityProcess
+    const maxOldSpace = this.getMaxOldSpaceSize(pluginId, manifest);
+    const rawProc = utilityProcess.fork(mainJsPath, [], {
+      serviceName: `plugin-${pluginId}`,
+      stdio: 'pipe',
+      // 通过 execArgv 直接向 V8 引擎传递堆上限参数（utilityProcess.fork 支持 ForkOptions.execArgv）。
+      // 不用 NODE_OPTIONS env —— utilityProcess 是 Chromium 子进程，不读取该环境变量。
+      execArgv: [`--max-old-space-size=${maxOldSpace}`],
+      env: pluginEnv,
+    });
+    return { proc: new UtilityProcessAdapter(rawProc), raw: rawProc };
+  }
+
+  /**
+   * 各插件的 V8 老生代堆内存上限。
+   * 通过 utilityProcess.fork 的 execArgv 传递给 V8 引擎。
+   * @see docs/plugin-process-isolation-analysis.md 6.3.2
+   */
+  private getMaxOldSpaceSize(pluginId: string, manifest?: PluginManifest): number {
+    if (manifest && typeof manifest.memoryLimit === 'number') {
+      return manifest.memoryLimit;
+    }
+    // AI 推理引擎需要较大上下文窗口
+    if (pluginId.includes('cline') || pluginId.includes('mastra')) return 1024;
+    // npm 安装/运行、ONNX 语音模型
+    if (pluginId.includes('npx') || pluginId.includes('voice')) return 512;
+    return 512; // 默认：给足空间，让 V8 自行管理
+  }
+
+  public async startBackgroundPlugin(pluginId: string, pluginPath: string, manifest: PluginManifest, context?: any): Promise<void> {
+    this.stderrBuffers.set(pluginId, []);
+    if (this.backgroundProcesses.has(pluginId)) {
+      console.log(`[PluginLauncher] Background plugin ${pluginId} is already running`);
+      return;
+    }
+
+    const mainJsPath = join(pluginPath, manifest.main || 'dist/index.js');
+    const mainJsExists = await fs.stat(mainJsPath).then(s => s.isFile()).catch(() => false);
+    if (!mainJsExists) {
+      console.error(`[PluginLauncher] Plugin entry NOT FOUND: ${mainJsPath}`);
+      return;
+    }
+
+    const isolation = manifest.processIsolation ?? 'optional';
+    console.log(`[PluginLauncher] STARTING "${pluginId}" → ${mainJsPath} [isolation=${isolation}]`);
+
+    // ── 策略决策：根据 processIsolation 声明决定独立进程还是共享池 ──────────
+    const { PluginManager } = require('./plugin-manager.js');
+    const scanned = PluginManager.getInstance().getPlugin(pluginId);
+    const isDev = scanned?.isDevFolder === true;
+
+    // 开发模式插件强制独立进程，避免池化污染
+    const decision = isDev ? 'standalone' : PluginIsolationPolicy.getInstance().decide(pluginId, isolation);
+
+    // ── 进程池路径（决策为 pooled 的插件共享 Host 进程）────────────────────
+    if (decision === 'pooled') {
+      return this.startPooledPlugin(pluginId, pluginPath, manifest, context);
+    }
+
+    // ── 独立进程路径（required / recommended）──────────────────────────────
+    const { proc, raw: rawProc } = this.createPluginProcess(pluginId, mainJsPath, manifest, context);
+    this.backgroundProcesses.set(pluginId, proc);
+    this.rawUtilityProcesses.set(pluginId, rawProc);
+
+    // 注册到 HookRegistry（用于跨插件钩子调用，传入适配器）
+    HookRegistry.getInstance().registerBackgroundProcess(pluginId, proc);
+    // 注册到 Watchdog（进程启动前先注册，避免立即误判心跳超时）
+    PluginWatchdog.getInstance().registerPlugin(pluginId);
+
+    rawProc.on('spawn', () => {
+      console.log(`[PluginLauncher] Process spawned for "${pluginId}", PID=${proc.pid}`);
+    });
+
+    let receivedOutput = false;
+
+    // Capture standard output and standard error from background plugin utilityProcess
+    let stdoutRemainder = '';
+    rawProc.stdout?.on('data', (chunk: Buffer) => {
+      receivedOutput = true;
+      const str = chunk.toString('utf-8');
+      process.stdout.write(str);
+
+      stdoutRemainder += str;
+      const lines = stdoutRemainder.split(/\r?\n/);
+      stdoutRemainder = lines.pop() || '';
+      for (const line of lines) {
+        addLog('info', `plugin:${pluginId}`, line);
+      }
+    });
+
+    rawProc.stdout?.on('end', () => {
+      if (stdoutRemainder.trim()) {
+        addLog('info', `plugin:${pluginId}`, stdoutRemainder);
+      }
+    });
+
+    let stderrRemainder = '';
+    rawProc.stderr?.on('data', (chunk: Buffer) => {
+      receivedOutput = true;
+      const str = chunk.toString('utf-8');
+      process.stderr.write(str);
+
+      stderrRemainder += str;
+      const lines = stderrRemainder.split(/\r?\n/);
+      stderrRemainder = lines.pop() || '';
+      for (const line of lines) {
+        addLog('info', `plugin:${pluginId}:stderr`, line);
+        let buf = this.stderrBuffers.get(pluginId);
+        if (!buf) {
+          buf = [];
+          this.stderrBuffers.set(pluginId, buf);
+        }
+        buf.push(line);
+        if (buf.length > 15) {
+          buf.shift();
+        }
+      }
+    });
+
+    rawProc.stderr?.on('end', () => {
+      if (stderrRemainder.trim()) {
+        addLog('info', `plugin:${pluginId}:stderr`, stderrRemainder);
+        let buf = this.stderrBuffers.get(pluginId);
+        if (!buf) {
+          buf = [];
+          this.stderrBuffers.set(pluginId, buf);
+        }
+        buf.push(stderrRemainder);
+        if (buf.length > 15) {
+          buf.shift();
+        }
+      }
+    });
+
+    ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+
+    // ── 消息处理（通过适配器的 onMessage，兼容 utilityProcess / child_process.fork 两种底层）────
+    proc.onMessage(async (event: unknown) => {
+      await this.handlePluginMessage(pluginId, event);
+    });
+
+    const activationTimeout = setTimeout(() => {
+      if (!receivedOutput && this.backgroundProcesses.has(pluginId) && !app.isPackaged) {
+        console.warn(`[PluginLauncher] ⚠️ No output from "${pluginId}" after 3s — possible missing self-activation call (activate().catch(...)) at end of file.`);
+      }
+    }, 3000);
+
+    rawProc.on('exit', (code: number | null) => {
+      clearTimeout(activationTimeout);
+      console.log(`[PluginLauncher] Background plugin ${pluginId} EXITED with code ${code}`);
+      this.backgroundProcesses.delete(pluginId);
+      this.rawUtilityProcesses.delete(pluginId);
+      this.busyPlugins.delete(pluginId);
+      for (const [sessId, pId] of this.sessionToPluginMap.entries()) {
+        if (pId === pluginId) {
+          this.sessionToPluginMap.delete(sessId);
+        }
+      }
+      if (code === 0) {
+        // 正常退出：注销看门狗监控
+        PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+      } else {
+        // 崩溃：立即通知看门狗调度重启，避免等待 15s 心跳超时才恢复。
+        // handleCrash 内部有 restartingPlugins 去重，不会与心跳超时/CPU 阈值重复触发。
+        PluginWatchdog.getInstance().handleCrash(pluginId, code);
+      }
+      // Onboarding已解耦，不再通知插件退出状态
+    });
+
+    rawProc.on('error', (err: unknown) => {
+      console.error(`[PluginLauncher] Background plugin ${pluginId} ERROR:`, err);
+    });
+
+    ipcMain.on(`plugin:emit:${pluginId}`, (_event, eventName: string, payload: unknown) => {
+      console.log(`[PluginLauncher] Main → plugin "${pluginId}" event: "${eventName}"`);
+      if (proc && this.backgroundProcesses.get(pluginId) === proc) {
+        proc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+      }
+    });
+
+    ipcMain.on(`plugin:post-message:${pluginId}`, (_event, msg: unknown) => {
+      if (proc && this.backgroundProcesses.get(pluginId) === proc) {
+        proc.sendMessage(msg);
+      }
+    });
+
+    console.log(`[PluginLauncher] "${pluginId}" startup complete`);
+    this.replayStateEvents(pluginId, proc);
+    this.establishDirectPortForPlugin(pluginId, proc);
+  }
+
+  /**
+   * 启动池化插件（processIsolation:'optional'）。
+   * 通过 PluginPool 加载到共享 Host 进程，不创建独立进程。
+   * stdout/stderr/exit 由 PluginPool 统一管理。
+   */
+  private async startPooledPlugin(pluginId: string, pluginPath: string, manifest: PluginManifest, context?: any): Promise<void> {
+    const pool = PluginPool.getInstance();
+    const proc = await pool.loadPlugin(pluginId, pluginPath, manifest);
+    this.backgroundProcesses.set(pluginId, proc);
+
+    // 注册到 HookRegistry
+    HookRegistry.getInstance().registerBackgroundProcess(pluginId, proc);
+
+    ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+
+    // 池化插件的消息处理（PooledProcessAdapter 按 sourcePluginId 过滤）
+    proc.onMessage(async (event: unknown) => {
+      await this.handlePluginMessage(pluginId, event);
+    });
+
+    ipcMain.on(`plugin:emit:${pluginId}`, (_event, eventName: string, payload: unknown) => {
+      console.log(`[PluginLauncher] Main → pooled plugin "${pluginId}" event: "${eventName}"`);
+      if (proc && this.backgroundProcesses.get(pluginId) === proc) {
+        proc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+      }
+    });
+
+    ipcMain.on(`plugin:post-message:${pluginId}`, (_event, msg: unknown) => {
+      if (proc && this.backgroundProcesses.get(pluginId) === proc) {
+        proc.sendMessage(msg);
+      }
+    });
+
+    console.log(`[PluginLauncher] Pooled plugin "${pluginId}" startup complete (pool PID: ${pool.pid})`);
+    this.replayStateEvents(pluginId, proc);
+    this.establishDirectPortForPlugin(pluginId, proc);
+  }
+
+  /**
+   * 统一的消息处理逻辑（独立进程和池化插件共用）。
+   * 处理心跳、MCP 响应、AI 流式响应、事件广播、API 调用。
+   */
+  private async handlePluginMessage(pluginId: string, event: unknown): Promise<void> {
+    const msg = event as Record<string, unknown>;
+    const proc = this.backgroundProcesses.get(pluginId);
+    if (!proc) return;
+
+    // ── 插件忙碌/闲置状态宣告 ────────────────────────────────────────────────
+    if (msg.type === 'plugin:lifecycle:set-busy') {
+      const { busy, reason } = msg as { busy: boolean; reason?: string };
+      if (busy) {
+        this.busyPlugins.add(pluginId);
+        console.log(`[PluginLauncher] Plugin "${pluginId}" marked as BUSY (Reason: ${reason || 'unspecified'})`);
+      } else {
+        this.busyPlugins.delete(pluginId);
+        console.log(`[PluginLauncher] Plugin "${pluginId}" marked as IDLE`);
+      }
+      return;
+    }
+
+    // ── 看门狗心跳（仅独立进程路径；池化插件的心跳由 PluginPool 拦截处理）────
+    if (msg.type === 'sdk:heartbeat') {
+      const metrics = msg.metrics as import('./plugin-watchdog').PluginMetrics | undefined;
+      if (metrics) {
+        PluginWatchdog.getInstance().onHeartbeat(pluginId, metrics);
+      }
+      return;
+    }
+
+    // ── MCP 工具响应 ────────────────────────────────────────────────────────
+    if (msg.type === 'mcp:tool-response') {
+      const { token, success, result, error } = msg as {
+        token: number;
+        success: boolean;
+        result?: unknown;
+        error?: string;
+      };
+      McpHost.getInstance().handleSandboxResponse(token, success, result, error);
+      return;
+    }
+
+    // ── AI 流式聊天响应 ──────────────────────────────────────────────────────
+    if (msg.type === 'sdk:callApi:stream-chunk') {
+      const { token, chunk } = msg as { token: number; chunk: string };
+      const { handleProxyAiResponse } = await import('./controllers/ai.js');
+      handleProxyAiResponse({ token, type: 'chunk', data: { text: chunk, is_end: false } });
+      return;
+    }
+    if (msg.type === 'sdk:callApi:stream-end') {
+      const { token, text } = msg as { token: number; text?: string };
+      const { handleProxyAiResponse } = await import('./controllers/ai.js');
+      handleProxyAiResponse({ token, type: 'response', data: { content: text || '' } });
+      return;
+    }
+    if (msg.type === 'sdk:callApi:stream-error') {
+      const { token, error } = msg as { token: number; error: string };
+      const { handleProxyAiResponse } = await import('./controllers/ai.js');
+      handleProxyAiResponse({ token, type: 'error', error });
+      return;
+    }
+
+    // ── 插件广播事件（sdk:events:emit） ─────────────────────────────────────
+    if (msg.type === 'sdk:events:emit') {
+      const eventName = msg.eventName as string;
+      const payload = msg.payload;
+
+      ipcMain.emit(eventName, null, payload);
+
+      if (eventName === 'agent:kernel_ready') {
+        console.log(`[PluginLauncher] ⭐ RECEIVED kernel_ready from plugin "${pluginId}":`, payload);
+      } else {
+        console.log(`[PluginLauncher] Event "${eventName}" from "${pluginId}"`);
+      }
+
+      const { getEventRoutingPolicy } = await import('../../plugins-sdk/event-catalog.js');
+      const policy = getEventRoutingPolicy(eventName);
+
+      if (policy.broadcastToRenderer) {
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) {
+            win.webContents.send(`plugin:event:${eventName}`, payload);
+          }
+        });
+      }
+
+      if (policy.broadcastToBackground) {
+        const { PluginManager } = await import('./plugin-manager.js');
+        const subscribers = EventSubscriptionRegistry.getInstance().getSubscribers(eventName);
+        for (const subscriberId of subscribers) {
+          if (subscriberId === pluginId) continue;
+          // 仅在插件启用时才转发事件或唤醒
+          if (!PluginManager.getInstance().isPluginEnabled(subscriberId)) {
+            continue;
+          }
+
+          const bgProc = this.backgroundProcesses.get(subscriberId);
+          if (bgProc) {
+            console.log(`[PluginLauncher] Forwarding event "${eventName}" to background plugin "${subscriberId}"`);
+            bgProc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+            PluginManager.getInstance().recordPluginActivity(subscriberId);
+          } else {
+            console.log(`[PluginLauncher] Waking up background plugin "${subscriberId}" due to event "${eventName}" from plugin "${pluginId}"`);
+            const ctx = {
+              action: 'normal' as const,
+              loadMode: 'normal' as const,
+              updatedAt: new Date().toISOString(),
+              trigger: {
+                eventName,
+                payload
+              }
+            };
+            PluginManager.getInstance().ensurePluginLoaded(subscriberId, ctx).then(() => {
+              const startedProc = this.backgroundProcesses.get(subscriberId);
+              if (startedProc) {
+                console.log(`[PluginLauncher] Replaying trigger event "${eventName}" to newly started background plugin "${subscriberId}"`);
+                startedProc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+              }
+            }).catch(err => {
+              console.error(`[PluginLauncher] Failed to wake up plugin "${subscriberId}" for event "${eventName}":`, err);
+            });
+          }
+        }
+      }
+
+      // 追踪 Agent 会话状态
+      if (eventName === 'agent:step_update' && payload && typeof payload === 'object') {
+        const stepPayload = payload as Record<string, unknown>;
+        const sessionId = stepPayload.sessionId as string;
+        const status = stepPayload.status as string;
+        if (sessionId) {
+          if (status === 'completed' || status === 'error' || status === 'cancelled') {
+            const mappedPluginId = this.sessionToPluginMap.get(sessionId);
+            this.activeAgentSessions.delete(sessionId);
+            this.sessionToPluginMap.delete(sessionId);
+            console.log(`[PluginLauncher] AI Session finished: ${sessionId} (status: ${status})`);
+
+            if (mappedPluginId && !this.isPluginBusy(mappedPluginId)) {
+              try {
+                const { PluginManager } = require('./plugin-manager.js');
+                PluginManager.getInstance().processPendingReload(mappedPluginId).catch((err: any) => {
+                  console.error(`[PluginLauncher] Failed to process pending reload for "${mappedPluginId}":`, err);
+                });
+              } catch (err) {
+                console.error(`[PluginLauncher] Failed to require PluginManager:`, err);
+              }
+            }
+          } else {
+            this.activeAgentSessions.add(sessionId);
+            this.sessionToPluginMap.set(sessionId, pluginId);
+          }
+        }
+      }
+    } else if (msg.type === 'sdk:callApi') {
+      const { token, apiName, methodName, args } = msg as {
+        token: number;
+        apiName: string;
+        methodName: string;
+        args: unknown[];
+      };
+      try {
+        const result = await dispatchPluginApiCall(
+          pluginId,
+          apiName as string,
+          methodName as string,
+          args as unknown[],
+        );
+        proc.sendMessage({ type: 'sdk:callApi:response', targetPluginId: pluginId, token, success: true, result });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        proc.sendMessage({ type: 'sdk:callApi:response', targetPluginId: pluginId, token, success: false, error: errMsg });
+      }
+    }
+  }
+
+  public async stopBackgroundPlugin(pluginId: string): Promise<void> {
+    const proc = this.backgroundProcesses.get(pluginId);
+    if (!proc) return;
+    console.log(`[PluginLauncher] Stopping background plugin: ${pluginId}`);
+
+    this.busyPlugins.delete(pluginId);
+    for (const [sessId, pId] of this.sessionToPluginMap.entries()) {
+      if (pId === pluginId) {
+        this.sessionToPluginMap.delete(sessId);
+      }
+    }
+
+    // 池化插件：通过 PluginPool 卸载（不终止 Host 进程）
+    if (proc instanceof PooledProcessAdapter) {
+      this.backgroundProcesses.delete(pluginId);
+      HookRegistry.getInstance().unregisterBackgroundProcess(pluginId);
+      HookRegistry.getInstance().unregisterPlugin(pluginId);
+      PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+      ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+      ipcMain.removeAllListeners(`plugin:post-message:${pluginId}`);
+      await PluginPool.getInstance().unloadPlugin(pluginId);
+      return;
+    }
+
+    // 独立进程插件
+    proc.kill();
+    this.backgroundProcesses.delete(pluginId);
+    this.rawUtilityProcesses.delete(pluginId);
+    HookRegistry.getInstance().unregisterBackgroundProcess(pluginId);
+    HookRegistry.getInstance().unregisterPlugin(pluginId);
+    PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+    ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+    ipcMain.removeAllListeners(`plugin:post-message:${pluginId}`);
+  }
+
+  public async startMainPlugin(
+    pluginId: string,
+    pluginPath: string,
+    manifest: PluginManifest,
+    createMainSDKInstance: (pluginId: string) => any,
+    context?: any
+  ): Promise<void> {
+    if (this.mainPlugins.has(pluginId)) {
+      console.log(`[PluginLauncher] Main plugin ${pluginId} is already running`);
+      return;
+    }
+
+    const mainJsPath = join(pluginPath, manifest.main || 'dist/index.js');
+    const mainJsExists = await fs.stat(mainJsPath).then(s => s.isFile()).catch(() => false);
+    if (!mainJsExists) {
+      console.warn(`[PluginLauncher] Main plugin entry not found: ${mainJsPath}`);
+      return;
+    }
+
+    console.log(`[PluginLauncher] Starting main-process plugin: ${pluginId} → ${mainJsPath}`);
+
+    try {
+      const fileUrl = pathToFileURL(mainJsPath).href + `?t=${Date.now()}`;
+      const module = await import(fileUrl);
+
+      const sdk = createMainSDKInstance(pluginId);
+      if (typeof module.activate === 'function') {
+        await module.activate(sdk, context);
+      }
+
+      this.mainPlugins.set(pluginId, module);
+      console.log(`[PluginLauncher] Main plugin ${pluginId} activated successfully`);
+    } catch (err) {
+      console.error(`[PluginLauncher] Failed to start main plugin ${pluginId}:`, err);
+    }
+  }
+
+  public async stopMainPlugin(pluginId: string, createMainSDKInstance: (pluginId: string) => any): Promise<void> {
+    const instance = this.mainPlugins.get(pluginId);
+    if (!instance) return;
+
+    console.log(`[PluginLauncher] Stopping main plugin: ${pluginId}`);
+    try {
+      const sdk = createMainSDKInstance(pluginId);
+      if (typeof instance.deactivate === 'function') {
+        await instance.deactivate(sdk);
+      }
+    } catch (err) {
+      console.error(`[PluginLauncher] Error deactivating main plugin ${pluginId}:`, err);
+    } finally {
+      this.mainPlugins.delete(pluginId);
+      McpHost.getInstance().unregisterPluginMcp(pluginId);
+    }
+  }
+
+  private async replayStateEvents(pluginId: string, proc: IPluginProcess): Promise<void> {
+    try {
+      const listens = EventSubscriptionRegistry.getInstance().getSubscribers('workspace:context-changed');
+      if (listens.has(pluginId)) {
+        const { WorkspaceManager } = await import('../services/workspace-manager.js');
+        const currentPath = WorkspaceManager.getInstance().getPathForWindow(null);
+        if (currentPath) {
+          console.log(`[PluginLauncher] Replaying workspace:context-changed to newly started plugin "${pluginId}":`, currentPath);
+          proc.sendMessage({
+            type: 'sdk:events:on',
+            eventName: 'workspace:context-changed',
+            payload: {
+              oldWorkspacePath: null,
+              newWorkspacePath: currentPath
+            }
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`[PluginLauncher] Failed to replay state events to "${pluginId}":`, err);
+    }
+  }
+
+  public cancelAllAgentSessions(): void {
+    const enabledKernels = Array.from(this.backgroundProcesses.keys());
+    for (const sessionId of this.activeAgentSessions) {
+      for (const kernelPluginId of enabledKernels) {
+        this.emitToBackgroundPlugin(kernelPluginId, 'agent:cancel_session', { sessionId });
+      }
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) {
+          win.webContents.send('plugin:event:agent:step_update', {
+            sessionId,
+            status: 'cancelled',
+            currentStep: 0,
+            message: '程序关闭，AI 工作已暂停/取消。'
+          });
+        }
+      });
+    }
+    this.activeAgentSessions.clear();
+    this.sessionToPluginMap.clear();
+    this.busyPlugins.clear();
+  }
+}

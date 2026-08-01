@@ -1,0 +1,37 @@
+diff --git a/electron/plugins/plugin-install.ts b/electron/plugins/plugin-install.ts
+index 34ea70e..50b8787 100644
+--- a/electron/plugins/plugin-install.ts
++++ b/electron/plugins/plugin-install.ts
+@@ -4,10 +4,11 @@ import * as path from 'path';
+ import * as fs from 'fs';
+ import { fileURLToPath } from 'url';
+ import AdmZip from 'adm-zip';
+-import { verifyPackageSignature, PluginManifest, SignatureJson } from './signature-verifier';
++import type { PluginManifest, SignatureJson } from './signature-verifier';
++import { verifyPackageSignature } from './signature-verifier';
+ import { PluginManager, getPluginRootDir } from './plugin-manager';
+ import { ElectronMainWindow } from '../windows/main-window';
+-import { ElectronFloatBall } from '../windows/float-ball';
++import { ElectronFloatWeb } from '../windows/float-web';
+ import { SKILLS_DIR } from '../config/paths';
+ import eventBus from '../../src/services/event_bus';
+ 
+@@ -196,7 +197,7 @@ export async function confirmInstallPackage(
+ 
+     // Also reload open UI windows for the just-installed plugin so that
+     // any already-open floating/workspace windows immediately show the new version.
+-    ElectronFloatBall.getInstance().reloadPluginWindows(pluginId);
++    ElectronFloatWeb.getInstance().reloadPluginWindows(pluginId);
+ 
+     // 触发全文索引重建（skills + tools）
+     // 与 enable/disable/uninstall 保持一致，安装后也需要更新 FtsAgentIndex
+@@ -263,7 +264,9 @@ async function syncPluginSkills(pluginDir: string, pluginId: string): Promise<vo
+               console.log(`[PluginInstall] 🗑️ Cleaned up obsolete skill [${existingName}] for updated plugin [${pluginId}]`);
+             }
+           }
+-        } catch {}
++        } catch {
++          // ignore
++        }
+       }
+     }

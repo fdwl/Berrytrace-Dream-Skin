@@ -1,0 +1,156 @@
+import Store from 'electron-store';
+import { ContextEntry, ContextOptions } from './workflow-types';
+
+export class SharedContextStore {
+  private static instance: SharedContextStore | null = null;
+  private memory = new Map<string, ContextEntry>();
+  private store: Store;
+
+  private constructor() {
+    this.store = new Store({ name: 'berrytrace_shared_context_store' });
+    this.restoreFromDisk();
+  }
+
+  public static getInstance(): SharedContextStore {
+    if (!SharedContextStore.instance) {
+      SharedContextStore.instance = new SharedContextStore();
+    }
+    return SharedContextStore.instance;
+  }
+
+  /**
+   * 构建 Key 标识
+   */
+  private buildKey(key: string, options?: ContextOptions): string {
+    const scope = options?.scope || 'session';
+    if (scope === 'workspace' && options?.workspacePath) {
+      return `ws:${options.workspacePath}:${key}`;
+    }
+    return `${scope}:${key}`;
+  }
+
+  /**
+   * 构建前缀，用于 list / clear
+   */
+  private buildKeyPrefix(options?: ContextOptions): string {
+    const scope = options?.scope || 'session';
+    if (scope === 'workspace' && options?.workspacePath) {
+      return `ws:${options.workspacePath}:`;
+    }
+    return `${scope}:`;
+  }
+
+  /**
+   * 写入共享上下文数据
+   */
+  public async set(key: string, value: unknown, options?: ContextOptions, pluginId?: string): Promise<void> {
+    const scopedKey = this.buildKey(key, options);
+    const entry: ContextEntry = {
+      value,
+      createdAt: Date.now(),
+      ttlMs: options?.ttlMs,
+      pluginId,
+    };
+    this.memory.set(scopedKey, entry);
+    this.persistToDisk();
+  }
+
+  /**
+   * 读取共享上下文数据
+   */
+  public async get(key: string, options?: ContextOptions): Promise<unknown> {
+    const scopedKey = this.buildKey(key, options);
+    const entry = this.memory.get(scopedKey);
+    if (!entry) return null;
+
+    // 检查 TTL 过期
+    if (entry.ttlMs && Date.now() - entry.createdAt > entry.ttlMs) {
+      this.memory.delete(scopedKey);
+      this.persistToDisk();
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  /**
+   * 列出指定 scope 下的所有 key
+   */
+  public async list(options?: ContextOptions): Promise<string[]> {
+    const prefix = this.buildKeyPrefix(options);
+    const keys: string[] = [];
+    const now = Date.now();
+
+    for (const [key, entry] of this.memory.entries()) {
+      if (entry.ttlMs && now - entry.createdAt > entry.ttlMs) {
+        this.memory.delete(key);
+        continue;
+      }
+      if (key.startsWith(prefix)) {
+        keys.push(key.slice(prefix.length));
+      }
+    }
+
+    return keys;
+  }
+
+  /**
+   * 清除指定 scope 下的所有数据
+   */
+  public async clear(options?: ContextOptions): Promise<void> {
+    const prefix = this.buildKeyPrefix(options);
+    for (const key of this.memory.keys()) {
+      if (key.startsWith(prefix)) {
+        this.memory.delete(key);
+      }
+    }
+    this.persistToDisk();
+  }
+
+  /**
+   * 当插件注销时，清理其写入的数据
+   */
+  public unregisterPlugin(pluginId: string): void {
+    for (const [key, entry] of this.memory.entries()) {
+      if (entry.pluginId === pluginId) {
+        this.memory.delete(key);
+      }
+    }
+    this.persistToDisk();
+  }
+
+  /**
+   * 异步写入磁盘持久化
+   */
+  private persistToDisk(): void {
+    try {
+      const obj: Record<string, ContextEntry> = {};
+      for (const [key, entry] of this.memory.entries()) {
+        // session 作用域数据仅保留在内存中，不持久化到磁盘
+        if (key.startsWith('session:')) continue;
+        obj[key] = entry;
+      }
+      this.store.set('context_store', obj);
+    } catch (err) {
+      console.error('[SharedContextStore] Persist to disk error:', err);
+    }
+  }
+
+  /**
+   * 启动时从磁盘恢复
+   */
+  private restoreFromDisk(): void {
+    try {
+      const obj = (this.store.get('context_store') as Record<string, ContextEntry>) || {};
+      const now = Date.now();
+      for (const [key, entry] of Object.entries(obj)) {
+        if (entry.ttlMs && now - entry.createdAt > entry.ttlMs) {
+          continue;
+        }
+        this.memory.set(key, entry);
+      }
+    } catch (err) {
+      console.error('[SharedContextStore] Restore from disk error:', err);
+    }
+  }
+}

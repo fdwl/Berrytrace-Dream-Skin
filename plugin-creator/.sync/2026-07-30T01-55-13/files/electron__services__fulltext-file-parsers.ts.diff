@@ -1,0 +1,23 @@
+diff --git a/electron/services/fulltext-file-parsers.ts b/electron/services/fulltext-file-parsers.ts
+index 706c924..976c639 100644
+--- a/electron/services/fulltext-file-parsers.ts
++++ b/electron/services/fulltext-file-parsers.ts
+@@ -383,12 +383,16 @@ export async function extractFileContentAsync(filePath: string, ext: string): Pr
+ 
+ /**
+  * 获取支持的文件扩展名列表（用于文件过滤）
++ *
++ * 设计原则：
++ * - 只收录 ripgrep 无法解析的二进制文档（PDF/Office 系列）及 .workflow
++ * - .md / .txt 已由 ripgrep 实时覆盖，无需 FTS 索引
++ * - 图片 OCR 改为按需触发，不在构建期批量索引
+  */
+ export function getSupportedExts(): string[] {
+   return [
+-    '.md', '.txt', '.pdf', '.docx', '.pptx', '.xlsx',
++    '.pdf', '.docx', '.pptx', '.xlsx',
+     '.doc', '.ppt', '.xls',
+-    '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.gif',
+     '.workflow'
+   ]
+ }

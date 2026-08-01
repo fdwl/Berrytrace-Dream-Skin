@@ -1,0 +1,362 @@
+import { DatabaseManager } from './db-manager.js';
+import { LocalAIService } from './local-ai-service.js';
+import { VectorSearchEngine } from './vector-search-engine.js';
+import * as path from 'path';
+
+export interface NoteSearchResult {
+  note_id: number;
+  title: string;
+  snip: string;
+  rank: number;
+  score?: number; // RRF score
+}
+
+export interface FileSearchResult {
+  file_path: string;
+  file_name: string;
+  snip: string;
+  rank: number;
+  line_number?: number;
+  score?: number; // RRF score
+}
+
+export interface AgentSearchResult {
+  entity_id: string;
+  entity_type: 'skill' | 'tool';
+  title: string;
+  content: string;
+  meta: string;
+  score?: number; // RRF score
+}
+
+export class FtsHybridSearcher {
+  private static RRF_K = 60;
+
+  public static applyTitleBoost(query: string, rawTitle: string, baseScore: number): number {
+    const q = query.trim().toLowerCase();
+    const t = rawTitle.trim().toLowerCase();
+    if (!q || !t) return baseScore;
+
+    // 去除可能的文件后缀，仅比对核心名称
+    const cleanTitle = t.replace(/\.[a-zA-Z0-9]+$/, '');
+
+    let boost = 0;
+
+    // 1. 完全一致
+    if (cleanTitle === q) {
+      boost = 0.40;
+    }
+    // 2. 前缀一致
+    else if (cleanTitle.startsWith(q)) {
+      boost = 0.25;
+    }
+    // 3a. 标题包含 Query
+    else if (cleanTitle.includes(q)) {
+      boost = 0.15;
+    }
+    // 3b. Query 包含标题
+    else if (q.includes(cleanTitle)) {
+      boost = 0.10;
+    }
+
+    // 线性累加并封顶为 1.0
+    return Math.min(baseScore + boost, 1.0);
+  }
+
+  public static async searchNotes(
+    query: string,
+    calendarUuid: number,
+    ftsResults: NoteSearchResult[]
+  ): Promise<NoteSearchResult[]> {
+    return ftsResults;
+  }
+
+  /**
+   * Hybrid search for files combining FTS and Vector search using RRF
+   */
+  public static async searchFiles(
+    query: string,
+    workspacePath: string,
+    ftsResults: FileSearchResult[]
+  ): Promise<FileSearchResult[]> {
+    const startTime = performance.now();
+    const localAI = LocalAIService.getInstance();
+    
+    let queryVector: number[] | null = null;
+    try {
+      const status = await ipcMainHandleStatus();
+      if (query.trim() && status?.workerRunning) {
+        queryVector = await localAI.getEmbedding(query);
+      }
+    } catch (e) {
+      console.warn('[FtsHybridSearcher] Local embedding generation failed for files, falling back to FTS:', e);
+    }
+
+    if (!queryVector) {
+      const duration = (performance.now() - startTime).toFixed(1);
+      console.log(`[FtsHybridSearcher] Search [Files]: fallback to pure FTS (Full-Text Index) keyword search for query: "${query}" (took ${duration}ms)`);
+      const resultsWithScore = ftsResults.map((r, idx) => ({
+        ...r,
+        score: 1 / (this.RRF_K + idx + 1)
+      }));
+      const boosted = resultsWithScore.map(item => ({
+        ...item,
+        score: FtsHybridSearcher.applyTitleBoost(query, item.file_name, item.score)
+      }));
+      return boosted.sort((a, b) => b.score - a.score);
+    }
+
+    const { modelId } = localAI.getActiveEmbeddingModel();
+    console.log(`[FtsHybridSearcher] Search [Files]: using Hybrid Search (Local AI Vector Search [model: ${modelId}] + FTS Full-Text Index) for query: "${query}"`);
+
+    const db = DatabaseManager.getInstance().getWorkspaceDB(workspacePath);
+    const dbKey = workspacePath;
+
+    const vectorEngine = VectorSearchEngine.getEngine(db, dbKey);
+    await vectorEngine.initialize();
+
+    // 1. Get Vector Search hits
+    const vectorHits = vectorEngine.search(queryVector, 100)
+      .filter(hit => hit.entityType === 'file');
+
+    // 2. Perform Reciprocal Rank Fusion
+    const rrfScores: Map<string, { ftsRank: number; vecRank: number; path: string }> = new Map();
+
+    ftsResults.forEach((res, index) => {
+      const pathKey = res.file_path;
+      rrfScores.set(pathKey, { ftsRank: index + 1, vecRank: -1, path: pathKey });
+    });
+
+    vectorHits.forEach((hit, index) => {
+      const pathKey = hit.entityId;
+      const existing = rrfScores.get(pathKey);
+      if (existing) {
+        existing.vecRank = index + 1;
+      } else {
+        rrfScores.set(pathKey, { ftsRank: -1, vecRank: index + 1, path: pathKey });
+      }
+    });
+
+    // Collect vector-only file paths to fetch details in a single batch query
+    const vectorOnlyPaths: string[] = [];
+    for (const [pathKey, _rankInfo] of rrfScores.entries()) {
+      const ftsItem = ftsResults.find(r => r.file_path === pathKey);
+      if (!ftsItem) {
+        vectorOnlyPaths.push(pathKey);
+      }
+    }
+
+    const fileDetailsMap = new Map<string, { file_name: string; content: string }>();
+    if (vectorOnlyPaths.length > 0) {
+      try {
+        const batchSize = 50;
+        for (let i = 0; i < vectorOnlyPaths.length; i += batchSize) {
+          const batch = vectorOnlyPaths.slice(i, i + batchSize);
+          const placeholders = batch.map(() => '?').join(',');
+          const rows = db.prepare(
+            `SELECT file_path, file_name, content FROM FtsFileIndex WHERE file_path IN (${placeholders}) AND workspace_path = ?`
+          ).all(...batch, workspacePath) as Array<{ file_path: string; file_name: string; content: string }>;
+          for (const row of rows) {
+            fileDetailsMap.set(row.file_path, { file_name: row.file_name, content: row.content });
+          }
+        }
+      } catch (err) {
+        console.error('[FtsHybridSearcher] Failed to batch fetch file info:', err);
+      }
+    }
+
+    const mergedList: FileSearchResult[] = [];
+    for (const [pathKey, rankInfo] of rrfScores.entries()) {
+      const ftsRank = rankInfo.ftsRank;
+      const vecRank = rankInfo.vecRank;
+
+      let rrfScore = 0;
+      if (ftsRank !== -1) {
+        rrfScore += 1 / (this.RRF_K + ftsRank);
+      }
+      if (vecRank !== -1) {
+        rrfScore += 1 / (this.RRF_K + vecRank);
+      }
+
+      const ftsItem = ftsResults.find(r => r.file_path === pathKey);
+      if (ftsItem) {
+        mergedList.push({
+          ...ftsItem,
+          score: rrfScore
+        });
+      } else {
+        const details = fileDetailsMap.get(pathKey);
+        if (details) {
+          const cleanContent = details.content ? details.content.substring(0, 80) : '';
+          const snip = cleanContent + (details.content && details.content.length > 80 ? '...' : '');
+          mergedList.push({
+            file_path: pathKey,
+            file_name: details.file_name || path.basename(pathKey),
+            snip: snip || '（无内容）',
+            rank: 9999,
+            score: rrfScore
+          });
+        }
+      }
+    }
+
+    const duration = (performance.now() - startTime).toFixed(1);
+    const boostedList = mergedList.map(item => ({
+      ...item,
+      score: FtsHybridSearcher.applyTitleBoost(query, item.file_name, item.score ?? 0)
+    }));
+    const sorted = boostedList.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    console.log(`[FtsHybridSearcher] Search [Files] complete. Merged ${sorted.length} results (took ${duration}ms)`);
+    return sorted;
+  }
+
+  /**
+   * Hybrid search for agent capabilities (skills and tools) combining FTS and Vector search using RRF
+   */
+  /**
+   * 清洗与转义 FTS 查询文本，剥除双引号及特殊 FTS5 匹配符
+   */
+  public static sanitizeFtsQuery(query: string): string {
+    if (!query) return '';
+    let cleaned = query
+      .replace(/["'“”‘’]/g, ' ') // 剥除各类全半角单双引号
+      .replace(/[:*^{}()+~]/g, ' ') // 剥除 FTS5 特殊语法符号
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // 如果查询文本极长（例如整段 System/User Prompt 被当作 query 传入），截取前 150 字符
+    if (cleaned.length > 150) {
+      cleaned = cleaned.slice(0, 150).trim();
+    }
+    return cleaned;
+  }
+
+  /**
+   * Hybrid search for agent capabilities (skills and tools) combining FTS and Vector search using RRF
+   */
+  public static async searchAgentCapabilities(query: string, workspacePath?: string | null, limit: number = 25): Promise<AgentSearchResult[]> {
+    const startTime = performance.now();
+    const db = workspacePath 
+      ? DatabaseManager.getInstance().getWorkspaceDB(workspacePath) 
+      : DatabaseManager.getInstance().getGlobalDB();
+    const _dbKey = workspacePath || 'global';
+    
+    const cleanQuery = FtsHybridSearcher.sanitizeFtsQuery(query);
+
+    // 1. Run FTS Search
+    const hasAdvancedSyntax = /( AND | OR | NOT |"-|"[^"]+")/.test(query);
+    let ftsResults: Array<AgentSearchResult & { rank: number }> = [];
+
+    if (!cleanQuery) {
+      try {
+        ftsResults = db.prepare(`SELECT entity_id, entity_type, title, content, meta, 0 as rank FROM FtsAgentIndex LIMIT 100`).all() as unknown as Array<AgentSearchResult & { rank: number }>;
+      } catch (err) {
+        console.warn('[FtsHybridSearcher] Failed to query default FtsAgentIndex:', err);
+      }
+    } else {
+      try {
+        if (hasAdvancedSyntax) {
+          const { QueryParser } = await import('./fulltext-query-parser.js');
+          const parser = new QueryParser();
+          const parsed = parser.parse(query);
+          const ftsQuery = parser.toFtsQuery(parsed);
+          const ftsSql = `
+            SELECT entity_id, entity_type, title, content, meta, rank
+            FROM FtsAgentIndex
+            WHERE FtsAgentIndex MATCH ?
+            ORDER BY rank
+            LIMIT 100
+          `;
+          ftsResults = db.prepare(ftsSql).all(ftsQuery) as unknown as Array<AgentSearchResult & { rank: number }>;
+        } else {
+          // 方案一：使用清洗后的 cleanQuery 经过 jieba_query 分词，并将 AND 替换为 OR
+          const ftsSql = `SELECT entity_id, entity_type, title, content, meta, rank FROM FtsAgentIndex WHERE FtsAgentIndex MATCH replace(jieba_query(?), ' AND ', ' OR ') ORDER BY rank LIMIT 100`;
+          ftsResults = db.prepare(ftsSql).all(cleanQuery) as unknown as Array<AgentSearchResult & { rank: number }>;
+        }
+        
+        const ftsDuration = (performance.now() - startTime).toFixed(1);
+        const topIds = ftsResults.slice(0, 3).map(r => `${r.entity_id}(${r.entity_type},rank:${r.rank},contentLen:${(r.content||'').length})`).join(', ') || '(none)';
+        console.log(`[FtsHybridSearcher] FTS query for "${cleanQuery.slice(0, 30)}" | hits: ${ftsResults.length} | top3: ${topIds} | ${ftsDuration}ms`);
+      } catch (primaryErr) {
+        console.warn('[FtsHybridSearcher] Primary jieba MATCH search failed, attempting safe token fallback:', primaryErr);
+        try {
+          // 降级策略：提取词项并用 OR 拼接安全词查询
+          const terms = cleanQuery.split(/\s+/).filter(t => t.length > 0).slice(0, 8);
+          if (terms.length > 0) {
+            const fallbackMatch = terms.map(t => `"${t}"`).join(' OR ');
+            const fallbackSql = `SELECT entity_id, entity_type, title, content, meta, rank FROM FtsAgentIndex WHERE FtsAgentIndex MATCH ? ORDER BY rank LIMIT 100`;
+            ftsResults = db.prepare(fallbackSql).all(fallbackMatch) as unknown as Array<AgentSearchResult & { rank: number }>;
+            console.log(`[FtsHybridSearcher] Fallback FTS query hit ${ftsResults.length} items`);
+          } else {
+            ftsResults = db.prepare(`SELECT entity_id, entity_type, title, content, meta, 0 as rank FROM FtsAgentIndex LIMIT 100`).all() as unknown as Array<AgentSearchResult & { rank: number }>;
+          }
+        } catch (fallbackErr) {
+          console.error('[FtsHybridSearcher] Agent FTS search fallback failed:', fallbackErr);
+        }
+      }
+    }
+
+    // 2. 工具/技能搜索：只用 FTS5 BM25，不用向量
+    // 向量搜索对短工具描述无效——"SVG optimizer"和"腾讯同步"在向量空间里分不清
+    {
+      const duration = (performance.now() - startTime).toFixed(1);
+      console.log(`[FtsHybridSearcher] Search [Capabilities]: FTS5 jieba OR-semantic for query: "${query}" (${duration}ms)`);
+      const resultsWithScore = ftsResults.map((r, idx) => ({
+        entity_id: r.entity_id,
+        entity_type: r.entity_type,
+        title: r.title,
+        content: r.content,
+        meta: r.meta,
+        score: 1 / (this.RRF_K + idx + 1)
+      }));
+      // 去重：FTS5 虚拟表 INSERT OR REPLACE 不认主键，可能产生重复行
+      const uniqueResults = Array.from(
+        new Map(resultsWithScore.map(r => [`${r.entity_type}:${r.entity_id}`, r])).values()
+      );
+      const boosted = uniqueResults.map(item => {
+        const titleScore = FtsHybridSearcher.applyTitleBoost(query, item.title, item.score);
+        let displayNameScore = 0;
+        let userQueriesScore = 0;
+        if (item.entity_type === 'tool' && item.meta) {
+          try {
+            const metaObj = JSON.parse(item.meta);
+            if (metaObj.displayName) {
+              displayNameScore = FtsHybridSearcher.applyTitleBoost(query, metaObj.displayName, item.score);
+            }
+            if (Array.isArray(metaObj.userQueries)) {
+              for (const uq of metaObj.userQueries) {
+                const uqScore = FtsHybridSearcher.applyTitleBoost(query, uq, item.score);
+                if (uqScore > userQueriesScore) {
+                  userQueriesScore = uqScore;
+                }
+              }
+            }
+          } catch (_e) {
+            console.warn('[FtsHybridSearcher] Failed to parse tool meta JSON for title boost:', _e);
+          }
+        }
+        const finalScore = Math.max(titleScore, displayNameScore, userQueriesScore, item.score);
+        return {
+          ...item,
+          score: finalScore
+        };
+      });
+      return boosted.sort((a, b) => b.score - a.score).slice(0, limit);
+    }
+  }
+}
+
+// Helper to check status of LocalAIService safely
+async function ipcMainHandleStatus() {
+  try {
+    const localAI = LocalAIService.getInstance();
+    const { modelId, dimension } = localAI.getActiveEmbeddingModel();
+    return {
+      workerRunning: localAI.isWorkerRunning(),
+      modelId,
+      embeddingDimension: dimension
+    };
+  } catch (_e) {
+    return null;
+  }
+}

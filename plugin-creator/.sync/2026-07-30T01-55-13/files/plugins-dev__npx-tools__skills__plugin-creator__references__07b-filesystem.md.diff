@@ -1,0 +1,13 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07b-filesystem.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07b-filesystem.md
+index ef8a11b..79b58c1 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07b-filesystem.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07b-filesystem.md
+@@ -9,7 +9,7 @@
+ | `mkdir` | `path: string` | `void` | 递归创建目录。 |
+ | `renameFile` | `oldPath: string, newPath: string` | `void` | 重命名/移动文件。 |
+ | `deleteFile` | `path: string` | `void` | 删除文件。 |
+-| `getSafePath` | `name: string` | `string` | 获取系统安全路径（userData / documents / desktop / temp）。 |
++| `getSafePath` | `name: string` | `string` | 获取系统安全路径。支持：`userData` / `documents` / `desktop` / `temp` / `skills` / **`pluginData`**（插件专属数据目录，用于生成式声明贡献文件）。 |
+ | `showItemInFolder` | `path: string` | `void` | 在系统文件管理器中显示文件。 |
+ | `extractZip` | `zipPath: string, destDir: string, overwrite?: boolean` | `void` | 解压 zip 文件到目标目录。 |
+ | `copyDir` | `src: string, dst: string` | `void` | 递归复制目录。 |

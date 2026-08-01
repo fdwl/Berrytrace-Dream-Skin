@@ -1,0 +1,68 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/01-architecture.md b/plugins-dev/npx-tools/skills/plugin-creator/references/01-architecture.md
+index 486711d..328a81c 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/01-architecture.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/01-architecture.md
+@@ -36,11 +36,32 @@
+ | `hybrid` | 必填 | 必填 | utilityProcess + 渲染进程 |
+ | `main` | 必填 | 不需要 | 主进程 |
+ 
++## OEM 内置插件机制
++
++宿主支持 OEM 配置（`oem.config.json`），可以预置内置插件：
++
++- `builtinPlugins`: 白名单数组，指定哪些插件为 OEM 内置
++- 内置插件在生产环境下自动标记为 `APPROVED` 状态，用户无法禁用
++- 内置插件目录：打包后 `dist/plugins/`，开发时 `builtin-plugins/`
++- 扫描顺序：用户安装插件 → OEM 内置插件（白名单过滤）
++
++```json
++// oem.config.json 示例
++{
++  "oemId": "partner",
++  "appName": "合作方应用",
++  "appId": "com.partner.app",
++  "apiGateway": "https://api.partner.com",
++  "builtinPlugins": ["com.berrytrace.plugin.online"]
++}
++```
++
+ ## plugin.json 加载流程
+ 
+ ```
+ 主进程 PluginManager
+-  → 扫描插件目录, 读取 plugin.json
++  → 扫描用户插件目录（~/.berrytrace/plugins/）
++  → 扫描 OEM 内置插件目录（builtin-plugins/），白名单过滤
+   → 根据 type 启动进程
+      background/hybrid → PluginLauncher → utilityProcess
+      main → 主进程内联
+@@ -113,6 +134,29 @@ plugin.json 声明
+ 
+ ## 声明 vs 运行时（当前状态）
+ 
++```
++声明式（plugin.json）                      运行时（SDK API）
++───────────                               ────────────────
++contributes.selectionMenuItems  ✅        sdk.storage.kv.*  ✅
++contributes.shortcutActions     ✅        sdk.storage.db.*  ✅
++contributes.events              ✅        sdk.ai.chat       ✅
++contributes.ribbonIcons         ✅        sdk.filesystem.*  ✅
++contributes.workspaceViews      ✅        sdk.mcp.registerToolHandler  ✅
++contributes.commands            ✅        sdk.window.create  ✅
++contributes.folderContextMenuItems ✅     sdk.events.on      ✅
++contributes.views               ✅        sdk.events.emit    ✅
++contributes.settingsSections    ✅        sdk.workspace.registerView    ✅
++contributes.voiceHandlers       ✅        sdk.workspace.registerRibbonIcon ✅
++mcp.tools（声明）               ✅        sdk.commands.register  ✅
++activationEvents                ✅        sdk.hooks.register  ✅
++fileAssociations                ✅        sdk.scheduler.register  ✅
++permissions                     ✅        sdk.user.*          ✅ (NEW)
++                                               sdk.system.getAppInfo  ✅ (NEW)
++                                               sdk.events.*          ✅
++                                               sdk.settings.*        ✅ (NEW)
++                                               sdk.selectionMenu.*   ✅
++                                               sdk.host.*            ✅
++                                               sdk.lifecycle.*       ✅
+ ```
+ 声明式（plugin.json）                      运行时（SDK API）
+ ───────────────────                      ────────────────

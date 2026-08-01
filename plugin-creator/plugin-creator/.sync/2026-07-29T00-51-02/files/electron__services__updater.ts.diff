@@ -1,0 +1,11 @@
+diff --git a/electron/services/updater.ts b/electron/services/updater.ts
+index d1349e5..f5a23aa 100644
+--- a/electron/services/updater.ts
++++ b/electron/services/updater.ts
+@@ -1,4 +1,5 @@
+-import { app, ipcMain, BrowserWindow } from 'electron';
++import type { BrowserWindow } from 'electron';
++import { app, ipcMain } from 'electron';
+ 
+ // 独立注册基础 IPC handlers (版本获取与基础 IPC)
+ export function registerUpdaterIpc(): void {

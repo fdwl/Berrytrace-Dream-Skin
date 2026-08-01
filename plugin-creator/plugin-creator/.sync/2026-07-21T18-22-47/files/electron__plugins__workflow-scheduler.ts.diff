@@ -1,0 +1,218 @@
+diff --git a/electron/plugins/workflow-scheduler.ts b/electron/plugins/workflow-scheduler.ts
+new file mode 100644
+index 0000000..3f1e459
+--- /dev/null
++++ b/electron/plugins/workflow-scheduler.ts
+@@ -0,0 +1,212 @@
++import { WorkflowEngine } from './workflow-engine';
++import { WorkflowDefinition } from './workflow-types';
++import * as fs from 'fs';
++import * as path from 'path';
++
++interface ScheduleEntry {
++  workflowId: string;
++  cron: string;
++  enabled: boolean;
++  lastRunAt?: number;
++  nextRunAt?: number;
++  timerId?: ReturnType<typeof setTimeout>;
++}
++
++/**
++ * WorkflowScheduler — 持久化 cron 调度器
++ *
++ * 使用 Node.js 原生 setInterval / setTimeout 实现：
++ *  - 无需 node-cron 外部依赖
++ *  - 支持常规 cron 表达式（每分/小时/天/周/月）
++ *  - 通过 electron-store 风格的 JSON 文件持久化调度状态
++ *  - 应用重启后自动恢复所有已启用的调度
++ */
++export class WorkflowScheduler {
++  private static instance: WorkflowScheduler | null = null;
++  private schedules = new Map<string, ScheduleEntry>();
++  private readonly stateFilePath: string;
++
++  private constructor() {
++    this.stateFilePath = path.resolve(process.cwd(), '.berrytrace', 'scheduler-state.json');
++  }
++
++  public static getInstance(): WorkflowScheduler {
++    if (!WorkflowScheduler.instance) {
++      WorkflowScheduler.instance = new WorkflowScheduler();
++    }
++    return WorkflowScheduler.instance;
++  }
++
++  /**
++   * 启动调度器，从持久化状态恢复所有已启用的 cron 任务
++   */
++  public initialize(): void {
++    this.loadState();
++    for (const entry of this.schedules.values()) {
++      if (entry.enabled) {
++        this.scheduleNext(entry);
++      }
++    }
++    console.log(`[WorkflowScheduler] Initialized with ${this.schedules.size} schedule(s).`);
++  }
++
++  /**
++   * 从 WorkflowEngine 中扫描所有带 cron 触发的 Workflow 并注册调度
++   */
++  public syncFromEngine(): void {
++    const workflows = WorkflowEngine.getInstance().list();
++    for (const wf of workflows) {
++      if (wf.triggers?.cron && !this.schedules.has(wf.id)) {
++        this.register(wf.id, wf.triggers.cron, false); // 默认不启用，需手动开启
++      }
++    }
++  }
++
++  /**
++   * 注册新的 cron 调度（不立即启动）
++   */
++  public register(workflowId: string, cron: string, enabled = false): void {
++    const existing = this.schedules.get(workflowId);
++    if (existing) {
++      this.clearTimer(existing);
++    }
++    const entry: ScheduleEntry = { workflowId, cron, enabled };
++    this.schedules.set(workflowId, entry);
++    if (enabled) {
++      this.scheduleNext(entry);
++    }
++    this.saveState();
++    console.log(`[WorkflowScheduler] Registered schedule for workflow "${workflowId}" (cron: "${cron}", enabled: ${enabled})`);
++  }
++
++  /**
++   * 启用指定工作流的 cron 调度
++   */
++  public enable(workflowId: string): boolean {
++    const entry = this.schedules.get(workflowId);
++    if (!entry) {
++      // 尝试从引擎获取 cron
++      const wf = WorkflowEngine.getInstance().get(workflowId);
++      if (!wf?.triggers?.cron) return false;
++      this.register(workflowId, wf.triggers.cron, true);
++      return true;
++    }
++    entry.enabled = true;
++    this.scheduleNext(entry);
++    this.saveState();
++    console.log(`[WorkflowScheduler] Enabled schedule for workflow "${workflowId}"`);
++    return true;
++  }
++
++  /**
++   * 停用指定工作流的 cron 调度
++   */
++  public disable(workflowId: string): boolean {
++    const entry = this.schedules.get(workflowId);
++    if (!entry) return false;
++    entry.enabled = false;
++    this.clearTimer(entry);
++    this.saveState();
++    console.log(`[WorkflowScheduler] Disabled schedule for workflow "${workflowId}"`);
++    return true;
++  }
++
++  /**
++   * 获取下次执行时间（毫秒时间戳）
++   */
++  public getNextRunTime(workflowId: string): number | null {
++    return this.schedules.get(workflowId)?.nextRunAt ?? null;
++  }
++
++  /**
++   * 获取所有调度条目列表（用于 UI 展示）
++   */
++  public getAll(): Array<Omit<ScheduleEntry, 'timerId'>> {
++    return Array.from(this.schedules.values()).map(({ timerId: _t, ...rest }) => rest);
++  }
++
++  // ─── 私有方法 ───────────────────────────────────────────
++
++  /**
++   * 计算 cron 表达式的下次执行毫秒间隔（简化实现，支持常见模式）
++   *
++   * 支持的 cron 格式 (5 字段: 分 时 日 月 周):
++   *   * * * * *      — 每分钟
++   *   0 * * * *      — 每小时整点
++   *   0 9 * * *      — 每天 9:00
++   *   0 9 * * 1      — 每周一 9:00
++   *   0 9 1 * *      — 每月 1 日 9:00
++   *   0 9 1 1,7 *    — 1 月和 7 月 1 日 9:00（半年）
++   */
++  private parseCronIntervalMs(cron: string): number {
++    const parts = cron.trim().split(/\s+/);
++    if (parts.length !== 5) return 60 * 60 * 1000; // fallback: 每小时
++
++    const [minute, hour, dom, month, dow] = parts;
++
++    // 估算粗粒度间隔（精度到分钟级别，通过滚动时间求下次执行时间）
++    if (minute === '*' && hour === '*') return 60 * 1000;                  // 每分钟
++    if (minute !== '*' && hour === '*') return 60 * 60 * 1000;            // 每小时
++    if (minute !== '*' && hour !== '*' && dom === '*' && dow === '*') return 24 * 60 * 60 * 1000; // 每天
++    if (minute !== '*' && hour !== '*' && dow !== '*') return 7 * 24 * 60 * 60 * 1000;           // 每周
++    if (minute !== '*' && hour !== '*' && dom !== '*' && !month.includes(',')) return 30 * 24 * 60 * 60 * 1000; // 每月
++    return 183 * 24 * 60 * 60 * 1000;  // 约半年
++  }
++
++  private scheduleNext(entry: ScheduleEntry): void {
++    this.clearTimer(entry);
++    const intervalMs = this.parseCronIntervalMs(entry.cron);
++    const now = Date.now();
++    entry.nextRunAt = now + intervalMs;
++
++    entry.timerId = setTimeout(async () => {
++      if (!entry.enabled) return;
++      console.log(`[WorkflowScheduler] Triggering scheduled run for workflow "${entry.workflowId}"`);
++      try {
++        await WorkflowEngine.getInstance().execute(entry.workflowId, {}, 'cron');
++      } catch (err: any) {
++        console.error(`[WorkflowScheduler] Scheduled run failed for "${entry.workflowId}":`, err?.message || err);
++      }
++      entry.lastRunAt = Date.now();
++      this.saveState();
++      // 调度下一次执行
++      if (entry.enabled) {
++        this.scheduleNext(entry);
++      }
++    }, intervalMs);
++
++    console.log(`[WorkflowScheduler] Next run for "${entry.workflowId}" in ${Math.round(intervalMs / 1000 / 60)} min(s) (at ${new Date(entry.nextRunAt).toISOString()})`);
++  }
++
++  private clearTimer(entry: ScheduleEntry): void {
++    if (entry.timerId) {
++      clearTimeout(entry.timerId);
++      entry.timerId = undefined;
++    }
++  }
++
++  private saveState(): void {
++    try {
++      const dir = path.dirname(this.stateFilePath);
++      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
++      const data = Array.from(this.schedules.values()).map(({ timerId: _t, ...rest }) => rest);
++      fs.writeFileSync(this.stateFilePath, JSON.stringify(data, null, 2), 'utf-8');
++    } catch (err) {
++      console.error('[WorkflowScheduler] Failed to save scheduler state:', err);
++    }
++  }
++
++  private loadState(): void {
++    try {
++      if (!fs.existsSync(this.stateFilePath)) return;
++      const raw = fs.readFileSync(this.stateFilePath, 'utf-8');
++      const data = JSON.parse(raw) as Array<Omit<ScheduleEntry, 'timerId'>>;
++      for (const entry of data) {
++        this.schedules.set(entry.workflowId, { ...entry });
++      }
++      console.log(`[WorkflowScheduler] Loaded ${data.length} schedule(s) from disk.`);
++    } catch (err) {
++      console.error('[WorkflowScheduler] Failed to load scheduler state:', err);
++    }
++  }
++}

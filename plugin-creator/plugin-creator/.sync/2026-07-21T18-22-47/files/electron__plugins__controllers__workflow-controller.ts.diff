@@ -1,0 +1,186 @@
+diff --git a/electron/plugins/controllers/workflow-controller.ts b/electron/plugins/controllers/workflow-controller.ts
+new file mode 100644
+index 0000000..573d252
+--- /dev/null
++++ b/electron/plugins/controllers/workflow-controller.ts
+@@ -0,0 +1,180 @@
++import { ApiContext, BaseApiController } from './api-context';
++import { WorkflowEngine } from '../workflow-engine';
++import { SharedContextStore } from '../shared-context-store';
++import { WorkflowDefinition, ContextOptions, WorkflowExecutionContext } from '../workflow-types';
++import { WorkspaceController } from './workspace';
++import { WorkflowHistoryManager } from '../workflow-history-manager';
++import { WorkflowIntentRouter } from '../workflow-intent-router';
++import { WorkflowScheduler } from '../workflow-scheduler';
++
++export class WorkflowController extends BaseApiController {
++  private workspaceCtrl = new WorkspaceController();
++
++  // ── workflow namespace ──
++
++  async workflow_register(def: WorkflowDefinition, context: ApiContext): Promise<null> {
++    const fullDef: WorkflowDefinition = {
++      ...def,
++      pluginId: context.pluginId,
++    };
++    WorkflowEngine.getInstance().register(fullDef);
++    WorkflowHistoryManager.getInstance().saveSnapshot(fullDef);
++
++    import('../../services/fulltext-index-manager.js').then(({ FullTextIndexManager }) => {
++      FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
++    }).catch(console.error);
++
++    return null;
++  }
++
++  async workflow_execute(
++    workflowId: string,
++    input: Record<string, unknown>,
++    triggerType?: WorkflowExecutionContext['triggerType'],
++    context?: ApiContext
++  ): Promise<unknown> {
++    return WorkflowEngine.getInstance().execute(
++      workflowId,
++      input || {},
++      triggerType || 'manual'
++    );
++  }
++
++  async workflow_list(pluginId?: string, context?: ApiContext): Promise<WorkflowDefinition[]> {
++    const targetPluginId = pluginId || context?.pluginId;
++    return WorkflowEngine.getInstance().list(targetPluginId);
++  }
++
++  async workflow_get(workflowId: string): Promise<WorkflowDefinition | null> {
++    return WorkflowEngine.getInstance().get(workflowId) || null;
++  }
++
++  async workflow_unregister(workflowId: string, context: ApiContext): Promise<boolean> {
++    const ok = WorkflowEngine.getInstance().unregister(workflowId, context.pluginId);
++    if (ok) {
++      import('../../services/fulltext-index-manager.js').then(({ FullTextIndexManager }) => {
++        FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
++      }).catch(console.error);
++    }
++    return ok;
++  }
++
++  async workflow_cancel(runId: string): Promise<boolean> {
++    return WorkflowEngine.getInstance().cancel(runId);
++  }
++
++  async workflow_pause(runId: string): Promise<boolean> {
++    return WorkflowEngine.getInstance().pause(runId);
++  }
++
++  async workflow_resume(runId: string): Promise<boolean> {
++    return WorkflowEngine.getInstance().resume(runId);
++  }
++
++  async workflow_executeFrom(
++    workflowId: string,
++    fromStepId: string,
++    previousInput?: Record<string, unknown>
++  ): Promise<unknown> {
++    return WorkflowEngine.getInstance().executeFrom(workflowId, fromStepId, previousInput || {});
++  }
++
++  async workflow_getActiveRun(workflowId: string): Promise<unknown | null> {
++    return WorkflowEngine.getInstance().getActiveRun(workflowId);
++  }
++
++  async workflow_getRunStatus(runId: string): Promise<unknown> {
++    return WorkflowEngine.getInstance().getRunStatus(runId);
++  }
++
++  async workflow_listRecentRuns(workflowId?: string, limit?: number): Promise<unknown[]> {
++    return WorkflowEngine.getInstance().listRecentRuns(workflowId, limit || 20);
++  }
++
++  async workflow_matchIntent(userQuery: string): Promise<unknown> {
++    return WorkflowIntentRouter.getInstance().matchIntent(userQuery);
++  }
++
++  async workflow_getHistory(workflowId: string): Promise<unknown[]> {
++    return WorkflowHistoryManager.getInstance().listSnapshots(workflowId);
++  }
++
++  async workflow_deleteRun(runId: string): Promise<boolean> {
++    return WorkflowEngine.getInstance().deleteRun(runId);
++  }
++
++  async workflow_clearRuns(workflowId: string): Promise<boolean> {
++    return WorkflowEngine.getInstance().clearRuns(workflowId);
++  }
++
++  async workflow_deleteSnapshot(args: { workflowId: string; timestamp: number }): Promise<boolean> {
++    return WorkflowHistoryManager.getInstance().deleteSnapshot(args.workflowId, args.timestamp);
++  }
++
++  async workflow_clearSnapshots(workflowId: string): Promise<boolean> {
++    return WorkflowHistoryManager.getInstance().clearSnapshots(workflowId);
++  }
++
++  async workflow_listAll(): Promise<WorkflowDefinition[]> {
++    return WorkflowEngine.getInstance().list();
++  }
++
++  // ── Scheduler API ──
++  async workflow_schedulerEnable(workflowId: string): Promise<boolean> {
++    return WorkflowScheduler.getInstance().enable(workflowId);
++  }
++
++  async workflow_schedulerDisable(workflowId: string): Promise<boolean> {
++    return WorkflowScheduler.getInstance().disable(workflowId);
++  }
++
++  async workflow_schedulerGetNextRun(workflowId: string): Promise<number | null> {
++    return WorkflowScheduler.getInstance().getNextRunTime(workflowId);
++  }
++
++  // ── context namespace (共享上下文存储) ──
++
++  async context_set(
++    key: string,
++    value: unknown,
++    options?: ContextOptions,
++    context?: ApiContext
++  ): Promise<null> {
++    await SharedContextStore.getInstance().set(
++      key,
++      value,
++      options,
++      context?.pluginId
++    );
++    return null;
++  }
++
++  async context_get(
++    key: string,
++    options?: ContextOptions
++  ): Promise<unknown> {
++    return SharedContextStore.getInstance().get(key, options);
++  }
++
++  async context_list(
++    options?: ContextOptions
++  ): Promise<string[]> {
++    return SharedContextStore.getInstance().list(options);
++  }
++
++  async context_clear(
++    options?: ContextOptions
++  ): Promise<null> {
++    await SharedContextStore.getInstance().clear(options);
++    return null;
++  }
++
++  // ── 保留原 context namespace 方法 (委托至 WorkspaceController) ──
++  async context_getSelection(): Promise<unknown> {
++    return this.workspaceCtrl.context_getSelection();
++  }
++
++  async context_getActiveApp(): Promise<unknown> {
++    return this.workspaceCtrl.context_getActiveApp();
++  }
++}

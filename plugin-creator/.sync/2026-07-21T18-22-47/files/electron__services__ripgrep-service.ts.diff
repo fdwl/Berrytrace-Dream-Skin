@@ -1,0 +1,49 @@
+diff --git a/electron/services/ripgrep-service.ts b/electron/services/ripgrep-service.ts
+index 10849c4..6a96ec2 100644
+--- a/electron/services/ripgrep-service.ts
++++ b/electron/services/ripgrep-service.ts
+@@ -198,4 +198,44 @@ export class RipgrepService {
+       })
+     })
+   }
++
++  /**
++   * 使用 ripgrep 极速查找指定路径下所有的 .workflow 文件 (毫秒级 Rust 引擎)
++   */
++  public async findWorkflowFiles(targetPath: string): Promise<string[]> {
++    console.log(`[RipgrepService:findWorkflowFiles] 极速检索 .workflow 文件，目标: "${targetPath}"`)
++    if (!targetPath || !fs.existsSync(targetPath)) return []
++
++    const defaultIgnores = ['.git', 'node_modules', 'dist', 'build', '.DS_Store']
++    const ignoreArgs: string[] = []
++    for (const dir of defaultIgnores) {
++      ignoreArgs.push('-g', `!**/${dir}/**`)
++    }
++
++    const args = [
++      '--files',
++      '-g', '*.workflow',
++      ...ignoreArgs,
++      targetPath
++    ]
++
++    return new Promise((resolve) => {
++      const child = spawn(this.resolvedRgPath, args)
++      let stdoutData = ''
++      child.stdout.on('data', (chunk) => {
++        stdoutData += chunk.toString()
++      })
++      child.on('close', () => {
++        const lines = stdoutData.split('\n')
++          .map(l => l.trim())
++          .filter(Boolean)
++        console.log(`[RipgrepService:findWorkflowFiles] ripgrep 检索完成，找到 ${lines.length} 个 .workflow 文件:`, lines)
++        resolve(lines)
++      })
++      child.on('error', (err) => {
++        console.error('[RipgrepService:findWorkflowFiles] Failed to spawn rg process:', err)
++        resolve([])
++      })
++    })
++  }
+ }

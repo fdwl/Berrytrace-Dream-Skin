@@ -1,0 +1,12 @@
+diff --git a/electron/services/protocol-handler.ts b/electron/services/protocol-handler.ts
+index c2c2dd0..a759bf5 100644
+--- a/electron/services/protocol-handler.ts
++++ b/electron/services/protocol-handler.ts
+@@ -196,7 +196,7 @@ export async function handleProtocolUrl(urlStr: string) {
+           .substring(0, 50)
+         const timestamp = new Date()
+           .toISOString()
+-          .replace(/[-:T]/g, '')
++          .replace(new RegExp('[' + '-:T' + ']', 'g'), '')
+           .substring(0, 14)
+         const fileName = `${timestamp}_${firstLine || 'clipping'}.md`

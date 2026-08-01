@@ -1,0 +1,68 @@
+diff --git a/electron/plugins/plugin-pool-host.js b/electron/plugins/plugin-pool-host.js
+index 6f22c44..5478bae 100644
+--- a/electron/plugins/plugin-pool-host.js
++++ b/electron/plugins/plugin-pool-host.js
+@@ -81,7 +81,7 @@ const poolRouter = {
+       loadedPlugins.set(pluginId, entry);
+     }
+     entry.messageHandlers.add(handler);
+-    console.log(`[PoolHost] SDK registered for "${pluginId}" (${entry.messageHandlers.size} handlers)`);
++    console.debug(`[PoolHost] SDK registered for "${pluginId}" (${entry.messageHandlers.size} handlers)`);
+   },
+ };
+ 
+@@ -157,27 +157,22 @@ onMessageFromMain(async (event) => {
+   }
+ 
+   // ── 广播消息（无 targetPluginId，如 sdk:events:on）────────────────────
+-  // 分发给所有已加载插件的 handler，SDK 内部按 targetPluginId 过滤会跳过不匹配的
++  // 并行分发给所有已加载插件的 handler，避免一个慢插件阻塞其余插件响应。
+   const broadcastStart = Date.now();
+-  let totalHandlers = 0;
++  const broadcastPromises = [];
+   for (const [pid, entry] of loadedPlugins) {
+     for (const handler of entry.messageHandlers) {
+-      totalHandlers++;
+-      try {
+-        const handlerStart = Date.now();
+-        await handler(event);
+-        const elapsed = Date.now() - handlerStart;
+-        if (elapsed > 1000) {
+-          console.warn(`[PoolHost:diag] SLOW broadcast handler for "${pid}" msgType="${msg.type}" elapsed=${elapsed}ms`);
+-        }
+-      } catch (err) {
+-        console.error(`[PoolHost] Broadcast handler error for "${pid}":`, err);
+-      }
++      broadcastPromises.push(
++        Promise.resolve().then(() => handler(event)).catch(err => {
++          console.error(`[PoolHost] Broadcast handler error for "${pid}":`, err);
++        })
++      );
+     }
+   }
++  await Promise.all(broadcastPromises);
+   const broadcastElapsed = Date.now() - broadcastStart;
+   if (broadcastElapsed > 2000) {
+-    console.warn(`[PoolHost:diag] SLOW broadcast processing: msgType="${msg.type}" handlers=${totalHandlers} elapsed=${broadcastElapsed}ms (may have delayed API responses)`);
++    console.warn(`[PoolHost:diag] SLOW broadcast processing: msgType="${msg.type}" handlers=${broadcastPromises.length} elapsed=${broadcastElapsed}ms (may have delayed API responses)`);
+   }
+ });
+ 
+@@ -198,7 +193,7 @@ async function loadPlugin(pluginId, pluginPath, mainFile) {
+   loadedPlugins.get(pluginId).pluginPath = pluginPath;
+ 
+   const fullPath = require('path').join(pluginPath, mainFile || 'dist/index.js');
+-  console.log(`[PoolHost] Loading plugin "${pluginId}" from ${fullPath}`);
++  console.debug(`[PoolHost] Loading plugin "${pluginId}" from ${fullPath}`);
+ 
+   try {
+     // import() 触发插件模块执行：
+@@ -208,7 +203,7 @@ async function loadPlugin(pluginId, pluginPath, mainFile) {
+     const mod = await import(fileUrl);
+     const entry = loadedPlugins.get(pluginId);
+     entry.module = mod;
+-    console.log(`[PoolHost] Plugin "${pluginId}" loaded and activated (${entry.messageHandlers.size} SDK handlers)`);
++    console.debug(`[PoolHost] Plugin "${pluginId}" loaded and activated (${entry.messageHandlers.size} SDK handlers)`);
+     sendToMain({ type: 'pool:loaded', pluginId, success: true });
+   } catch (err) {
+     console.error(`[PoolHost] Failed to load plugin "${pluginId}":`, err);

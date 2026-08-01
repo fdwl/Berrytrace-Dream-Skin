@@ -1,0 +1,21 @@
+diff --git a/electron/plugins/controllers/ai.ts b/electron/plugins/controllers/ai.ts
+index 6fbd647..f26686a 100644
+--- a/electron/plugins/controllers/ai.ts
++++ b/electron/plugins/controllers/ai.ts
+@@ -190,7 +190,15 @@ export class AiController extends BaseApiController {
+     let llmConfig = options.llmConfig;
+     let availableConfigs = (options as any).availableConfigs;
+ 
+-    console.log('[AiController] Received — llmConfig:', JSON.stringify(llmConfig));
++    if (llmConfig) {
++      const masked = {
++        ...llmConfig,
++        apiKey: llmConfig.apiKey ? (llmConfig.apiKey.length > 8 ? `${llmConfig.apiKey.slice(0, 4)}...${llmConfig.apiKey.slice(-4)}` : '***') : undefined
++      };
++      console.log('[AiController] Received — llmConfig:', JSON.stringify(masked));
++    } else {
++      console.log('[AiController] Received — llmConfig: (none, resolving default)');
++    }
+ 
+     if (!llmConfig) {
+       const mainWindow = ElectronMainWindow.getInstance().getWindow();

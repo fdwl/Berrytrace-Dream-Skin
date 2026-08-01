@@ -1,0 +1,23 @@
+diff --git a/electron/services/db-manager.ts b/electron/services/db-manager.ts
+index 1b8a8ee..7d1594c 100644
+--- a/electron/services/db-manager.ts
++++ b/electron/services/db-manager.ts
+@@ -13,7 +13,7 @@ async function getWordsModule() {
+   return _wordsModule
+ }
+ import { WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME } from '../../src/config/constants'
+-import { GLOBAL_MIGRATIONS, WORKSPACE_MIGRATIONS, runMigrations, createGlobalTables } from './db-migrations'
++import { GLOBAL_MIGRATIONS, WORKSPACE_MIGRATIONS, runMigrations, createGlobalTables, createWorkspaceTables } from './db-migrations'
+ 
+ const __filename = fileURLToPath(import.meta.url)
+ const __dirname = dirname(__filename)
+@@ -147,7 +147,8 @@ export class DatabaseManager {
+     this.loadVecExtension(db)
+ 
+     // 运行 workspace 数据库迁移
+-    runMigrations(db, WORKSPACE_MIGRATIONS, 'DbChatSession')
++    createWorkspaceTables(db)
++    runMigrations(db, WORKSPACE_MIGRATIONS, 'FtsFileIndex')
+ 
+     // 缓存
+     this.workspaceDBs.set(workspacePath, { db, path: dbPath })

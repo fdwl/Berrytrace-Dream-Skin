@@ -1,0 +1,301 @@
+diff --git a/electron/plugins/plugin-ipc.ts b/electron/plugins/plugin-ipc.ts
+index 48b2ba4..f4fd543 100644
+--- a/electron/plugins/plugin-ipc.ts
++++ b/electron/plugins/plugin-ipc.ts
+@@ -7,7 +7,7 @@ import { PluginUpdater } from './plugin-update';
+ import { verifyPackage, confirmInstallPackage } from './plugin-install';
+ import { dispatchPluginApiCall } from './api-dispatcher';
+ import { SignatureJson } from './signature-verifier';
+-import { join } from 'path';
++import path, { join } from 'path';
+ import { promises as fs } from 'fs';
+ import * as fsSync from 'fs';
+ import { spawn } from 'child_process';
+@@ -70,6 +70,287 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     }
+   );
+ 
++  // 辅助函数：校验文件路径是否在允许的工作区或系统持久化数据目录下
++  const isPathAllowed = (filePath: string): boolean => {
++    try {
++      const resolved = path.resolve(filePath);
++      const { WorkspaceManager, getDefaultWorkspacePath } = require('../services/workspace-manager');
++      const wsRoot = WorkspaceManager.getInstance().getPath() || getDefaultWorkspacePath();
++      const resolvedWs = path.resolve(wsRoot);
++      const homeDir = process.env.HOME || process.env.USERPROFILE || '';
++      const berrytraceHome = path.join(homeDir, '.berrytrace');
++      return resolved.startsWith(resolvedWs) || resolved.startsWith(berrytraceHome) || resolved.startsWith('/tmp');
++    } catch {
++      return true;
++    }
++  };
++
++  // 注册一等公民内置宿主 MCP 工具：图片 OCR
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'read_image_ocr',
++      description: '读取图片文件并使用 PaddleOCR ONNX 引擎执行文字识别，提取图片中的文本内容（支持 .png, .jpg, .jpeg, .webp, .bmp, .tiff, .gif）',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          filePath: {
++            type: 'string',
++            description: '图片文件的绝对物理路径'
++          }
++        },
++        required: ['filePath']
++      }
++    },
++    async (args) => {
++      const rawPath = args?.filePath;
++      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
++        return { error: 'filePath parameter is required and must be a non-empty string' };
++      }
++      const filePath = path.resolve(rawPath.trim());
++      if (!isPathAllowed(filePath)) {
++        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
++      }
++      try {
++        const { parseImageOcr } = await import('../services/ocr-image-parser');
++        const text = await parseImageOcr(filePath);
++        return { text, filePath };
++      } catch (err: any) {
++        return { error: err.message || String(err), filePath };
++      }
++    }
++  );
++
++  // 注册一等公民内置宿主 MCP 工具：Office 文档解析
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'read_office_document',
++      description: '读取并提取 Office 文档中的纯文本内容（支持 .pptx, .xlsx, .xls, .docx；旧版 .doc/.ppt 采用降级匹配）',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          filePath: {
++            type: 'string',
++            description: 'Office 文档文件的绝对物理路径'
++          }
++        },
++        required: ['filePath']
++      }
++    },
++    async (args) => {
++      const rawPath = args?.filePath;
++      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
++        return { error: 'filePath parameter is required and must be a non-empty string' };
++      }
++      const filePath = path.resolve(rawPath.trim());
++      if (!isPathAllowed(filePath)) {
++        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
++      }
++      try {
++        const stats = await fs.promises.stat(filePath).catch(() => null);
++        if (stats && stats.size > 50 * 1024 * 1024) {
++          return { error: `Office document too large (${(stats.size / 1024 / 1024).toFixed(2)}MB > 50MB). Please use 'read_document_outline' for structure.`, filePath };
++        }
++        const { extractFileContent } = await import('../services/fulltext-file-parsers');
++        const ext = path.extname(filePath) || '';
++        const text = await extractFileContent(filePath, ext);
++        return { text, filePath };
++      } catch (err: any) {
++        return { error: err.message || String(err), filePath };
++      }
++    }
++  );
++
++  // 注册一等公民内置宿主 MCP 工具：PDF 电子书/文档解析 (支持按页码范围读取)
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'read_pdf_document',
++      description: '读取并提取 PDF 电子书或文档中的纯文本内容，支持指定页码范围（startPage - endPage，未指定 endPage 时默认读取 startPage 起始的 10 页）',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          filePath: {
++            type: 'string',
++            description: 'PDF 文件的绝对物理路径'
++          },
++          startPage: {
++            type: 'number',
++            description: '起始页码（1-indexed，默认 1）'
++          },
++          endPage: {
++            type: 'number',
++            description: '结束页码（包含，可选；若未提供则默认读取 10 页）'
++          }
++        },
++        required: ['filePath']
++      }
++    },
++    async (args) => {
++      const rawPath = args?.filePath;
++      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
++        return { error: 'filePath parameter is required and must be a non-empty string' };
++      }
++      const filePath = path.resolve(rawPath.trim());
++      if (!isPathAllowed(filePath)) {
++        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
++      }
++      const startPage = typeof args.startPage === 'number' && args.startPage > 0 ? Math.floor(args.startPage) : 1;
++      const endPage = typeof args.endPage === 'number' && args.endPage >= startPage ? Math.floor(args.endPage) : undefined;
++      try {
++        const { parsePdfPageRange } = await import('../services/fulltext-file-parsers');
++        const res = await parsePdfPageRange(filePath, startPage, endPage);
++        return { ...res, filePath };
++      } catch (err: any) {
++        return { error: err.message || String(err), filePath };
++      }
++    }
++  );
++
++  // 注册一等公民内置宿主 MCP 工具：提炼文档大纲与目录结构
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'read_document_outline',
++      description: '提取文档的目录大纲、书签与结构概览（支持 PDF 书签目录、DOCX/MD 标题大纲、XLSX 表格清单等）',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          filePath: {
++            type: 'string',
++            description: '目标文档的绝对物理路径'
++          }
++        },
++        required: ['filePath']
++      }
++    },
++    async (args) => {
++      const rawPath = args?.filePath;
++      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
++        return { error: 'filePath parameter is required and must be a non-empty string' };
++      }
++      const filePath = path.resolve(rawPath.trim());
++      if (!isPathAllowed(filePath)) {
++        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
++      }
++      try {
++        const { extractDocumentOutline } = await import('../services/fulltext-file-parsers');
++        const res = await extractDocumentOutline(filePath);
++        return typeof res === 'object' && res !== null ? { ...res, filePath } : { outline: res, filePath };
++      } catch (err: any) {
++        return { error: err.message || String(err), filePath };
++      }
++    }
++  );
++
++  // 注册一等公民内置宿主 MCP 工具：注册定时与自动唤醒任务
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'schedule_task_register',
++      description: '注册定时自动任务或每日首次打开任务。支持由 AI Agent 自动思考执行（提供 prompt 参数）或触发系统终端命令（提供 command 参数）。',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          id: {
++            type: 'string',
++            description: '任务唯一标识符，例如 daily-ai-news'
++          },
++          cron: {
++            type: 'string',
++            description: '定时表达式。支持标准 5 段式 cron (如 "0 8 * * *" 每天 8 点)，或特殊关键字 "first-open"（每天用户第一次打开 App 时激活一次 Agent 任务）'
++          },
++          prompt: {
++            type: 'string',
++            description: '自动任务要让 Agent 执行的自然语言 Prompt（例如 "帮我收集 10 条 AI Agent 相关新闻并整理"）'
++          },
++          command: {
++            type: 'string',
++            description: '系统终端 Shell 命令（可选，如 "npm run lint"）'
++          },
++          intervalMs: {
++            type: 'number',
++            description: '间隔触发的毫秒数（可选，如 3600000 表示每小时）'
++          },
++          workDir: {
++            type: 'string',
++            description: '任务执行的目标工作区目录路径（可选，默认使用当前活动工作区）'
++          }
++        },
++        required: ['id']
++      }
++    },
++    async (args) => {
++      try {
++        const { PluginScheduler } = await import('./scheduler');
++        const { WorkspaceManager, getDefaultWorkspacePath } = await import('../services/workspace-manager');
++        const workDir = (args.workDir as string) || WorkspaceManager.getInstance().getPath() || getDefaultWorkspacePath();
++
++        await PluginScheduler.getInstance().register('agent-schedule', {
++          id: args.id as string,
++          cron: args.cron as string | undefined,
++          prompt: args.prompt as string | undefined,
++          command: args.command as string | undefined,
++          intervalMs: typeof args.intervalMs === 'number' ? args.intervalMs : undefined,
++          cwd: workDir,
++        });
++
++        return {
++          success: true,
++          message: `Successfully registered scheduled task "${args.id}" (cron: ${args.cron || 'N/A'}, prompt: ${args.prompt ? 'yes' : 'no'})`
++        };
++      } catch (err: any) {
++        return { success: false, error: err.message || String(err) };
++      }
++    }
++  );
++
++  // 注册一等公民内置宿主 MCP 工具：列出当前所有定时任务
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'schedule_task_list',
++      description: '列出当前系统与工作区中所有已注册的定时/自动唤醒任务清单及状态',
++      inputSchema: {
++        type: 'object',
++        properties: {},
++        required: []
++      }
++    },
++    async () => {
++      try {
++        const { PluginScheduler } = await import('./scheduler');
++        const tasks = PluginScheduler.getInstance().list();
++        return { success: true, tasks };
++      } catch (err: any) {
++        return { success: false, error: err.message || String(err) };
++      }
++    }
++  );
++
++  // 注册一等公民内置宿主 MCP 工具：注销定时任务
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'schedule_task_unregister',
++      description: '取消或注销指定的定时/自动唤醒任务',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          id: {
++            type: 'string',
++            description: '要注销的任务 ID'
++          }
++        },
++        required: ['id']
++      }
++    },
++    async (args) => {
++      try {
++        const { PluginScheduler } = await import('./scheduler');
++        await PluginScheduler.getInstance().unregister('agent-schedule', args.id as string);
++        await PluginScheduler.getInstance().unregister('workspace-schedule', args.id as string);
++        return { success: true, message: `Successfully unregistered scheduled task "${args.id}"` };
++      } catch (err: any) {
++        return { success: false, error: err.message || String(err) };
++      }
++    }
++  );
++
+   ipcMain.handle('plugins:get-list', async (event) => {
+     await pm.init();
+     const enabledList = cache.get(CacheAttribute.prefEnabledPlugins) as string[] | undefined;

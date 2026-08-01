@@ -1,0 +1,12 @@
+diff --git a/plugins-sdk/tsconfig.json b/plugins-sdk/tsconfig.json
+index 89499af..b96445a 100644
+--- a/plugins-sdk/tsconfig.json
++++ b/plugins-sdk/tsconfig.json
+@@ -5,6 +5,7 @@
+     "moduleResolution": "NodeNext",
+     "strict": true,
+     "skipLibCheck": true,
++    "experimentalDecorators": true,
+     "declaration": true,
+     "types": ["node", "react"]
+   },

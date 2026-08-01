@@ -1,0 +1,118 @@
+diff --git a/electron/plugins/plugin-ipc.ts b/electron/plugins/plugin-ipc.ts
+index f4fd543..1b4cb26 100644
+--- a/electron/plugins/plugin-ipc.ts
++++ b/electron/plugins/plugin-ipc.ts
+@@ -146,7 +146,7 @@ export function registerIpcHandlers(pm: PluginManager): void {
+         return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
+       }
+       try {
+-        const stats = await fs.promises.stat(filePath).catch(() => null);
++        const stats = await fs.stat(filePath).catch(() => null);
+         if (stats && stats.size > 50 * 1024 * 1024) {
+           return { error: `Office document too large (${(stats.size / 1024 / 1024).toFixed(2)}MB > 50MB). Please use 'read_document_outline' for structure.`, filePath };
+         }
+@@ -918,6 +918,104 @@ export function registerIpcHandlers(pm: PluginManager): void {
+ 
+   ipcMain.on('agent:dispatch-task', async (_event, payload: any) => {
+     try {
++      const { WorkflowIntentRouter } = await import('./workflow-intent-router');
++      const intentResult = WorkflowIntentRouter.getInstance().matchIntent(payload.task);
++      if (intentResult.matched && intentResult.workflowId) {
++        console.log(`[plugin-ipc] Intent matched workflow: ${intentResult.workflowId}. Routing dispatch to workflow execution.`);
++
++        const broadcast = (stepUpdate: any) => {
++          BrowserWindow.getAllWindows().forEach((win) => {
++            if (!win.isDestroyed()) {
++              win.webContents.send('plugin:event:agent:step_update', stepUpdate);
++            }
++          });
++        };
++
++        // 1. 发送开始事件
++        broadcast({
++          sessionId: payload.sessionId,
++          turnId: payload.turnId,
++          status: 'started',
++          currentStep: 0,
++          message: `🔍 已识别到匹配的工作流: "${intentResult.workflowName || intentResult.workflowId}"。准备执行...`
++        });
++
++        // 2. 监听本地进展并桥接
++        const { WorkflowEngine } = await import('./workflow-engine');
++        const progressHandler = (progressPayload: any) => {
++          if (!progressPayload || progressPayload.workflowId !== intentResult.workflowId) return;
++
++          let agentStatus: any = 'running';
++          let message = '';
++          let toolName = undefined;
++          let toolDisplayName = undefined;
++
++          switch (progressPayload.event) {
++            case 'workflow_started':
++              agentStatus = 'thinking';
++              message = `🚀 启动工作流「${intentResult.workflowName || intentResult.workflowId}」...`;
++              break;
++            case 'step_started':
++              agentStatus = 'calling_tool';
++              toolName = progressPayload.stepId || '';
++              toolDisplayName = progressPayload.stepName || toolName;
++              message = `⏳ 正在执行步骤: ${toolDisplayName}`;
++              break;
++            case 'step_success':
++              agentStatus = 'tool_result';
++              toolName = progressPayload.stepId || '';
++              toolDisplayName = progressPayload.stepName || toolName;
++              message = `✅ 步骤 "${toolDisplayName}" 执行成功（耗时 ${progressPayload.durationMs}ms）。`;
++              break;
++            case 'step_failed':
++              agentStatus = 'error';
++              toolName = progressPayload.stepId || '';
++              toolDisplayName = progressPayload.stepName || toolName;
++              message = `❌ 步骤 "${toolDisplayName}" 执行失败: ${progressPayload.error}`;
++              break;
++            case 'workflow_completed':
++              agentStatus = progressPayload.success ? 'completed' : 'error';
++              message = progressPayload.success 
++                ? `🏁 工作流执行成功！总耗时 ${progressPayload.totalDurationMs}ms。`
++                : `🏁 工作流执行失败: ${progressPayload.error}`;
++              
++              // 移除监听器
++              process.nextTick(() => {
++                WorkflowEngine.getInstance().removeListener('step-progress', progressHandler);
++              });
++              break;
++          }
++
++          broadcast({
++            sessionId: payload.sessionId,
++            turnId: payload.turnId,
++            status: agentStatus,
++            currentStep: (progressPayload.stepIndex ?? 0) + 1,
++            totalSteps: progressPayload.totalSteps,
++            toolName,
++            toolDisplayName,
++            message,
++          });
++        };
++
++        WorkflowEngine.getInstance().on('step-progress', progressHandler);
++
++        // 3. 执行工作流
++        WorkflowEngine.getInstance().execute(intentResult.workflowId, intentResult.extractedParams || {}, 'direct').catch(err => {
++          console.error('[plugin-ipc] Failed to execute matched workflow:', err);
++          broadcast({
++            sessionId: payload.sessionId,
++            turnId: payload.turnId,
++            status: 'error',
++            currentStep: 0,
++            message: `❌ 执行工作流失败: ${err?.message || err}`
++          });
++          WorkflowEngine.getInstance().removeListener('step-progress', progressHandler);
++        });
++
++        return;
++      }
++
+       const { ApiDispatcher } = await import('./api-dispatcher');
+       await ApiDispatcher.getInstance().dispatch(
+         'generic-ui',

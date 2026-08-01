@@ -1,0 +1,26 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md b/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md
+index 286a5ed..3d36eb1 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md
+@@ -167,6 +167,21 @@ banner: {
+ 
+ ---
+ 
++## 11. 报错 `You are calling ReactDOMClient.createRoot() on a container that has already been passed to createRoot() before`
++
++**现象**：
++控制台打印红标报错：
++`You are calling ReactDOMClient.createRoot() on a container that has already been passed to createRoot() before. Instead, call root.render() on the existing root instead if you want to update it.`
++
++**原因**：
++视图在卸载与重新挂载、热重载或宿主多次调用 `onOpen` 时，试图在已被 React 18 绑定过 `__reactContainer$` 的同一个 DOM 容器元素上再次执行 `createRoot(this.container)`。
++
++**修复方案**：
++1. **宿主隔离**：宿主挂载 View 前，先在 DOM `ref` 中创建一个全新的 `document.createElement('div')` 子节点传给 View 实例，卸载时整块 DOM 移除；
++2. **插件 View 隔离**：在插件 View 内部使用 `subContainer` 模式（参见 [04-plugin-types.md](./04-plugin-types.md) 的 DOM Sub-Container Pattern）。
++
++---
++
+ ## 快速诊断命令
+ 
+ ```

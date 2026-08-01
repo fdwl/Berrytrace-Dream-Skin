@@ -1,0 +1,184 @@
+diff --git a/electron/plugins/plugin-isolation-policy.ts b/electron/plugins/plugin-isolation-policy.ts
+index 532af8c..d4571af 100644
+--- a/electron/plugins/plugin-isolation-policy.ts
++++ b/electron/plugins/plugin-isolation-policy.ts
+@@ -1,47 +1,20 @@
+ /**
+- * PluginIsolationPolicy — 进程隔离动态降级/提升策略
++ * PluginIsolationPolicy — 进程隔离策略（简化版）
+  *
+- * 根据系统内存压力和插件稳定性，动态调整 recommended 插件的进程类型：
+- * - 正常状态：recommended → 独立进程（utilityProcess）
+- * - 低内存状态：recommended → 降级到 C 池（共享 Host 进程）
+- * - 不稳定状态（optional 插件频繁崩溃）：提升到独立进程
++ * 静态映射，不做运行时动态降级/提升：
++ * - required   → 独立进程（强制隔离）
++ * - recommended → 独立进程（默认隔离）
++ * - optional   → 共享池（节省内存）
+  *
+- * 策略状态机：纯 TypeScript 类，不依赖 React/UI 层。
+- * PluginManager/PluginLauncher 读取策略决策，不反向驱动。
+- *
+- * @see docs/plugin-process-isolation-analysis.md 6.2.2 / 风险评估表
++ * 不稳定插件（频繁崩溃）由 PluginWatchdog 负责重启/禁用，
++ * 不在运行时切换进程模型。
+  */
+ 
+-import { PluginWatchdog } from './plugin-watchdog';
+-
+ export type IsolationDecision = 'standalone' | 'pooled';
+ 
+-interface PluginStabilityRecord {
+-  /** 近期崩溃次数（由看门狗重启计数代理） */
+-  crashCount: number;
+-  /** 最后一次崩溃时间戳 */
+-  lastCrashAt: number;
+-}
+-
+ export class PluginIsolationPolicy {
+   private static instance: PluginIsolationPolicy;
+ 
+-  /** 各插件的稳定性记录 */
+-  private stability = new Map<string, PluginStabilityRecord>();
+-
+-  /** 内存压力阈值：系统可用内存低于此值时触发降级（MB） */
+-  private readonly LOW_MEMORY_THRESHOLD_MB = 512;
+-  /** optional 插件崩溃次数超过此值时提升到独立进程 */
+-  private readonly INSTABILITY_CRASH_THRESHOLD = 2;
+-  /** 不稳定判定时间窗口（5 分钟内的崩溃计入） */
+-  private readonly INSTABILITY_WINDOW_MS = 5 * 60 * 1000;
+-  /** 降级检查间隔 */
+-  private readonly CHECK_INTERVAL_MS = 60_000;
+-
+-  private checkTimer: NodeJS.Timeout | null = null;
+-  /** 当前是否处于低内存降级模式 */
+-  private isLowMemoryMode = false;
+-
+   private constructor() {}
+ 
+   public static getInstance(): PluginIsolationPolicy {
+@@ -51,121 +24,15 @@ export class PluginIsolationPolicy {
+     return PluginIsolationPolicy.instance;
+   }
+ 
+-  /**
+-   * 启动策略定时检查（每 60s 检查一次内存压力）。
+-   */
+-  public start(): void {
+-    if (this.checkTimer) return;
+-    this.checkTimer = setInterval(() => this.checkMemoryPressure(), this.CHECK_INTERVAL_MS);
+-    if (this.checkTimer.unref) this.checkTimer.unref();
+-    console.log('[IsolationPolicy] Started, checking memory pressure every 60s');
+-  }
+-
+-  public stop(): void {
+-    if (this.checkTimer) {
+-      clearInterval(this.checkTimer);
+-      this.checkTimer = null;
+-    }
+-  }
+-
+   /**
+    * 决策插件应使用的进程类型。
+-   * PluginLauncher.startBackgroundPlugin 在创建进程前调用此方法。
+    *
+-   * 注意：决策仅在插件启动/重启时生效。已运行的插件不会因内存压力变化而实时迁移
+-   * （live migration 未实现）。recommended 插件在低内存模式下的降级会在其下次启动时生效。
+-   *
+-   * @param pluginId 插件 ID
++   * @param pluginId 插件 ID（保留参数，供日志使用）
+    * @param declared 插件声明的 processIsolation 等级
+    * @returns 'standalone'（独立进程）或 'pooled'（共享池）
+    */
+   public decide(pluginId: string, declared: 'required' | 'recommended' | 'optional'): IsolationDecision {
+-    // required 永远独立进程
+-    if (declared === 'required') return 'standalone';
+-
+-    const record = this.stability.get(pluginId);
+-
+-    // optional 插件不稳定时提升到独立进程
+-    if (declared === 'optional' && record && this.isUnstable(pluginId)) {
+-      console.warn(`[IsolationPolicy] Promoting unstable optional plugin "${pluginId}" to standalone (crashes: ${record.crashCount})`);
+-      return 'standalone';
+-    }
+-
+-    // recommended 插件在低内存时降级到池
+-    if (declared === 'recommended' && this.isLowMemoryMode) {
+-      console.log(`[IsolationPolicy] Demoting recommended plugin "${pluginId}" to pool (low memory mode)`);
+-      return 'pooled';
+-    }
+-
+-    // 默认：required → standalone, recommended → standalone, optional → pooled
+-    return declared === 'optional' ? 'pooled' : 'standalone';
+-  }
+-
+-  /**
+-   * 记录插件崩溃事件（由看门狗 handleCrash 调用）。
+-   */
+-  public recordCrash(pluginId: string): void {
+-    const now = Date.now();
+-    const record = this.stability.get(pluginId);
+-    if (record) {
+-      // 清除窗口外的崩溃记录
+-      if (now - record.lastCrashAt > this.INSTABILITY_WINDOW_MS) {
+-        record.crashCount = 0;
+-      }
+-      record.crashCount++;
+-      record.lastCrashAt = now;
+-    } else {
+-      this.stability.set(pluginId, {
+-        crashCount: 1,
+-        lastCrashAt: now,
+-      });
+-    }
+-  }
+-
+-  /**
+-   * 插件稳定运行后重置崩溃计数（由看门狗稳定运行重置时调用）。
+-   */
+-  public resetStability(pluginId: string): void {
+-    const record = this.stability.get(pluginId);
+-    if (record) {
+-      record.crashCount = 0;
+-    }
+-  }
+-
+-  /** 当前是否处于低内存降级模式 */
+-  public get lowMemoryMode(): boolean {
+-    return this.isLowMemoryMode;
+-  }
+-
+-  // ─── 私有方法 ─────────────────────────────────────────────────────────────
+-
+-  /** 检查内存压力，切换低内存模式 */
+-  private checkMemoryPressure(): void {
+-    const mem = process.getSystemMemoryInfo();
+-    // Electron getSystemMemoryInfo() 返回 { total, free, swapTotal, swapFree }，单位 KB。
+-    // free 在某些平台上可能为 0 或 undefined，回退到 os.freemem()（返回 bytes）。
+-    let freeKB = mem.free ?? 0;
+-    if (freeKB === 0) {
+-      const os = require('os');
+-      freeKB = Math.round(os.freemem() / 1024);
+-    }
+-    const availableMB = freeKB / 1024;
+-
+-    if (!this.isLowMemoryMode && availableMB < this.LOW_MEMORY_THRESHOLD_MB) {
+-      this.isLowMemoryMode = true;
+-      console.warn(`[IsolationPolicy] Entering low-memory mode (available: ${Math.round(availableMB)}MB < ${this.LOW_MEMORY_THRESHOLD_MB}MB)`);
+-    } else if (this.isLowMemoryMode && availableMB > this.LOW_MEMORY_THRESHOLD_MB * 1.5) {
+-      this.isLowMemoryMode = false;
+-      console.log(`[IsolationPolicy] Exiting low-memory mode (available: ${Math.round(availableMB)}MB)`);
+-    }
+-  }
+-
+-  /** 判断插件是否不稳定（窗口内崩溃次数超阈值） */
+-  private isUnstable(pluginId: string): boolean {
+-    const record = this.stability.get(pluginId);
+-    if (!record) return false;
+-    const now = Date.now();
+-    if (now - record.lastCrashAt > this.INSTABILITY_WINDOW_MS) return false;
+-    return record.crashCount >= this.INSTABILITY_CRASH_THRESHOLD;
++    if (declared === 'optional') return 'pooled';
++    return 'standalone';
+   }
+ }

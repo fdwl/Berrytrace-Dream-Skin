@@ -1,0 +1,11 @@
+diff --git a/electron/plugins/shared-context-store.ts b/electron/plugins/shared-context-store.ts
+index ffe81b0..6f6692d 100644
+--- a/electron/plugins/shared-context-store.ts
++++ b/electron/plugins/shared-context-store.ts
+@@ -1,5 +1,5 @@
+ import Store from 'electron-store';
+-import { ContextEntry, ContextOptions } from './workflow-types';
++import type { ContextEntry, ContextOptions } from './workflow-types';
+ 
+ export class SharedContextStore {
+   private static instance: SharedContextStore | null = null;

@@ -1,0 +1,130 @@
+diff --git a/electron/services/pty/agent-title-detector.ts b/electron/services/pty/agent-title-detector.ts
+new file mode 100644
+index 0000000..5afc782
+--- /dev/null
++++ b/electron/services/pty/agent-title-detector.ts
+@@ -0,0 +1,124 @@
++/**
++ * Terminal Agent Title Status Detector
++ * Ported from Orca's src/shared/agent-title-status.ts, agent-title-core.ts, and osc-title-extraction.ts
++ *
++ * Extracts OSC 0 / 1 / 2 title sequences from raw PTY stream and classifies
++ * real-time AI Agent & CLI execution states (working, permission, idle).
++ */
++
++export type AgentTitleStatus = 'working' | 'permission' | 'idle' | null;
++
++const OSC_TITLE_COMMANDS = new Set([0x30, 0x31, 0x32]); // ASCII '0', '1', '2'
++const MAX_OSC_TITLE_CHARS = 1024;
++
++/**
++ * Extracts the last valid OSC 0, 1, or 2 title string from a PTY output chunk.
++ * Handles both BEL (\x07) and ST (\x1b\) terminators without regex overhead.
++ */
++export function extractLastOscTitle(data: string): string | null {
++  if (!data.includes('\x1b]')) {
++    return null;
++  }
++
++  let last: string | null = null;
++  let searchStart = 0;
++
++  while (searchStart < data.length) {
++    const start = data.indexOf('\x1b]', searchStart);
++    if (start === -1) break;
++
++    const cmdCode = data.charCodeAt(start + 2);
++    const semiCode = data.charCodeAt(start + 3);
++    if (!OSC_TITLE_COMMANDS.has(cmdCode) || semiCode !== 0x3b) { // 0x3b is ';'
++      searchStart = start + 1;
++      continue;
++    }
++
++    const titleStart = start + 4;
++    let foundTerminator = false;
++    for (let cursor = titleStart; cursor < data.length; cursor++) {
++      const code = data.charCodeAt(cursor);
++      if (code === 0x07) { // BEL
++        last = data.slice(titleStart, Math.min(cursor, titleStart + MAX_OSC_TITLE_CHARS));
++        searchStart = cursor + 1;
++        foundTerminator = true;
++        break;
++      }
++      if (code === 0x1b && data.charCodeAt(cursor + 1) === 0x5c) { // ST (\x1b\)
++        last = data.slice(titleStart, Math.min(cursor, titleStart + MAX_OSC_TITLE_CHARS));
++        searchStart = cursor + 2;
++        foundTerminator = true;
++        break;
++      }
++    }
++
++    if (!foundTerminator) {
++      break;
++    }
++  }
++
++  return last;
++}
++
++// Unicode Braille Spinner Range: \u2800 - \u28ff (used by Claude, Pi, Grok, OMP, Droid, etc.)
++const BRAILLE_SPINNER_RE = /[\u2800-\u28ff]/;
++
++// Gemini CLI Symbols
++const GEMINI_WORKING = '\u2726'; // ✦
++const GEMINI_SILENT_WORKING = '\u23f2'; // ⏲
++const GEMINI_IDLE = '\u25c7'; // ◇
++const GEMINI_PERMISSION = '\u270b'; // ✋
++
++// Claude / Generic Symbols
++const CLAUDE_IDLE = '\u2733'; // ✳
++
++const STRONG_IDLE_KEYWORDS = ['ready', 'idle', 'done'];
++const STRONG_WORKING_KEYWORDS = ['working', 'thinking', 'running'];
++
++// Boundary-aware regexes matching Orca's agent-title-core.ts to avoid false positives in paths
++const STRONG_IDLE_KEYWORDS_RE = new RegExp(
++  `(?<![\\w./\\\\-])(${STRONG_IDLE_KEYWORDS.join('|')})(?![\\w\\-])`,
++  'i'
++);
++const STRONG_WORKING_KEYWORDS_RE = new RegExp(
++  `(?<![\\w./\\\\-])(${STRONG_WORKING_KEYWORDS.join('|')})(?![\\w\\-])`,
++  'i'
++);
++
++/**
++ * Classifies an OSC terminal title into an Agent execution status.
++ */
++export function detectAgentStatusFromTitle(title: string): AgentTitleStatus {
++  if (!title) return null;
++  const trimmed = title.trim();
++  const lower = trimmed.toLowerCase();
++
++  // Filter management / static native titles
++  if (lower === 'cursor agent' || lower === 'claude agents') {
++    return null;
++  }
++
++  // 1. Gemini explicit symbols
++  if (title.includes(GEMINI_PERMISSION)) return 'permission';
++  if (title.includes(GEMINI_WORKING) || title.includes(GEMINI_SILENT_WORKING)) return 'working';
++  if (title.includes(GEMINI_IDLE)) return 'idle';
++
++  // 2. Claude idle symbol & Braille spinners
++  if (title.startsWith(`${CLAUDE_IDLE} `) || title === CLAUDE_IDLE) return 'idle';
++  if (BRAILLE_SPINNER_RE.test(title)) return 'working';
++
++  // 3. Permission / Action Required keywords
++  if (lower.includes('action required') || lower.includes('permission') || lower.includes('waiting')) {
++    return 'permission';
++  }
++
++  // 4. Boundary-aware strong status keywords
++  if (STRONG_IDLE_KEYWORDS_RE.test(title)) return 'idle';
++  if (STRONG_WORKING_KEYWORDS_RE.test(title)) return 'working';
++
++  // 5. Conventional prefix indicators
++  if (title.startsWith('. ')) return 'working';
++  if (title.startsWith('* ')) return 'idle';
++
++  return null;
++}

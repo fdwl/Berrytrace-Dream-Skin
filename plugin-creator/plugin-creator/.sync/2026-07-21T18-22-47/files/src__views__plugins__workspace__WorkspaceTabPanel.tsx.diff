@@ -1,0 +1,71 @@
+diff --git a/src/views/plugins/workspace/WorkspaceTabPanel.tsx b/src/views/plugins/workspace/WorkspaceTabPanel.tsx
+index 394da68..4d64320 100644
+--- a/src/views/plugins/workspace/WorkspaceTabPanel.tsx
++++ b/src/views/plugins/workspace/WorkspaceTabPanel.tsx
+@@ -7,6 +7,7 @@ import { useWorkspaceScanner } from '../../../layouts/hooks/useWorkspaceScanner'
+ import { WorkspaceVirtualList } from '../../../components/WorkspaceVirtualList';
+ import TerminalTabPanel from './TerminalTabPanel';
+ import BrowserTabPanel from './BrowserTabPanel';
++import { WorkflowInspectorView } from '../../workflow/WorkflowInspectorView';
+ 
+ interface PluginMetadata {
+   id: string;
+@@ -390,8 +391,9 @@ export default function WorkspaceTabPanel({
+             openFilePath: filePath || '',
+             articleId: articleId || '',
+             theme,
+-            sessionId
+-          })).catch((err: unknown) => {
++            sessionId,
++            customParams
++          } as any)).catch((err: unknown) => {
+             console.error(`[WorkspaceTabPanel] Error in view.onOpen for ${viewType}:`, err);
+           });
+           useWorkspaceStore.getState().setActiveView(tabId, activeViewRef.current);
+@@ -428,6 +430,15 @@ export default function WorkspaceTabPanel({
+     };
+   }, [pluginId, tabId]);
+ 
++  const isWorkflowFile = Boolean(filePath && (filePath.endsWith('.workflow') || filePath.endsWith('.btskill')));
++  if (isWorkflowFile) {
++    return (
++      <div className="flex-1 flex flex-col w-full h-full overflow-hidden bg-[var(--bg-page)] text-[var(--text-primary)]">
++        <WorkflowInspectorView filePath={filePath} />
++      </div>
++    );
++  }
++
+   if (pluginId === 'system.workspace-blank' || pluginId === 'system.unsupported-file') {
+     const isUnsupported = pluginId === 'system.unsupported-file';
+     const fileName = filePath ? filePath.split(/[/\\]/).pop() : '未命名文件';
+@@ -646,7 +657,9 @@ export default function WorkspaceTabPanel({
+                   onFileSelect={async (selectedPath) => {
+                     const ext = (selectedPath.split('.').pop() || '').toLowerCase().replace(/^\./, '');
+                     let pluginId = '';
+-                    if (window.electronAPI?.plugins?.getList) {
++                    if (ext === 'workflow') {
++                      pluginId = 'system.workflow-inspector';
++                    } else if (window.electronAPI?.plugins?.getList) {
+                       try {
+                         const list = await window.electronAPI.plugins.getList();
+                         const matching = list.find((p: any) =>
+@@ -702,7 +715,7 @@ export default function WorkspaceTabPanel({
+     );
+   }
+ 
+-  const isSystemPlugin = pluginId === 'system.terminal' || pluginId === 'system.browser';
++  const isSystemPlugin = pluginId === 'system.terminal' || pluginId === 'system.browser' || pluginId === 'system.workflow-inspector' || (filePath && (filePath.endsWith('.workflow') || filePath.endsWith('.btskill')));
+ 
+   if (!isSystemPlugin) {
+     if (errorMsg || !plugin) {
+@@ -1032,7 +1045,9 @@ export default function WorkspaceTabPanel({
+ 
+       {/* Content Area */}
+       <div className="flex-1 flex min-h-0 divide-x divide-[var(--border-light,#3c3c3c)] bg-[var(--bg-page)] relative">
+-        {pluginId === 'system.terminal' ? (
++        {pluginId === 'system.workflow-inspector' || (filePath && (filePath.endsWith('.workflow') || filePath.endsWith('.btskill'))) ? (
++          <WorkflowInspectorView filePath={filePath} />
++        ) : pluginId === 'system.terminal' ? (
+           <TerminalTabPanel tabId={tabId} visible={visible} customParams={customParams} />
+         ) : pluginId === 'system.browser' ? (
+           <BrowserTabPanel tabId={tabId} visible={visible} customParams={customParams} />

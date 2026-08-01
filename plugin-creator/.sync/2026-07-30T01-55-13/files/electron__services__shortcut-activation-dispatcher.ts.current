@@ -1,0 +1,99 @@
+import { PluginManager } from '../plugins/plugin-manager'
+import { PluginLauncher } from '../plugins/plugin-launcher'
+import { getShortcutActionRegistry } from './shortcut-action-registry'
+
+/**
+ * ShortcutActivationDispatcher — 宿主全局快捷键与硬件手势按需唤醒调度器
+ *
+ * 纯粹的手势/快捷键分发管道。本身不硬编码任何特定插件或命令，
+ * 映射关系完全由 KeybindingsManager 根据插件 plugin.json 声明式 keybindings
+ * 及 user_keybindings.json 动态注册。
+ */
+export class ShortcutActivationDispatcher {
+  private static instance: ShortcutActivationDispatcher | null = null
+
+  /** 手势/快捷键 ➔ 插件与动作映射表 */
+  private gestureToPluginMap = new Map<string, { pluginId: string; commandId?: string; eventName?: string }>()
+
+  /** 被 user_keybindings.json 以 `-command` 显式禁用的命令集合 */
+  private disabledCommands = new Set<string>()
+
+  private constructor() {}
+
+  public static getInstance(): ShortcutActivationDispatcher {
+    if (!ShortcutActivationDispatcher.instance) {
+      ShortcutActivationDispatcher.instance = new ShortcutActivationDispatcher()
+    }
+    return ShortcutActivationDispatcher.instance
+  }
+
+  /**
+   * 注册或更新手势到插件与动作的映射
+   */
+  public registerBinding(gestureKey: string, pluginId: string, commandId?: string) {
+    this.gestureToPluginMap.set(gestureKey, { pluginId, commandId })
+    console.log(`[ShortcutActivationDispatcher] Bound gesture "${gestureKey}" → plugin "${pluginId}" (${commandId || 'default'})`)
+  }
+
+  /**
+   * 注销指定手势/快捷键的绑定（用于用户改绑时清除旧映射，避免 stale 残留）
+   */
+  public unregisterBinding(gestureKey: string): void {
+    this.gestureToPluginMap.delete(gestureKey)
+  }
+
+  /**
+   * 同步被 user_keybindings.json 以 `-command` 禁用的命令集合
+   */
+  public setDisabledCommands(commands: Set<string>): void {
+    this.disabledCommands = commands
+  }
+
+  /**
+   * 处理接收到的手势或快捷键触发事件
+   */
+  public async handleGesture(gestureKey: string): Promise<boolean> {
+    console.log(`[ShortcutActivationDispatcher] Received gesture/shortcut event: "${gestureKey}"`)
+
+    const mapping = this.gestureToPluginMap.get(gestureKey)
+    if (!mapping) {
+      console.log(`[ShortcutActivationDispatcher] No target plugin/command bound for gesture "${gestureKey}". Skipping execution.`)
+      return false
+    }
+
+    const { pluginId, commandId, eventName } = mapping
+
+    // 若命令被用户在 user_keybindings.json 中显式禁用，直接跳过
+    if (commandId && this.disabledCommands.has(commandId)) {
+      console.log(`[ShortcutActivationDispatcher] Command "${commandId}" is disabled by user override, skipping gesture "${gestureKey}".`)
+      return false
+    }
+
+    try {
+      console.log(`[ShortcutActivationDispatcher] Dynamically activating target plugin "${pluginId}" for gesture "${gestureKey}"...`)
+
+      // 1. 确保目标插件已动态加载与激活（按需唤醒关键点）
+      await PluginManager.getInstance().ensurePluginLoaded(pluginId)
+
+      // 2. 若存在具体的 Command，通过 ActionRegistry 或 Command 派发器执行
+      if (commandId) {
+        const registry = getShortcutActionRegistry()
+        const executed = registry.execute(commandId)
+        if (executed) {
+          console.log(`[ShortcutActivationDispatcher] Executed command "${commandId}" for plugin "${pluginId}"`)
+        }
+      }
+
+      // 3. 若存在特定广播事件，通过 PluginLauncher 触发
+      if (eventName) {
+        const launcher = PluginLauncher.getInstance()
+        launcher.emitToBackgroundPlugin(pluginId, eventName, { visible: true, sourceGesture: gestureKey })
+      }
+
+      return true
+    } catch (err) {
+      console.error(`[ShortcutActivationDispatcher] Failed to activate plugin "${pluginId}" for gesture "${gestureKey}":`, err)
+      return false
+    }
+  }
+}

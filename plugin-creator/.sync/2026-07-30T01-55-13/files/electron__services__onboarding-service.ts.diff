@@ -1,0 +1,89 @@
+diff --git a/electron/services/onboarding-service.ts b/electron/services/onboarding-service.ts
+index aaaeb48..405ce88 100644
+--- a/electron/services/onboarding-service.ts
++++ b/electron/services/onboarding-service.ts
+@@ -25,9 +25,13 @@ export interface OnboardingConfig {
+ }
+ 
+ export function registerOnboardingIpcHandlers(): void {
+-  // Initialize onboarding completed flag if not set
+-  if (cache.get(CacheAttribute.prefOnboardingCompleted) === undefined) {
+-    cache.set(CacheAttribute.prefOnboardingCompleted, true)
++  // 开发模式下每次启动自动清除引导完成标记，方便联调
++  if (!app.isPackaged) {
++    cache.set(CacheAttribute.prefOnboardingCompleted, false)
++    console.log('[OnboardingService] Dev mode detected — cleared onboarding completed flag')
++  } else if (cache.get(CacheAttribute.prefOnboardingCompleted) === undefined) {
++    // 生产环境下首次启动若未设置，默认为 false 以触发引导
++    cache.set(CacheAttribute.prefOnboardingCompleted, false)
+   }
+ 
+   console.log('[OnboardingService] Registering onboarding IPC handlers...')
+@@ -39,6 +43,55 @@ export function registerOnboardingIpcHandlers(): void {
+     return completed
+   })
+ 
++  ipcMain.handle('onboarding:get-status', () => {
++    const completed = (cache.get(CacheAttribute.prefOnboardingCompleted) as boolean) ?? false
++    console.log(`[OnboardingService] onboarding:get-status → ${completed}`)
++    return { completed }
++  })
++
++  ipcMain.handle('onboarding:set-status', (_event, payload: unknown) => {
++    const isComp = typeof payload === 'boolean' ? payload : !!(payload as { completed?: boolean })?.completed
++    cache.set(CacheAttribute.prefOnboardingCompleted, isComp)
++    console.log(`[OnboardingService] onboarding:set-status → ${isComp}`)
++    return { success: true }
++  })
++
++  ipcMain.handle('models:fetch-platform-models', async () => {
++    try {
++      const endpoint = process.env.BERRYTRACE_ONLINE_ENDPOINT || 'https://berrytrace.getdear.cn'
++      const modelsUrl = `${endpoint.replace(/\/+$/, '')}/v1/models`
++      console.log(`[OnboardingService] Fetching platform models from: ${modelsUrl}`)
++      const resp = await fetch(modelsUrl).catch(() => null)
++      if (resp && resp.ok) {
++        const json = await resp.json()
++        const list = Array.isArray(json) ? json : (json?.data || json?.models || [])
++        return { success: true, models: list }
++      }
++    } catch (e) {
++      console.warn('[OnboardingService] Exception during models:fetch-platform-models:', e)
++    }
++    return {
++      success: false,
++      models: [
++        { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', type: 'text_gen' },
++        { id: 'qwen3-vl-plus', name: 'Qwen3 VL Plus', type: 'vision_gen' },
++        { id: 'qwen3.5-omni-flash', name: 'Qwen3.5 Omni Flash', type: 'omni_gen' },
++        { id: 'wan2.7-image-pro', name: 'Wan2.7 Image Pro', type: 'image_gen' }
++      ]
++    }
++  })
++
++  ipcMain.handle('llm:set-active-config', async (_event, config: { mode?: 'byok' | 'platform'; provider?: string; apiKey?: string; baseUrl?: string; modelId?: string }) => {
++    console.log('[OnboardingService] llm:set-active-config → setting active model config:', config)
++    try {
++      cache.set('activeLlmConfig', config)
++      return { success: true }
++    } catch (err) {
++      console.error('🚨 [OnboardingService:ERROR] Failed to set active LLM config:', err)
++      return { success: false, error: String(err) }
++    }
++  })
++
+   // 2. 完成引导并保存配置
+   ipcMain.handle('onboarding:complete', (_event, config: OnboardingConfig) => {
+     console.log('[OnboardingService] onboarding:complete → saving config', config)
+@@ -99,11 +152,6 @@ export function registerOnboardingIpcHandlers(): void {
+     console.log('[OnboardingService] Starting global hooks (native mouse + keyboard)...')
+     try { startGlobalMouseHook() } catch (e) { console.warn('[OnboardingService] Mouse hook start failed:', e) }
+     try { startGlobalDoubleTapHook() } catch (e) { console.warn('[OnboardingService] Double-tap hook start failed:', e) }
+-    import('./fn-voice-input').then(({ startFnVoiceInput }) => {
+-      try { startFnVoiceInput() } catch (e) { console.warn('[OnboardingService] Fn voice input start failed:', e) }
+-    }).catch((err) => {
+-      console.error('[OnboardingService] Failed to load fn-voice-input dynamically:', err)
+-    })
+   })
+ 
+   // 10. 静默下载相关

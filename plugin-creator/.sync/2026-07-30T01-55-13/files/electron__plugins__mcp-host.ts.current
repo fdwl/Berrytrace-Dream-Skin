@@ -1,0 +1,574 @@
+
+
+import { BrowserWindow } from 'electron';
+import fs from 'fs';
+import path from 'path';
+import { ElectronMainWindow } from '../windows/main-window';
+import { PluginManager } from './plugin-manager';
+import { WorkflowEngine } from './workflow-engine';
+import { WorkspaceManager } from '../services/workspace-manager';
+import { ApiDispatcher } from './api-dispatcher';
+
+export function getFinalToolName(toolName: string, pluginId: string, allowedPrefixes?: string[]): string {
+  const parts = pluginId.split('.');
+  const lastPart = parts[parts.length - 1] || '';
+  const defaultPrefix = lastPart.replace(/-/g, '_').toLowerCase().replace(/_tools$/, '').replace(/_agent$/, '');
+
+  let prefixes = allowedPrefixes;
+  if (!prefixes && pluginId) {
+    try {
+      const pm = PluginManager.getInstance();
+      const plugin = pm.getPlugin(pluginId);
+      prefixes = plugin?.manifest?.mcp?.toolPrefixes as string[] | undefined;
+    } catch {
+      // 忽略可能存在的依赖初始化顺序问题
+    }
+  }
+
+  const activePrefixes = prefixes && prefixes.length > 0
+    ? prefixes.map(p => p.toLowerCase())
+    : [defaultPrefix];
+
+  // 校验工具名是否以允许的前缀开头
+  let hasValidPrefix = false;
+  for (const p of activePrefixes) {
+    if (toolName.startsWith(p + '_')) {
+      hasValidPrefix = true;
+      break;
+    }
+  }
+
+  if (!hasValidPrefix && pluginId !== 'berrytrace.host' && pluginId !== '') {
+    console.warn(`[McpHost] Warning: Tool "${toolName}" from plugin "${pluginId}" does not follow the naming standard. It should be prefixed with "${activePrefixes[0]}_".`);
+  }
+
+  return toolName;
+}
+
+export interface McpToolDeclaration {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  pluginId: string;
+  displayName?: string;
+  /** 由插件运行时动态注册（非 plugin.json 声明），relevance-filter 直接放行 */
+  isDynamic?: boolean;
+  userQueries?: string[];
+}
+
+export interface McpResourceDeclaration {
+  uri: string;
+  name: string;
+  mimeType?: string;
+  description?: string;
+  pluginId: string;
+}
+
+export class McpHost {
+  private static instance: McpHost;
+  private tools = new Map<string, McpToolDeclaration>();
+  private resources = new Map<string, McpResourceDeclaration>();
+  private systemPrompts = new Map<string, { pluginId: string; promptText: string }>();
+  
+  // Callback to execute tool inside sandboxed utilityProcess
+  private toolHandlers = new Map<string, (args: Record<string, unknown>) => Promise<unknown>>();
+
+  private activeState = {
+    fileExtension: ''
+  };
+
+  public setActiveState(state: { fileExtension: string }) {
+    console.log(`[McpHost] Updating active state:`, state);
+    this.activeState = { ...this.activeState, ...state };
+  }
+
+  private constructor() {}
+
+  public static getInstance(): McpHost {
+    if (!McpHost.instance) {
+      McpHost.instance = new McpHost();
+    }
+    return McpHost.instance;
+  }
+
+  public registerPluginMcp(pluginId: string, mcpConfig: Record<string, unknown>, sendToSandbox: (channel: string, data: Record<string, unknown>) => void | Promise<void>) {
+    if (!mcpConfig) return;
+
+    // Register Tools
+    if (Array.isArray(mcpConfig.tools)) {
+      mcpConfig.tools.forEach((tool: { name: string; description: string; inputSchema: Record<string, unknown>; displayName?: string; userQueries?: string[] }) => {
+        const finalName = getFinalToolName(tool.name, pluginId, mcpConfig.toolPrefixes as string[] | undefined);
+        console.debug(`[McpHost] Registering tool "${finalName}" (original: "${tool.name}") from plugin "${pluginId}"`);
+        this.tools.set(finalName, {
+          name: finalName,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          pluginId,
+          displayName: tool.displayName,
+          userQueries: tool.userQueries
+        });
+
+        // Set up the router execution callback
+        this.toolHandlers.set(finalName, async (args) => {
+          return new Promise((resolve, reject) => {
+            const token = Math.floor(Math.random() * 1000000);
+
+            // Register this pending call
+            (global as unknown as Record<string, unknown>).pendingMcpCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls || new Map();
+            ((global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>).set(token, { resolve, reject });
+
+            // Send message to the sandbox process
+            console.log(`[McpHost] sendToSandbox mcp:call-tool: tool=${finalName}, token=${token}, args=${JSON.stringify(args)}`);
+            Promise.resolve(
+              sendToSandbox('mcp:call-tool', {
+                toolName: finalName,
+                args,
+                token
+              })
+            ).catch((err) => {
+              reject(err);
+              const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+              pendingCalls?.delete(token);
+            });
+
+            // Set timeout for safety (30 minutes max to allow interactive CLI logins)
+            setTimeout(() => {
+              const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+              const pending = pendingCalls?.get(token);
+              if (pending) {
+                pending.reject(new Error(`MCP Tool call timeout: ${finalName}`));
+                pendingCalls?.delete(token);
+              }
+            }, 30 * 60 * 1000);
+          });
+        });
+      });
+    }
+
+    // Register Resources
+    if (Array.isArray(mcpConfig.resources)) {
+      mcpConfig.resources.forEach((res: { name: string; uri: string; mimeType?: string; description?: string }) => {
+        console.log(`[McpHost] Registering resource "${res.name}" (${res.uri}) from plugin "${pluginId}"`);
+        this.resources.set(res.uri, {
+          uri: res.uri,
+          name: res.name,
+          mimeType: res.mimeType,
+          description: res.description,
+          pluginId
+        });
+      });
+    }
+  }
+
+  public unregisterPluginMcp(pluginId: string) {
+    for (const [name, tool] of this.tools.entries()) {
+      if (tool.pluginId === pluginId) {
+        this.tools.delete(name);
+        this.toolHandlers.delete(name);
+      }
+    }
+    for (const [uri, res] of this.resources.entries()) {
+      if (res.pluginId === pluginId) {
+        this.resources.delete(uri);
+      }
+    }
+    for (const [promptId, item] of this.systemPrompts.entries()) {
+      if (item.pluginId === pluginId) {
+        this.systemPrompts.delete(promptId);
+      }
+    }
+  }
+
+  public listTools(): McpToolDeclaration[] {
+    const allTools = Array.from(this.tools.values());
+    const currentExt = (this.activeState.fileExtension || '').toLowerCase().replace(/^\./, '');
+
+    // Dynamic detection of client-agents (mimo, codebuddy)
+    try {
+      const targetWin = BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow();
+      const workspacePath = targetWin ? WorkspaceManager.getInstance().getPathForWindow(targetWin) : null;
+      
+      if (workspacePath) {
+        const hasMimo = fs.existsSync(path.join(workspacePath, '.mimocode'));
+        const hasCodebuddy = fs.existsSync(path.join(workspacePath, '.codebuddy'));
+
+        if (hasMimo) {
+          allTools.push({
+            name: 'mimo_run_cli',
+            displayName: 'Mimo CLI Agent',
+            description: '在工作区中运行 Mimo 智能体命令行执行指定评估、开发或审查任务。将在前台可见终端中执行，保留上下文和状态。',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instruction: { type: 'string', description: '传递给 Mimo 的具体评估或开发指令' }
+              },
+              required: ['instruction']
+            },
+            pluginId: 'system'
+          });
+        }
+
+        if (hasCodebuddy) {
+          allTools.push({
+            name: 'codebuddy_run_cli',
+            displayName: 'CodeBuddy CLI Agent',
+            description: '在工作区中运行 CodeBuddy 智能体命令行执行指定代码修正或开发任务。将在前台可见终端中执行，保留上下文和状态。',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instruction: { type: 'string', description: '传递给 CodeBuddy 的具体修正或重构指令' }
+              },
+              required: ['instruction']
+            },
+            pluginId: 'system'
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('[McpHost] Failed to dynamically list client agents:', e);
+    }
+
+    // 注入已注册的本地工作流作为虚拟 MCP 工具
+    try {
+      const workflows = WorkflowEngine.getInstance().list();
+      workflows.forEach((wf: any) => {
+        const properties: Record<string, any> = {};
+        const required: string[] = [];
+        if (wf.inputs) {
+          for (const [key, inputDef] of Object.entries(wf.inputs) as any) {
+            properties[key] = {
+              type: inputDef.type || 'string',
+              description: inputDef.description || '',
+            };
+            if (inputDef.required) {
+              required.push(key);
+            }
+          }
+        }
+
+        allTools.push({
+          name: wf.id,
+          displayName: wf.name || wf.id,
+          description: `【本地 SOP 工作流】${wf.description || ''}。执行此工具将按顺序运行工作流的各个步骤。`,
+          inputSchema: {
+            type: 'object',
+            properties,
+            required,
+          },
+          pluginId: 'workflow-engine',
+        });
+      });
+    } catch (err) {
+      console.warn('[McpHost] Failed to list workflows as mcp tools:', err);
+    }
+
+    return allTools.filter(tool => {
+      // Host tools have pluginId 'berrytrace.host' or 'system' or 'berrytrace' -> always allow
+      if (tool.pluginId === 'berrytrace.host' || tool.pluginId === 'system' || tool.pluginId === 'berrytrace' || tool.pluginId === 'workflow-engine') {
+        return true;
+      }
+
+      const pm = PluginManager.getInstance();
+
+      // Check if the plugin is currently enabled
+      if (!pm.isPluginEnabled(tool.pluginId)) {
+        return false;
+      }
+
+      // If active, always expose all registered tools
+      if (pm.isPluginActive(tool.pluginId)) {
+        return true;
+      }
+      
+      const plugin = pm.getPlugin(tool.pluginId);
+      if (!plugin) return true;
+      
+      const events = plugin.manifest.activationEvents || (plugin.manifest.mcp as Record<string, any> | undefined)?.activationEvents;
+      if (!events || !Array.isArray(events) || events.length === 0) {
+        return true; // No scoping declared, expose by default
+      }
+      
+      // Match rules: e.g. "onFileExtension:md" or "onMcpCall:toolName"
+      return events.some((event: string) => {
+        if (event === '*') return true;
+        const [type, val] = event.split(':');
+        if (type === 'onFileExtension' && val) {
+          return val.toLowerCase() === currentExt;
+        }
+        if (type === 'onMcpCall' && val) {
+          return val === tool.name;
+        }
+        return false;
+      });
+    });
+  }
+
+  public listResources(): McpResourceDeclaration[] {
+    return Array.from(this.resources.values());
+  }
+
+  public hasToolHandler(toolName: string): boolean {
+    if (!toolName) return false;
+    let resolvedName = toolName;
+    if (toolName.includes(':')) {
+      resolvedName = toolName.split(':').pop() || toolName;
+    }
+    return this.toolHandlers.has(resolvedName);
+  }
+
+  public async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    if (!toolName) throw new Error('Tool name is undefined or empty');
+    let resolvedName = toolName;
+    if (toolName.includes(':')) {
+      resolvedName = toolName.split(':').pop() || toolName;
+    }
+
+    if (resolvedName === 'mimo_run_cli' || resolvedName === 'codebuddy_run_cli') {
+      return this.executeAgentCliTool(resolvedName, args);
+    }
+
+    // 优先拦截工作流调用
+    try {
+      const wf = WorkflowEngine.getInstance().get(resolvedName);
+      if (wf) {
+        console.log(`[McpHost] Intercepting MCP call to execute workflow "${resolvedName}"...`);
+        const result = await WorkflowEngine.getInstance().execute(resolvedName, args, 'direct');
+        if (!result.success) {
+          throw new Error(result.error || '工作流执行失败');
+        }
+        return result.finalOutput || '工作流执行成功完成！';
+      }
+    } catch (err: any) {
+      console.error(`[McpHost] Failed to execute workflow tool "${resolvedName}":`, err);
+      throw err;
+    }
+
+    let handler = this.toolHandlers.get(resolvedName);
+    console.log(`[McpHost] callTool: toolName=${toolName}, resolvedName=${resolvedName}, hasHandler=${!!handler}`);
+    
+    // Lazy-loaded plugin: tool not registered yet → load plugin on-demand, then retry
+    if (!handler) {
+      const toolDecl = this.tools.get(resolvedName);
+      if (toolDecl && toolDecl.pluginId && toolDecl.pluginId !== 'berrytrace.host' && toolDecl.pluginId !== 'system') {
+        const pm = PluginManager.getInstance();
+        if (pm.isPluginEnabled(toolDecl.pluginId)) {
+          console.log(`[McpHost] Tool "${resolvedName}" not loaded, triggering lazy load for plugin "${toolDecl.pluginId}"...`);
+          await pm.ensurePluginLoaded(toolDecl.pluginId);
+          handler = this.toolHandlers.get(resolvedName);
+        }
+      }
+    }
+    
+    if (!handler) {
+      throw new Error(`MCP Tool "${toolName}" not found or has no active handler.`);
+    }
+    return handler(args);
+  }
+
+  /**
+   * Register a tool that runs directly in the main process (no sandbox IPC needed).
+   * Used by NoteTools and other built-in host tools.
+   */
+  public registerHostTool(
+    declaration: Omit<McpToolDeclaration, 'pluginId'>,
+    handler: (args: Record<string, unknown>) => Promise<unknown>,
+    pluginId = 'berrytrace.host',
+  ): void {
+    console.debug(`[McpHost] Registering host tool: ${declaration.name}`);
+    this.tools.set(declaration.name, { ...declaration, pluginId });
+    this.toolHandlers.set(declaration.name, handler);
+  }
+
+  public registerDynamicRendererTool(
+    pluginId: string,
+    tool: { name: string; description: string; inputSchema: Record<string, unknown>; displayName?: string; userQueries?: string[] }
+  ): void {
+    const finalName = getFinalToolName(tool.name, pluginId);
+    console.log(`[McpHost] Registering dynamic renderer tool "${finalName}" (original: "${tool.name}") from plugin "${pluginId}"`);
+    this.tools.set(finalName, {
+      name: finalName,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      pluginId,
+      displayName: tool.displayName,
+      isDynamic: true,  // 标记为运行时动态注册，relevance-filter 直接放行
+      userQueries: tool.userQueries
+    });
+
+    this.toolHandlers.set(finalName, async (args) => {
+      return new Promise((resolve, reject) => {
+        const token = Math.floor(Math.random() * 1000000);
+
+        // Register this pending call
+        (global as unknown as Record<string, unknown>).pendingMcpCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls || new Map();
+        ((global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>).set(token, { resolve, reject });
+
+        // Route call to the active main window renderer
+        const win = ElectronMainWindow.getInstance().getWindow();
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('plugins:mcp-call-tool', {
+            pluginId,
+            toolName: finalName,
+            args,
+            token
+          });
+        } else {
+          reject(new Error(`Main window not available to route dynamic MCP tool call for plugin "${pluginId}"`));
+          const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+          pendingCalls?.delete(token);
+          return;
+        }
+
+        // Set timeout for safety (30 minutes max to allow interactive CLI logins)
+        setTimeout(() => {
+          const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+          const pending = pendingCalls?.get(token);
+          if (pending) {
+            pending.reject(new Error(`MCP Dynamic Tool call timeout: ${finalName}`));
+            pendingCalls?.delete(token);
+          }
+        }, 30 * 60 * 1000);
+      });
+    });
+  }
+
+  public unregisterDynamicRendererTool(pluginId: string, toolName: string): void {
+    const finalName = getFinalToolName(toolName, pluginId);
+    console.log(`[McpHost] Unregistering dynamic renderer tool "${finalName}" (original: "${toolName}") from plugin "${pluginId}"`);
+    const tool = this.tools.get(finalName);
+    if (tool && tool.pluginId === pluginId) {
+      this.tools.delete(finalName);
+      this.toolHandlers.delete(finalName);
+    }
+  }
+
+  public registerSystemPrompt(pluginId: string, promptId: string, promptText: string): void {
+    console.log(`[McpHost] Registering system prompt "${promptId}" from plugin "${pluginId}"`);
+    this.systemPrompts.set(promptId, { pluginId, promptText });
+  }
+
+  public unregisterSystemPrompt(pluginId: string, promptId: string): void {
+    console.log(`[McpHost] Unregistering system prompt "${promptId}" from plugin "${pluginId}"`);
+    this.systemPrompts.delete(promptId);
+  }
+
+  public listSystemPrompts(): string[] {
+    const prompts: string[] = [];
+    for (const [_, item] of this.systemPrompts.entries()) {
+      if (PluginManager.getInstance().isPluginActive(item.pluginId)) {
+        prompts.push(item.promptText);
+      }
+    }
+    return prompts;
+  }
+
+  // Handle replies returning from sandbox process
+  public handleSandboxResponse(token: number | string, success: boolean, result: unknown, errorMsg?: string) {
+    console.log(`[McpHost] handleSandboxResponse received: token=${token} (${typeof token}), success=${success}`);
+    const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<unknown, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+    if (!pendingCalls) {
+      console.warn('[McpHost] handleSandboxResponse: pendingCalls map is empty/undefined');
+      return;
+    }
+
+    const numKey = Number(token);
+    const strKey = String(token);
+    const call = pendingCalls.get(token) || pendingCalls.get(numKey) || pendingCalls.get(strKey);
+
+    if (call) {
+      console.log(`[McpHost] ✅ Found pending call for token=${token}, resolving response...`);
+      if (success) {
+        call.resolve(result);
+      } else {
+        call.reject(new Error(errorMsg || 'Tool execution failed inside sandbox'));
+      }
+      pendingCalls.delete(token);
+      pendingCalls.delete(numKey);
+      pendingCalls.delete(strKey);
+    } else {
+      console.warn(`[McpHost] ⚠️ handleSandboxResponse: no pending call found for token=${token} (pending tokens: [${Array.from(pendingCalls.keys()).join(', ')}])`);
+    }
+  }
+
+  private async executeAgentCliTool(toolName: string, args: Record<string, unknown>): Promise<string> {
+    const targetWin = BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow();
+    const workspacePath = targetWin ? WorkspaceManager.getInstance().getPathForWindow(targetWin) : null;
+    if (!workspacePath) {
+      throw new Error('当前未打开任何工作区，无法运行 CLI 智能体。');
+    }
+
+    const instruction = String(args.instruction || '').trim();
+    if (!instruction) {
+      throw new Error('参数 instruction 不能为空。');
+    }
+
+    // Escape instruction safely for single-quoted zsh argument passing
+    const safeInstruction = instruction.replace(/'/g, "'\\''");
+    let cmd: string;
+
+    if (toolName === 'mimo_run_cli') {
+      const hasLocalMimo = fs.existsSync(path.join(workspacePath, 'node_modules/.bin/mimo'));
+      cmd = hasLocalMimo ? `./node_modules/.bin/mimo '${safeInstruction}'` : `npx mimo '${safeInstruction}'`;
+    } else {
+      const hasLocalCodebuddy = fs.existsSync(path.join(workspacePath, 'node_modules/.bin/codebuddy'));
+      cmd = hasLocalCodebuddy ? `./node_modules/.bin/codebuddy '${safeInstruction}'` : `npx codebuddy '${safeInstruction}'`;
+    }
+
+    const sessionId = `term_${toolName}_${Date.now()}`;
+    const title = toolName === 'mimo_run_cli' ? 'Mimo 运行' : 'CodeBuddy 运行';
+
+    console.log(`[McpHost] Spawning terminal command for agent: "${cmd}" with sessionId: "${sessionId}"`);
+
+    // 1. Send IPC to open the terminal tab in the UI
+    if (targetWin && targetWin.webContents) {
+      targetWin.webContents.send('workspace:open-terminal-tab', {
+        command: cmd,
+        title,
+        sessionId
+      });
+    } else {
+      throw new Error('找不到可用的主窗口来打开终端。');
+    }
+
+    const terminalCtrl = ApiDispatcher.getInstance().getController('terminal') as any;
+    if (!terminalCtrl) {
+      throw new Error('系统终端控制器未就绪。');
+    }
+
+    // 2. Poll for terminal session creation (up to 10s)
+    let exists = false;
+    for (let i = 0; i < 20; i++) {
+      const status = terminalCtrl.sessionStatus.get(sessionId);
+      if (status) {
+        exists = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    if (!exists) {
+      throw new Error('终端进程未能在 10 秒内启动。请重试。');
+    }
+
+    // 3. Wait for command completion (up to 10 minutes)
+    let isDone = false;
+    const maxTicks = 1200; // 10 minutes
+    for (let tick = 0; tick < maxTicks; tick++) {
+      const status = terminalCtrl.sessionStatus.get(sessionId);
+      if (!status || !status.isBusy) {
+        isDone = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    if (!isDone) {
+      throw new Error('智能体任务运行超时（已运行 10 分钟）。');
+    }
+
+    // 4. Wait for buffer flush and return output
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const outputText = await terminalCtrl.getOutput(sessionId, 500);
+    return outputText || '任务已执行，无控制台输出。';
+  }
+}

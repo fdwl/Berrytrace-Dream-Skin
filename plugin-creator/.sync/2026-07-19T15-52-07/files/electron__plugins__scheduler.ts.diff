@@ -1,0 +1,146 @@
+diff --git a/electron/plugins/scheduler.ts b/electron/plugins/scheduler.ts
+index 9278f6e..905d2ab 100644
+--- a/electron/plugins/scheduler.ts
++++ b/electron/plugins/scheduler.ts
+@@ -15,6 +15,7 @@ export interface TaskRecord {
+   command?: string;
+   args?: string[];
+   cwd?: string;
++  prompt?: string;
+ }
+ 
+ // Simple cron matcher
+@@ -99,6 +100,7 @@ export class PluginScheduler {
+       command?: string;
+       args?: string[];
+       cwd?: string;
++      prompt?: string;
+     }
+   ): Promise<void> {
+     let targetId = options.id;
+@@ -109,8 +111,8 @@ export class PluginScheduler {
+     const key = `${pluginId}:${targetId}`;
+     const existing = this.tasks.get(key);
+     
+-    // If it's a cron task, validate it
+-    if (options.cron) {
++    // If it's a cron task, validate it (unless it's a special keyword like first-open)
++    if (options.cron && !['first-open', 'daily-first', '@startup'].includes(options.cron.toLowerCase())) {
+       try {
+         parseCron(options.cron);
+       } catch (e) {
+@@ -129,6 +131,7 @@ export class PluginScheduler {
+       command: options.command,
+       args: options.args,
+       cwd: options.cwd,
++      prompt: options.prompt,
+     };
+ 
+     this.tasks.set(key, record);
+@@ -195,17 +198,27 @@ export class PluginScheduler {
+         }
+       } else if (task.cron) {
+         try {
+-          const matcher = parseCron(task.cron);
+-          if (matcher(date)) {
+-            // Check if we already ran it in the current minute (60s) to prevent double trigger
+-            const lastRunDate = new Date(task.lastRunTime);
+-            const isSameMinute = lastRunDate.getFullYear() === date.getFullYear() &&
+-                                 lastRunDate.getMonth() === date.getMonth() &&
+-                                 lastRunDate.getDate() === date.getDate() &&
+-                                 lastRunDate.getHours() === date.getHours() &&
+-                                 lastRunDate.getMinutes() === date.getMinutes();
+-            if (!isSameMinute) {
++          const cronLower = task.cron.toLowerCase();
++          if (['first-open', 'daily-first', '@startup'].includes(cronLower)) {
++            const taskKey = `${task.pluginId}:${task.taskId}`;
++            const { WorkflowRunner } = await import('./workflow-runner');
++            if (!WorkflowRunner.getInstance().hasRunToday(taskKey)) {
+               shouldRun = true;
++              WorkflowRunner.getInstance().markRunToday(taskKey);
++            }
++          } else {
++            const matcher = parseCron(task.cron);
++            if (matcher(date)) {
++              // Check if we already ran it in the current minute (60s) to prevent double trigger
++              const lastRunDate = new Date(task.lastRunTime);
++              const isSameMinute = lastRunDate.getFullYear() === date.getFullYear() &&
++                                   lastRunDate.getMonth() === date.getMonth() &&
++                                   lastRunDate.getDate() === date.getDate() &&
++                                   lastRunDate.getHours() === date.getHours() &&
++                                   lastRunDate.getMinutes() === date.getMinutes();
++              if (!isSameMinute) {
++                shouldRun = true;
++              }
+             }
+           }
+         } catch (err) {
+@@ -234,7 +247,17 @@ export class PluginScheduler {
+ 
+   private async executeTask(task: TaskRecord) {
+     try {
+-      if (task.command) {
++      if (task.prompt) {
++        // AI Agent Prompt Task
++        console.log(`[PluginScheduler] Dispatching Agent Prompt for scheduled task ${task.taskId}`);
++        const { WorkflowRunner } = await import('./workflow-runner');
++        await WorkflowRunner.getInstance().dispatchToAgent({
++          workDir: task.cwd || '',
++          triggerType: 'schedule',
++          taskPrompt: task.prompt,
++          ruleId: task.taskId,
++        });
++      } else if (task.command) {
+         console.log(`[PluginScheduler] Executing scheduled system command for task ${task.taskId}: ${task.command} ${task.args?.join(' ')}`);
+         const { executeSystemCommand } = await import('./controllers/system');
+         await executeSystemCommand(task.pluginId, {
+@@ -298,8 +321,9 @@ export class PluginScheduler {
+           const id = parts[0].replace(/`/g, '').trim()
+           const cron = parts[1].replace(/`/g, '').trim()
+           const command = parts[2].replace(/`/g, '').trim()
+-          if (cron.split(/\s+/).length === 5 && id && command && id !== 'ID' && id !== 'id') {
+-            tasks.push({ id, cron, command })
++          const isValidCron = cron.split(/\s+/).length === 5 || ['first-open', 'daily-first', '@startup'].includes(cron.toLowerCase());
++          if (isValidCron && id && command && id !== 'ID' && id !== 'id') {
++            tasks.push({ id, cron, command });
+           }
+         }
+       }
+@@ -330,18 +354,25 @@ export class PluginScheduler {
+ 
+       // Register new tasks
+       for (const t of tasks) {
+-        const cmdParts = t.command.split(/\s+/)
+-        const cmd = cmdParts[0]
+-        const args = cmdParts.slice(1)
+-
+-        await this.register('workspace-schedule', {
+-          id: t.id,
+-          cron: t.cron,
+-          command: cmd,
+-          args: args,
+-          cwd: workDir
+-        })
+-        console.log(`[PluginScheduler] Successfully loaded scheduled task: ${t.id} -> ${t.cron} (${t.command})`)
++        const isCliCommand = /^(npm|node|npx|pnpm|yarn|bun|bash|sh)\s/i.test(t.command.trim());
++        if (isCliCommand) {
++          const cmdParts = t.command.split(/\s+/);
++          await this.register('workspace-schedule', {
++            id: t.id,
++            cron: t.cron,
++            command: cmdParts[0],
++            args: cmdParts.slice(1),
++            cwd: workDir,
++          });
++        } else {
++          await this.register('workspace-schedule', {
++            id: t.id,
++            cron: t.cron,
++            prompt: t.command,
++            cwd: workDir,
++          });
++        }
++        console.log(`[PluginScheduler] Successfully loaded scheduled task: ${t.id} -> ${t.cron} (${t.command})`);
+       }
+     } catch (err) {
+       console.error('[PluginScheduler] Error loading workspace schedule:', err)

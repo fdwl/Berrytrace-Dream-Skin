@@ -1,0 +1,182 @@
+import { app, globalShortcut, BrowserWindow } from 'electron'
+import { cache, CacheAttribute } from '../config/index'
+import { ElectronMainWindow } from '../windows/main-window'
+
+export class ElectronGlobalShortcuts {
+  private static instance: ElectronGlobalShortcuts
+  private togglePublishWindow?: () => void
+  private showMainWindow?: () => void
+  private toggleBufferWindow?: () => void
+  private triggerScreenshot?: () => void
+  private toggleQuickPanelWindow?: () => void
+  private createNewDocument?: () => void
+
+  private constructor() {}
+
+  public static getInstance(): ElectronGlobalShortcuts {
+    if (!ElectronGlobalShortcuts.instance) {
+      ElectronGlobalShortcuts.instance = new ElectronGlobalShortcuts()
+    }
+    return ElectronGlobalShortcuts.instance
+  }
+
+  public setDependencies(deps: {
+    togglePublishWindow: () => void
+    showMainWindow: () => void
+    toggleBufferWindow: () => void
+    triggerScreenshot: () => void
+    toggleQuickPanelWindow: () => void
+    createNewDocument?: () => void
+  }): void {
+    this.togglePublishWindow = deps.togglePublishWindow
+    this.showMainWindow = deps.showMainWindow
+    this.toggleBufferWindow = deps.toggleBufferWindow
+    this.triggerScreenshot = deps.triggerScreenshot
+    this.toggleQuickPanelWindow = deps.toggleQuickPanelWindow
+    this.createNewDocument = deps.createNewDocument
+  }
+
+  public getDefaultLockShortcut(): string {
+    if (process.platform === 'darwin') {
+      return 'Ctrl+Cmd+L'
+    }
+    return 'Ctrl+Alt+L'
+  }
+
+  public getDefaultScreenshotShortcut(): string {
+    if (process.platform === 'darwin') {
+      return 'Ctrl+Cmd+Shift+A'
+    }
+    return 'Ctrl+Alt+Shift+A'
+  }
+
+  public getDefaultShortcut(): string {
+    if (process.platform === 'darwin') {
+      return 'Ctrl+Cmd+N'
+    }
+    return 'Ctrl+Alt+N'
+  }
+
+  public getDefaultShowMainShortcut(): string {
+    if (process.platform === 'darwin') {
+      return 'Ctrl+Cmd+O'
+    }
+    return 'Ctrl+Alt+O'
+  }
+
+  public getDefaultBufferShortcut(): string {
+    if (process.platform === 'darwin') {
+      return 'Ctrl+Cmd+B'
+    }
+    return 'Ctrl+Alt+B'
+  }
+
+  public registerGlobalShortcuts(): void {
+    if (!app.isReady()) {
+      console.warn('⚠️ [ElectronGlobalShortcuts] app is not ready yet, skipping registerGlobalShortcuts.')
+      return
+    }
+    globalShortcut.unregisterAll()
+
+    const bufferShortcut: string | null = null
+    const newRecordShortcut =
+      (cache.get(CacheAttribute.prefGlobalShortcut) as string) || this.getDefaultShortcut()
+    const newRecordOk = globalShortcut.register(newRecordShortcut, () => {
+      if (!ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+        console.log('⚠️ 用户尚未进入主界面，忽略快捷键触发（新建文档）')
+        return
+      }
+      console.log('✅ 全局快捷键触发（新建文档）:', newRecordShortcut)
+      // 先显示主窗口，然后创建新文档
+      ElectronMainWindow.getInstance().showWindow()
+      // 延迟发送创建新文档的消息，确保主窗口已显示
+      setTimeout(() => {
+        this.createNewDocument?.()
+      }, 100)
+    })
+    if (newRecordOk) {
+      console.log('✅ 全局快捷键注册成功（新建文档）:', newRecordShortcut)
+    } else {
+      console.error('❌ 全局快捷键注册失败（新建文档）:', newRecordShortcut)
+    }
+
+    const showMainShortcut =
+      (cache.get(CacheAttribute.prefShowMainShortcut) as string) || this.getDefaultShowMainShortcut()
+    if (showMainShortcut && showMainShortcut !== newRecordShortcut) {
+      const showMainOk = globalShortcut.register(showMainShortcut, () => {
+        if (!ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+          console.log('⚠️ 用户尚未进入主界面，忽略快捷键触发（打开主窗口）')
+          return
+        }
+        console.log('✅ 全局快捷键触发（打开主窗口）:', showMainShortcut)
+        this.showMainWindow?.()
+      })
+      if (showMainOk) {
+        console.log('✅ 全局快捷键注册成功（打开主窗口）:', showMainShortcut)
+      } else {
+        console.error('❌ 全局快捷键注册失败（打开主窗口）:', showMainShortcut)
+      }
+    } else {
+      console.warn('⚠️ “打开主窗口”快捷键与“新建记录”冲突或为空，已跳过:', showMainShortcut)
+    }
+
+    const screenshotShortcut =
+      (cache.get(CacheAttribute.prefScreenshotShortcut) as string) || this.getDefaultScreenshotShortcut()
+    if (
+      screenshotShortcut &&
+      screenshotShortcut !== newRecordShortcut &&
+      screenshotShortcut !== showMainShortcut &&
+      screenshotShortcut !== bufferShortcut
+    ) {
+      const screenshotOk = globalShortcut.register(screenshotShortcut, () => {
+        if (!ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+          console.log('⚠️ 用户尚未进入主界面，忽略快捷键触发（截图）')
+          return
+        }
+        console.log('✅ 全局快捷键触发（截图）:', screenshotShortcut)
+        this.triggerScreenshot?.()
+      })
+      if (screenshotOk) {
+        console.log('✅ 全局快捷键注册成功（截图）:', screenshotShortcut)
+      } else {
+        console.error('❌ 全局快捷键注册失败（截图）:', screenshotShortcut)
+      }
+    }
+
+    const quickPanelEnabled = (cache.get(CacheAttribute.prefQuickPanelEnabled) as boolean) ?? false
+    const quickPanelShortcut =
+      (cache.get(CacheAttribute.prefQuickPanelShortcut) as string) || 'Alt+Space'
+    if (
+      quickPanelEnabled &&
+      quickPanelShortcut &&
+      quickPanelShortcut !== newRecordShortcut &&
+      quickPanelShortcut !== showMainShortcut &&
+      quickPanelShortcut !== bufferShortcut &&
+      quickPanelShortcut !== screenshotShortcut
+    ) {
+      const quickPanelOk = globalShortcut.register(quickPanelShortcut, () => {
+        if (!ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+          console.log('⚠️ 用户尚未进入主界面，忽略快捷键触发（快捷面板）')
+          return
+        }
+        console.log('✅ 全局快捷键触发（快捷面板）:', quickPanelShortcut)
+        this.toggleQuickPanelWindow?.()
+      })
+      if (quickPanelOk) {
+        console.log('✅ 全局快捷键注册成功（快捷面板）:', quickPanelShortcut)
+      } else {
+        console.error('❌ 全局快捷键注册失败（快捷面板）:', quickPanelShortcut)
+      }
+    } else {
+      console.warn('⚠️ “快捷面板”快捷键与其他冲突或为空，已跳过:', quickPanelShortcut)
+    }
+  }
+
+  public unregisterAll(): void {
+    if (app.isReady()) {
+      globalShortcut.unregisterAll()
+    } else {
+      console.log('[ElectronGlobalShortcuts] app is not ready, skipping unregisterAll.')
+    }
+  }
+}

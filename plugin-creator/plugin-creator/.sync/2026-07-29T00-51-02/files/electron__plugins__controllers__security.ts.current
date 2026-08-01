@@ -1,0 +1,58 @@
+/**
+ * SecurityController — OS Keychain 密码加密/解密
+ *
+ * 使用 Electron 内置的 safeStorage API：
+ *   - macOS: Keychain (AES-256, per-user)
+ *   - Windows: DPAPI (per-user/machine)
+ *   - Linux: libsecret / Gnome Keyring / fallback
+ *
+ * 对外暴露两个 SDK 方法：
+ *   sdk.security.encryptString(plain)   → base64 密文
+ *   sdk.security.decryptString(base64)  → 明文（只在内存中）
+ */
+
+import { safeStorage } from 'electron';
+import type { ApiContext } from './api-context';
+import { BaseApiController } from './api-context';
+
+export class SecurityController extends BaseApiController {
+
+  /**
+   * 使用 OS Keychain 加密字符串，返回 base64 密文（可安全持久化）
+   */
+  async security_encryptString(plain: string, _ctx?: ApiContext): Promise<string> {
+    if (!safeStorage.isEncryptionAvailable()) {
+      // Fallback：OS Keychain 不可用时（CI/无桌面 Linux）用 base64 占位
+      // 生产环境建议抛错或提示用户
+      console.warn('[SecurityController] safeStorage not available, using base64 fallback (NOT SECURE)');
+      return Buffer.from(plain, 'utf-8').toString('base64');
+    }
+    const encrypted = safeStorage.encryptString(plain);
+    return encrypted.toString('base64');
+  }
+
+  /**
+   * 解密 encryptString 返回的 base64 密文，返回原始明文
+   * 解密结果只存在于调用方内存，不应被持久化
+   */
+  async security_decryptString(encryptedBase64: string, _ctx?: ApiContext): Promise<string> {
+    if (!safeStorage.isEncryptionAvailable()) {
+      // 对应 fallback：直接 base64 decode
+      return Buffer.from(encryptedBase64, 'base64').toString('utf-8');
+    }
+    try {
+      const buf = Buffer.from(encryptedBase64, 'base64');
+      return safeStorage.decryptString(buf);
+    } catch (err: any) {
+      console.error('[SecurityController] decryptString failed:', err?.message || err);
+      throw new Error('密码解密失败：可能是 OS Keychain 数据损坏或迁移到了不同的用户/机器。请重新填写密码。');
+    }
+  }
+
+  /**
+   * 检查当前平台是否支持 OS Keychain 加密
+   */
+  async security_isEncryptionAvailable(_args?: unknown, _ctx?: ApiContext): Promise<boolean> {
+    return safeStorage.isEncryptionAvailable();
+  }
+}

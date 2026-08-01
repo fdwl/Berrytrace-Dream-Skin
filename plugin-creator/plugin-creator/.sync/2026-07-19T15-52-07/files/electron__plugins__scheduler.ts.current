@@ -1,0 +1,381 @@
+import Store from 'electron-store';
+import { PluginManager } from './plugin-manager';
+import { ipcMain } from 'electron';
+import * as fs from 'fs';
+import { join } from 'path';
+
+export interface TaskRecord {
+  pluginId: string;
+  taskId: string;
+  cron?: string;
+  intervalMs?: number;
+  once?: boolean;
+  executeAt?: number;
+  lastRunTime: number; // timestamp
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  prompt?: string;
+}
+
+// Simple cron matcher
+function matchField(value: number, pattern: string): boolean {
+  if (pattern === '*') return true;
+  
+  const parts = pattern.split(',');
+  for (const part of parts) {
+    if (part.includes('/')) {
+      const [left, right] = part.split('/');
+      const step = parseInt(right, 10);
+      const start = left === '*' ? 0 : parseInt(left, 10);
+      if ((value - start) % step === 0 && value >= start) return true;
+    } else if (part.includes('-')) {
+      const [start, end] = part.split('-').map(Number);
+      if (value >= start && value <= end) return true;
+    } else {
+      if (parseInt(part, 10) === value) return true;
+    }
+  }
+  return false;
+}
+
+function parseCron(cron: string): (date: Date) => boolean {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== 5) {
+    throw new Error(`Invalid cron expression: "${cron}". Must have 5 fields.`);
+  }
+  
+  return (date: Date) => {
+    const mins = date.getMinutes();
+    const hours = date.getHours();
+    const dom = date.getDate();
+    const month = date.getMonth() + 1; // getMonth is 0-indexed
+    const dow = date.getDay(); // 0 is Sunday
+    
+    return matchField(mins, fields[0]) &&
+           matchField(hours, fields[1]) &&
+           matchField(dom, fields[2]) &&
+           matchField(month, fields[3]) &&
+           matchField(dow, fields[4]);
+  };
+}
+
+export class PluginScheduler {
+  private static instance: PluginScheduler | null = null;
+  private store: Store;
+  private tasks: Map<string, TaskRecord> = new Map();
+  private timer: NodeJS.Timeout | null = null;
+
+  private constructor() {
+    this.store = new Store({ name: 'plugin_scheduler_tasks' });
+    this.loadTasks();
+  }
+
+  public static getInstance(): PluginScheduler {
+    if (!PluginScheduler.instance) {
+      PluginScheduler.instance = new PluginScheduler();
+    }
+    return PluginScheduler.instance;
+  }
+
+  private loadTasks() {
+    const rawTasks = this.store.get('tasks') as Record<string, TaskRecord> || {};
+    this.tasks = new Map(Object.entries(rawTasks));
+    console.log(`[PluginScheduler] Loaded ${this.tasks.size} scheduled tasks from store.`);
+  }
+
+  private saveTasks() {
+    const obj = Object.fromEntries(this.tasks.entries());
+    this.store.set('tasks', obj);
+  }
+
+  public async register(
+    pluginId: string,
+    options: {
+      id: string;
+      cron?: string;
+      intervalMs?: number;
+      once?: boolean;
+      executeAt?: number;
+      command?: string;
+      args?: string[];
+      cwd?: string;
+      prompt?: string;
+    }
+  ): Promise<void> {
+    let targetId = options.id;
+    const prefix = `${pluginId}:`;
+    if (options.id.startsWith(prefix)) {
+      targetId = options.id.slice(prefix.length);
+    }
+    const key = `${pluginId}:${targetId}`;
+    const existing = this.tasks.get(key);
+    
+    // If it's a cron task, validate it (unless it's a special keyword like first-open)
+    if (options.cron && !['first-open', 'daily-first', '@startup'].includes(options.cron.toLowerCase())) {
+      try {
+        parseCron(options.cron);
+      } catch (e) {
+        throw new Error(`Invalid cron expression for task "${options.id}": ${(e as Error).message}`);
+      }
+    }
+
+    const record: TaskRecord = {
+      pluginId,
+      taskId: targetId,
+      cron: options.cron,
+      intervalMs: options.intervalMs,
+      once: options.once,
+      executeAt: options.executeAt,
+      lastRunTime: existing ? existing.lastRunTime : (options.intervalMs ? Date.now() : 0),
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      prompt: options.prompt,
+    };
+
+    this.tasks.set(key, record);
+    this.saveTasks();
+    console.log(`[PluginScheduler] Registered task: ${key} (cron: ${options.cron}, intervalMs: ${options.intervalMs}, once: ${options.once}, executeAt: ${options.executeAt})`);
+  }
+
+  public async unregister(pluginId: string, id: string): Promise<void> {
+    let targetId = id;
+    const prefix = `${pluginId}:`;
+    if (id.startsWith(prefix)) {
+      targetId = id.slice(prefix.length);
+    }
+    const key = `${pluginId}:${targetId}`;
+    if (this.tasks.has(key)) {
+      this.tasks.delete(key);
+      this.saveTasks();
+      console.log(`[PluginScheduler] Unregistered task: ${key}`);
+    }
+  }
+
+  public list(pluginId?: string): TaskRecord[] {
+    const all = Array.from(this.tasks.values());
+    if (pluginId) {
+      return all.filter(t => t.pluginId === pluginId);
+    }
+    return all;
+  }
+
+  public start() {
+    if (this.timer) return;
+    
+    console.log('[PluginScheduler] Starting background task scheduler...');
+    // Tick every minute
+    this.timer = setInterval(() => this.tick(), 60000);
+    
+    // Run an initial tick after a short delay (e.g. 5 seconds) to catch up overdue interval tasks
+    setTimeout(() => this.tick(), 5000);
+  }
+
+  public stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+      console.log('[PluginScheduler] Stopped background task scheduler.');
+    }
+  }
+
+  private tick() {
+    const now = Date.now();
+    const date = new Date(now);
+    let changed = false;
+
+    for (const [key, task] of this.tasks.entries()) {
+      let shouldRun = false;
+
+      if (task.executeAt && task.executeAt > 0) {
+        if (now >= task.executeAt) {
+          shouldRun = true;
+        }
+      } else if (task.intervalMs && task.intervalMs > 0) {
+        if (task.lastRunTime > 0 && now - task.lastRunTime >= task.intervalMs) {
+          shouldRun = true;
+        }
+      } else if (task.cron) {
+        try {
+          const cronLower = task.cron.toLowerCase();
+          if (['first-open', 'daily-first', '@startup'].includes(cronLower)) {
+            const taskKey = `${task.pluginId}:${task.taskId}`;
+            const { WorkflowRunner } = await import('./workflow-runner');
+            if (!WorkflowRunner.getInstance().hasRunToday(taskKey)) {
+              shouldRun = true;
+              WorkflowRunner.getInstance().markRunToday(taskKey);
+            }
+          } else {
+            const matcher = parseCron(task.cron);
+            if (matcher(date)) {
+              // Check if we already ran it in the current minute (60s) to prevent double trigger
+              const lastRunDate = new Date(task.lastRunTime);
+              const isSameMinute = lastRunDate.getFullYear() === date.getFullYear() &&
+                                   lastRunDate.getMonth() === date.getMonth() &&
+                                   lastRunDate.getDate() === date.getDate() &&
+                                   lastRunDate.getHours() === date.getHours() &&
+                                   lastRunDate.getMinutes() === date.getMinutes();
+              if (!isSameMinute) {
+                shouldRun = true;
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`[PluginScheduler] Error matching cron for task ${key}:`, err);
+        }
+      }
+
+      if (shouldRun) {
+        console.log(`[PluginScheduler] Triggering task ${key}`);
+        task.lastRunTime = now;
+        changed = true;
+        
+        this.executeTask(task);
+
+        if (task.once || (task.executeAt && task.executeAt > 0)) {
+          this.tasks.delete(key);
+          console.log(`[PluginScheduler] Auto-unregistered one-time task: ${key}`);
+        }
+      }
+    }
+
+    if (changed) {
+      this.saveTasks();
+    }
+  }
+
+  private async executeTask(task: TaskRecord) {
+    try {
+      if (task.prompt) {
+        // AI Agent Prompt Task
+        console.log(`[PluginScheduler] Dispatching Agent Prompt for scheduled task ${task.taskId}`);
+        const { WorkflowRunner } = await import('./workflow-runner');
+        await WorkflowRunner.getInstance().dispatchToAgent({
+          workDir: task.cwd || '',
+          triggerType: 'schedule',
+          taskPrompt: task.prompt,
+          ruleId: task.taskId,
+        });
+      } else if (task.command) {
+        console.log(`[PluginScheduler] Executing scheduled system command for task ${task.taskId}: ${task.command} ${task.args?.join(' ')}`);
+        const { executeSystemCommand } = await import('./controllers/system');
+        await executeSystemCommand(task.pluginId, {
+          command: task.command,
+          args: task.args,
+          cwd: task.cwd,
+        });
+      } else {
+        const pm = PluginManager.getInstance();
+        if (pm.isBackgroundPluginRunning(task.pluginId)) {
+          console.log(`[PluginScheduler] Dispatching trigger event to background plugin: ${task.pluginId}`);
+          pm.emitToBackgroundPlugin(task.pluginId, 'scheduler:trigger', { taskId: task.taskId });
+        }
+        ipcMain.emit('scheduler:trigger', {}, { taskId: task.taskId, pluginId: task.pluginId });
+      }
+    } catch (err) {
+      console.error(`[PluginScheduler] Error executing task ${task.pluginId}:${task.taskId}:`, err);
+    }
+  }
+
+  private parseScheduleMd(content: string): Array<{ id: string; cron: string; command: string }> {
+    const tasks: Array<{ id: string; cron: string; command: string }> = []
+    
+    // Support bullet point blocks:
+    // - `task_id`:
+    //   - Cron: `*/5 * * * *`
+    //   - Execute: `npm run lint`
+    const blockRegex = /-\s*`([^`:]+)`:\s*\n(?:\s*- [Cc]ron:\s*`([^`]+)`\s*\n\s*- [Ee]xecute:\s*`([^`]+)`|\s*- [Ee]xecute:\s*`([^`]+)`\s*\n\s*- [Cc]ron:\s*`([^`]+)`)/g
+    let match
+    while ((match = blockRegex.exec(content)) !== null) {
+      const id = match[1].trim()
+      const cron = (match[2] || match[5] || '').trim()
+      const command = (match[3] || match[4] || '').trim()
+      if (id && cron && command) {
+        tasks.push({ id, cron, command })
+      }
+    }
+
+    // Reset regex index
+    blockRegex.lastIndex = 0
+
+    // Support inline list format:
+    // - ID: `task_id`, Cron: `*/5 * * * *`, Execute: `npm run lint`
+    const inlineRegex = /-\s*(?:ID|id):\s*`([^`]+)`,\s*(?:Cron|cron):\s*`([^`]+)`,\s*(?:Execute|execute):\s*`([^`]+)`/g
+    while ((match = inlineRegex.exec(content)) !== null) {
+      const id = match[1].trim()
+      const cron = match[2].trim()
+      const command = match[3].trim()
+      if (id && cron && command) {
+        tasks.push({ id, cron, command })
+      }
+    }
+
+    // Support table format:
+    // | task_id | */5 * * * * | npm run lint |
+    const lines = content.split('\n')
+    for (const line of lines) {
+      if (line.trim().startsWith('|') && !line.includes('---')) {
+        const parts = line.split('|').map(p => p.trim()).filter(Boolean)
+        if (parts.length >= 3) {
+          const id = parts[0].replace(/`/g, '').trim()
+          const cron = parts[1].replace(/`/g, '').trim()
+          const command = parts[2].replace(/`/g, '').trim()
+          const isValidCron = cron.split(/\s+/).length === 5 || ['first-open', 'daily-first', '@startup'].includes(cron.toLowerCase());
+          if (isValidCron && id && command && id !== 'ID' && id !== 'id') {
+            tasks.push({ id, cron, command });
+          }
+        }
+      }
+    }
+
+    return tasks
+  }
+
+  public async loadWorkspaceSchedule(workDir: string): Promise<void> {
+    let scheduleMdPath = join(workDir, '.skills', 'schedule.md')
+    if (!fs.existsSync(scheduleMdPath)) {
+      scheduleMdPath = join(workDir, 'skills', 'schedule.md')
+    }
+    if (!fs.existsSync(scheduleMdPath)) {
+      return
+    }
+
+    try {
+      console.log(`[PluginScheduler] Loading schedule.md from ${scheduleMdPath}`)
+      const content = fs.readFileSync(scheduleMdPath, 'utf8')
+      const tasks = this.parseScheduleMd(content)
+
+      // Unregister old tasks for this workspace
+      const allTasks = this.list('workspace-schedule')
+      for (const t of allTasks) {
+        await this.unregister('workspace-schedule', t.taskId)
+      }
+
+      // Register new tasks
+      for (const t of tasks) {
+        const isCliCommand = /^(npm|node|npx|pnpm|yarn|bun|bash|sh)\s/i.test(t.command.trim());
+        if (isCliCommand) {
+          const cmdParts = t.command.split(/\s+/);
+          await this.register('workspace-schedule', {
+            id: t.id,
+            cron: t.cron,
+            command: cmdParts[0],
+            args: cmdParts.slice(1),
+            cwd: workDir,
+          });
+        } else {
+          await this.register('workspace-schedule', {
+            id: t.id,
+            cron: t.cron,
+            prompt: t.command,
+            cwd: workDir,
+          });
+        }
+        console.log(`[PluginScheduler] Successfully loaded scheduled task: ${t.id} -> ${t.cron} (${t.command})`);
+      }
+    } catch (err) {
+      console.error('[PluginScheduler] Error loading workspace schedule:', err)
+    }
+  }
+}

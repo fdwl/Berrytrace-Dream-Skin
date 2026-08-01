@@ -1,0 +1,16 @@
+diff --git a/electron/services/memory-monitor.ts b/electron/services/memory-monitor.ts
+index b8c3de7..34e0356 100644
+--- a/electron/services/memory-monitor.ts
++++ b/electron/services/memory-monitor.ts
+@@ -123,8 +123,10 @@ export class MemoryMonitor {
+       // Note: render frames may be disposed (navigating/crashed) — wrap each send individually
+       BrowserWindow.getAllWindows().forEach((win) => {
+         if (win.isDestroyed()) return
++        const wc = win.webContents
++        if (!wc || wc.isDestroyed() || wc.isCrashed()) return
+         try {
+-          win.webContents.send('system:request-gc')
++          wc.send('system:request-gc')
+         } catch (err) {
+           // Render frame disposed during page load or navigation — safe to ignore
+         }

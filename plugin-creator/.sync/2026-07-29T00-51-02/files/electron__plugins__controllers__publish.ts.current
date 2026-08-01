@@ -1,0 +1,255 @@
+// httpService 依赖统一的 storage 抽象，主进程需在 import 前注入 ElectronCache 后端
+import { setStorageBackend } from '../../../src/config/storage';
+import { cache as electronCache } from '../../config/index';
+setStorageBackend(electronCache);
+
+import { httpService } from '../../../src/services/http';
+import type { ApiContext} from './api-context';
+import { BaseApiController } from './api-context';
+import { ElectronAuthManager } from '../../services/auth-manager';
+
+/**
+ * PublishController - 临时发布/分享文档功能
+ *
+ * 通过 httpService 发起 HTTP 请求到 berrytrace 服务器，复用统一的：
+ *   - VITE_APP_API_URL（环境变量基地址）
+ *   - Authorization: Bearer <token>（登录鉴权）
+ *   - X-App-Package、X-App-Version、X-App-Platform 等标准请求头
+ *   - 统一的响应格式解析与错误处理
+ */
+
+interface ApiResponse<T> {
+  code: number;
+  message: string;
+  data: T;
+}
+
+interface CreateShareArgs {
+  title: string;
+  content: string;
+  expire: '1h' | '1d' | '7d' | '30d';
+  password?: string;
+  /** 权限模式: readonly / login_edit / anonymous_edit，默认 readonly */
+  perm_mode?: 'readonly' | 'login_edit' | 'anonymous_edit';
+  /** Tiptap JSON 内容（协同编辑模式需要） */
+  content_json?: string;
+  /** 敏感内容标记 */
+  is_nsfw?: boolean;
+}
+
+interface CreateShareData {
+  share_id: string;
+  url: string;
+  expire_at: string;
+  password_protected: boolean;
+  /** 协同编辑 WebSocket 地址 */
+  collab_url?: string;
+  /** 权限模式 */
+  perm_mode?: string;
+  /** 是否开启协同编辑 */
+  enable_collab?: boolean;
+  /** 文档 ID（= share_id） */
+  doc_id?: string;
+  /** Tiptap JSON 内容 */
+  content_json?: string;
+  /** 分享链接 */
+  share_url?: string;
+}
+
+interface DeleteShareArgs { share_id: string; }
+
+interface ListShareItem {
+  share_id: string;
+  title: string;
+  url: string;
+  created_at: string;
+  expire_at: string;
+  views: number;
+}
+
+interface ListShareData {
+  shares: ListShareItem[];
+  total: number;
+}
+
+interface UpdateShareArgs {
+  share_id: string;
+  content: string;
+  title?: string;
+  expire?: '1h' | '1d' | '7d' | '30d';
+  /** 切换权限模式 */
+  perm_mode?: 'readonly' | 'login_edit' | 'anonymous_edit';
+  /** Tiptap JSON 内容 */
+  content_json?: string;
+}
+
+function ensureAuth(): string {
+  const token = ElectronAuthManager.getInstance().getToken();
+  if (!token) {
+    throw new Error('请先登录后再操作分享链接。点击主界面右上角头像进行登录。');
+  }
+  httpService.setAuthToken(token);
+  return token;
+}
+
+async function apiPost<T>(url: string, data: Record<string, unknown>): Promise<T> {
+  // 使用 formData: true (multipart/form-data) 与服务端 API 规范一致
+  // 服务端 publish/create, publish/update, publish/delete, publish/list 均要求 multipart/form-data
+  const resp = await httpService.post<ApiResponse<T>>({ url, data, formData: true });
+  if (resp.code !== 200) {
+    throw new Error(resp.message || `服务器返回错误 (${resp.code})`);
+  }
+  return resp.data;
+}
+
+export class PublishController extends BaseApiController {
+
+  /**
+   * 创建分享链接。需先登录。
+   * @param args title — 标题，content — 内容（Markdown），expire — 过期时间（1h/1d/7d/30d），password — 密码（可选），perm_mode — 权限模式（可选），content_json — Tiptap JSON（可选），is_nsfw — 敏感内容标记（可选）
+   * @returns { share_id, url, expire_at, collab_url?, perm_mode?, share_url? }
+   */
+  async publish_createShare(args: CreateShareArgs, context: ApiContext): Promise<CreateShareData> {
+    const { title, content, expire, password, perm_mode, content_json, is_nsfw } = args;
+    ensureAuth();
+
+    if (!title || !content || !expire) {
+      throw new Error('缺少必填参数：title, content, expire');
+    }
+
+    const validExpires = ['1h', '1d', '7d', '30d'];
+    if (!validExpires.includes(expire)) {
+      throw new Error(`无效的过期时间：${expire}，可选值：${validExpires.join(', ')}`);
+    }
+
+    const payload: Record<string, unknown> = {
+      plugin_id: context.pluginId || 'com.berrytrace.app',
+      title, content, expire,
+      timestamp: String(Math.floor(Date.now() / 1000)),
+    };
+    if (password) payload.password = password;
+    if (perm_mode) payload.perm_mode = perm_mode;
+    if (content_json) payload.content_json = content_json;
+    if (is_nsfw !== undefined) payload.is_nsfw = is_nsfw;
+
+    console.log(`[PublishController] Creating share: title="${title}", expire=${expire}, perm_mode=${perm_mode || 'readonly'}, content_length=${content.length}`);
+
+    try {
+      const data = await apiPost<CreateShareData>('publish/create', payload);
+      console.log(`[PublishController] Share created: share_id=${data.share_id}, url=${data.url}, collab=${!!data.collab_url}`);
+      return data;
+    } catch (err: unknown) {
+      console.error('[PublishController] createShare failed:', err);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  /**
+   * 删除分享链接。
+   * @param args share_id — 分享 ID
+   */
+  async publish_deleteShare(args: DeleteShareArgs, context: ApiContext): Promise<{ success: boolean }> {
+    const { share_id } = args;
+    ensureAuth();
+    if (!share_id) throw new Error('缺少必填参数：share_id');
+
+    console.log(`[PublishController] Deleting share: share_id=${share_id}`);
+
+    try {
+      const data = await apiPost<{ success: boolean }>('publish/delete', {
+        plugin_id: context.pluginId || 'com.berrytrace.app',
+        share_id,
+        timestamp: String(Math.floor(Date.now() / 1000)),
+      });
+      console.log(`[PublishController] Share deleted: share_id=${share_id}, success=${data.success}`);
+      return data;
+    } catch (err: unknown) {
+      console.error('[PublishController] deleteShare failed:', err);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  /**
+   * 列出当前用户所有分享。
+   * @returns { shares: [{ share_id, title, url, created_at, expire_at, views }], total }
+   */
+  async publish_listShares(_args: unknown, context: ApiContext): Promise<ListShareData> {
+    ensureAuth();
+    console.log('[PublishController] Listing shares');
+
+    try {
+      const data = await apiPost<ListShareData>('publish/list', {
+        plugin_id: context.pluginId || 'com.berrytrace.app',
+        timestamp: String(Math.floor(Date.now() / 1000)),
+      });
+      console.log(`[PublishController] Listed ${data.shares?.length || 0} shares`);
+      return data;
+    } catch (err: unknown) {
+      console.error('[PublishController] listShares failed:', err);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  /**
+   * 更新分享链接内容。
+   * @param args share_id — 分享 ID，content — 新内容，title — 新标题（可选），expire — 过期时间（可选），perm_mode — 权限模式（可选），content_json — Tiptap JSON（可选）
+   */
+  async publish_updateShare(args: UpdateShareArgs, context: ApiContext): Promise<CreateShareData> {
+    const { share_id, content, title, expire, perm_mode, content_json } = args;
+    ensureAuth();
+    if (!share_id || !content) throw new Error('缺少必填参数：share_id, content');
+
+    const payload: Record<string, unknown> = {
+      plugin_id: context.pluginId || 'com.berrytrace.app',
+      share_id, content,
+      timestamp: String(Math.floor(Date.now() / 1000)),
+    };
+    if (title) payload.title = title;
+    if (expire) payload.expire = expire;
+    if (perm_mode) payload.perm_mode = perm_mode;
+    if (content_json) payload.content_json = content_json;
+
+    console.log(`[PublishController] Updating share: share_id=${share_id}, content_length=${content.length}, perm_mode=${perm_mode || '(unchanged)'}`);
+
+    try {
+      const data = await apiPost<CreateShareData>('publish/update', payload);
+      console.log(`[PublishController] Share updated: share_id=${data.share_id}`);
+      return data;
+    } catch (err: unknown) {
+      console.error('[PublishController] updateShare failed:', err);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  /**
+   * 根据文件路径获取本地分享记录。
+   * @param args filePath — 文件路径，workspacePath — 工作区路径
+   */
+  publish_getShareByPath(args: { filePath: string; workspacePath: string }, _context: ApiContext) {
+    const { filePath, workspacePath } = args;
+    const { ShareFileService } = require('../../services/share-file-service');
+    return ShareFileService.getInstance().getShareByPath(workspacePath, filePath);
+  }
+
+  /**
+   * 添加或更新本地分享记录。
+   * @param args filePath — 文件路径，workspacePath — 工作区路径，record — 分享记录
+   */
+  publish_addOrUpdateShare(args: { filePath: string; workspacePath: string; record: Record<string, unknown> }, _context: ApiContext) {
+    const { filePath, workspacePath, record } = args;
+    const { ShareFileService } = require('../../services/share-file-service');
+    ShareFileService.getInstance().addOrUpdateShare(workspacePath, filePath, record as any);
+    return { success: true };
+  }
+
+  /**
+   * 删除本地分享记录。
+   * @param args filePath — 文件路径，workspacePath — 工作区路径
+   */
+  publish_removeShare(args: { filePath: string; workspacePath: string }, _context: ApiContext) {
+    const { filePath, workspacePath } = args;
+    const { ShareFileService } = require('../../services/share-file-service');
+    const result = ShareFileService.getInstance().removeShare(workspacePath, filePath);
+    return { success: result };
+  }
+}

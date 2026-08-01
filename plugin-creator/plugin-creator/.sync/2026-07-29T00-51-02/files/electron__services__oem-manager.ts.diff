@@ -1,0 +1,58 @@
+diff --git a/electron/services/oem-manager.ts b/electron/services/oem-manager.ts
+index f5ef931..6ccc517 100644
+--- a/electron/services/oem-manager.ts
++++ b/electron/services/oem-manager.ts
+@@ -105,6 +105,53 @@ class OEMManager {
+       return this.getConfig();
+     });
+   }
++
++  /**
++   * 获取系统中所有已知 OEM 配置文件中声明的所有内置/专有插件 ID 集合
++   */
++  public getAllOEMBuiltinPlugins(): Set<string> {
++    const set = new Set<string>();
++
++    // 默认包含硬编码已知的 OEM builtin 插件
++    set.add('com.berrytrace.plugin.online');
++    set.add('com.berrytrace.plugin.heigelasi');
++
++    try {
++      const searchDirs = [
++        process.cwd(),
++        app.getAppPath(),
++        path.dirname(app.getPath('exe')),
++      ];
++
++      for (const dir of searchDirs) {
++        if (!dir || !fs.existsSync(dir)) continue;
++        try {
++          const files = fs.readdirSync(dir);
++          for (const file of files) {
++            if (file.startsWith('oem.') && file.endsWith('.json')) {
++              try {
++                const content = fs.readFileSync(path.join(dir, file), 'utf-8');
++                const parsed = JSON.parse(content);
++                if (Array.isArray(parsed.builtinPlugins)) {
++                  parsed.builtinPlugins.forEach((id: string) => {
++                    if (typeof id === 'string') set.add(id);
++                  });
++                }
++              } catch {
++                // 忽略个别损坏配置的解析错误
++              }
++            }
++          }
++        } catch {
++          // 忽略目录读取错误
++        }
++      }
++    } catch (e) {
++      console.warn('[OEMManager] Failed to scan OEM config files for builtin plugins:', e);
++    }
++
++    return set;
++  }
+ }
+ 
+ export const oemManager = OEMManager.getInstance();

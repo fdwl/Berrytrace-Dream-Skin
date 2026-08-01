@@ -1,0 +1,13 @@
+diff --git a/electron/services/preferences-manager.ts b/electron/services/preferences-manager.ts
+index 1709f34..acd4c42 100644
+--- a/electron/services/preferences-manager.ts
++++ b/electron/services/preferences-manager.ts
+@@ -335,7 +335,7 @@ export function registerPreferencesIpcHandlers(
+             const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(_event.sender)
+             if (workspacePath) {
+               const safeText = text.substring(0, 15).replace(/[\\/:*?"<>|]/g, '_').trim()
+-              const timestamp = new Date().toISOString().replace(/[-:T]/g, '').substring(0, 14)
++              const timestamp = new Date().toISOString().replace(new RegExp('[' + '-:T' + ']', 'g'), '').substring(0, 14)
+               const fileName = `quick_note_${safeText || 'empty'}_${timestamp}.md`
+               const fileContent = `# Quick Note\n\n${text}\n`
+               const targetPath = await WorkspaceManager.getInstance().createFile(workspacePath, fileName, workspacePath, fileContent)

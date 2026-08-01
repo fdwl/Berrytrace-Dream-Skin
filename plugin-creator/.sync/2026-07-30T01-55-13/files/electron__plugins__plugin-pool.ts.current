@@ -1,0 +1,469 @@
+/**
+ * PluginPool — 进程池管理器（C 池）
+ *
+ * 管理一个共享 Host 进程（utilityProcess 运行 plugin-pool-host.js），
+ * 承载所有 processIsolation:'optional' 的 background/hybrid 插件。
+ *
+ * 职责：
+ * 1. 按需启动 Host 进程（首个 optional 插件加载时启动）
+ * 2. 向 Host 发送 pool:load / pool:unload 指令，动态装卸池内插件
+ * 3. 维护共享消息流，为每个池内插件创建 PooledProcessAdapter
+ * 4. Host 进程崩溃时通知所有池内插件的 exit handler，触发看门狗重启
+ * 5. 空闲超时自动关闭 Host 进程（节省内存）
+ *
+ * 线程模型：PluginPool 运行在主进程，Host 进程是 utilityProcess。
+ * 两者通过 IPC 通信，消息格式见 plugin-pool-host.js。
+ *
+ * @see docs/plugin-process-isolation-analysis.md 6.2.1 进程池 C 池
+ */
+
+import { join, dirname, delimiter } from 'path';
+import { fileURLToPath } from 'url';
+import { app, utilityProcess } from 'electron';
+import { PooledProcessAdapter, type IPluginProcess } from './plugin-process-adapter';
+import { PluginWatchdog } from './plugin-watchdog';
+import { addLog } from '../services/logger';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+interface PoolEntry {
+  pluginId: string;
+  adapter: PooledProcessAdapter;
+  /** 插件加载状态回调 */
+  loadedResolve?: () => void;
+  loadedReject?: (err: Error) => void;
+}
+
+export class PluginPool {
+  private static instance: PluginPool;
+
+  /** 共享 Host 进程 */
+  private hostProc: import('electron').UtilityProcess | null = null;
+  /** Host 是否就绪（收到 pool:ready） */
+  private hostReady = false;
+  /** Host 就绪回调队列 */
+  private readyWaiters: (() => void)[] = [];
+  /** 池内插件注册表 */
+  private entries = new Map<string, PoolEntry>();
+  /** 池内插件的消息处理器注册表（直接路由模式，取代广播） */
+  private pooledHandlers = new Map<string, (msg: unknown) => void>();
+  /** 插件卸载状态回调注册表 */
+  private unloadResolvers = new Map<string, () => void>();
+  /** 空闲关闭定时器（池空时 30s 后关闭 Host 进程） */
+  private idleTimer: NodeJS.Timeout | null = null;
+  private readonly IDLE_TIMEOUT_MS = 30_000;
+  /**
+   * loadPlugin 串行化锁。
+   * Host 崩溃恢复时多个池内插件并发 scheduleRestart → loadPlugin，
+   * 串行化避免并发 import() 造成瞬时资源尖峰和加载顺序不确定。
+   * ensureHostReady 的 readyWaiters 队列已保证只启动一个 Host，
+   * 此锁进一步保证 Host ready 后插件按顺序逐一加载。
+   */
+  private loadLock: Promise<void> = Promise.resolve();
+  /** app 正在退出，killHost 时设置，阻止 exit 回调触发崩溃恢复重启 */
+  private isShuttingDown = false;
+
+  private constructor() {}
+
+  public static getInstance(): PluginPool {
+    if (!PluginPool.instance) {
+      PluginPool.instance = new PluginPool();
+    }
+    return PluginPool.instance;
+  }
+
+  /** 池内当前插件数量 */
+  public get size(): number {
+    return this.entries.size;
+  }
+
+  /** 池是否包含指定插件 */
+  public has(pluginId: string): boolean {
+    return this.entries.has(pluginId);
+  }
+
+  /** 注册池内插件的消息处理器（路由模式） */
+  public registerPooledHandler(pluginId: string, handler: (msg: unknown) => void): () => void {
+    this.pooledHandlers.set(pluginId, handler);
+    return () => {
+      this.pooledHandlers.delete(pluginId);
+    };
+  }
+
+  /**
+   * 加载插件到池中。
+   * 如果 Host 进程尚未启动，先启动。返回 PooledProcessAdapter 供 PluginLauncher 注册。
+   *
+   * 通过 loadLock 串行化，避免 Host 崩溃恢复时多个插件并发 import()。
+   */
+  public async loadPlugin(
+    pluginId: string,
+    pluginPath: string,
+    manifest: { main?: string; processIsolation?: string },
+  ): Promise<IPluginProcess> {
+    // 已在池中（快速路径，不加锁）
+    if (this.entries.has(pluginId)) {
+      return this.entries.get(pluginId)!.adapter;
+    }
+
+    // 串行化加载：排队等待前一个 loadPlugin 完成
+    let resolveAdapter!: (adapter: IPluginProcess) => void;
+    let rejectAdapter!: (err: Error) => void;
+    const result = new Promise<IPluginProcess>((resolve, reject) => {
+      resolveAdapter = resolve;
+      rejectAdapter = reject;
+    });
+
+    this.loadLock = this.loadLock
+      .then(() =>
+        this.loadPluginInner(pluginId, pluginPath, manifest)
+          .then(resolveAdapter, rejectAdapter)
+      )
+      .catch(() => {});
+
+    return result;
+  }
+
+  /** loadPlugin 的实际实现（由 loadLock 串行化调用） */
+  private async loadPluginInner(
+    pluginId: string,
+    pluginPath: string,
+    manifest: { main?: string; processIsolation?: string },
+  ): Promise<IPluginProcess> {
+    // 再次检查（可能在排队期间已被其他调用加载）
+    if (this.entries.has(pluginId)) {
+      return this.entries.get(pluginId)!.adapter;
+    }
+
+    // 确保 Host 进程就绪
+    await this.ensureHostReady();
+
+    // 清除空闲关闭定时器（有插件要加载了）
+    this.clearIdleTimer();
+
+    // 为每个池内插件注册看门狗监控（共享 PID，但独立跟踪心跳）
+    PluginWatchdog.getInstance().registerPlugin(pluginId);
+
+    // 创建 adapter（路由模式，传入注册函数）
+    const registerHandler = (pid: string, handler: (msg: unknown) => void): (() => void) => {
+      return this.registerPooledHandler(pid, handler);
+    };
+    const adapter = new PooledProcessAdapter(pluginId, this.hostProc!, registerHandler);
+
+    const entry: PoolEntry = { pluginId, adapter };
+    this.entries.set(pluginId, entry);
+
+    // 向 Host 发送加载指令
+    const loadPromise = new Promise<void>((resolve, reject) => {
+      entry.loadedResolve = resolve;
+      entry.loadedReject = reject;
+    });
+
+    this.hostProc!.postMessage({
+      type: 'pool:load',
+      pluginId,
+      pluginPath,
+      mainFile: manifest.main || 'dist/index.js',
+    });
+
+    // 等待 Host 确认加载完成（或超时）
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Pool load timeout for "${pluginId}"`)), 15_000)
+    );
+
+    try {
+      await Promise.race([loadPromise, timeout]);
+      console.log(`[PluginPool] Plugin "${pluginId}" loaded into pool (pool size: ${this.entries.size})`);
+    } catch (err) {
+      // 加载失败：回滚注册
+      this.entries.delete(pluginId);
+      PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+      throw err;
+    }
+
+    return adapter;
+  }
+
+  /**
+   * 从池中卸载插件。
+   * 向 Host 发送 pool:unload，Host 调用插件的 deactivate()。
+   */
+  public async unloadPlugin(pluginId: string): Promise<void> {
+    const entry = this.entries.get(pluginId);
+    if (!entry) return;
+
+    const unloadPromise = new Promise<void>((resolve) => {
+      this.unloadResolvers.set(pluginId, resolve);
+      // 超时兜底
+      setTimeout(() => {
+        if (this.unloadResolvers.get(pluginId) === resolve) {
+          this.unloadResolvers.delete(pluginId);
+          resolve();
+        }
+      }, 10_000);
+    });
+
+    this.hostProc?.postMessage({ type: 'pool:unload', pluginId });
+    await unloadPromise;
+
+    this.entries.delete(pluginId);
+    PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+    console.log(`[PluginPool] Plugin "${pluginId}" unloaded from pool (pool size: ${this.entries.size})`);
+
+    // 池空时启动空闲关闭定时器
+    if (this.entries.size === 0) {
+      this.startIdleTimer();
+    }
+  }
+
+  /** 获取 Host 进程 PID */
+  public get pid(): number | undefined {
+    return this.hostProc?.pid;
+  }
+
+  /**
+   * 强制终止 Host 进程（看门狗对池内插件执行 kill 时调用）。
+   * 池化插件共享 Host，单个插件心跳/CPU 超时等需终止进程的场景下，
+   * 软卸载（pool:unload）无法处理卡死的 Host，必须直接 kill 整个进程。
+   * Host exit handler 会统一清理所有池内插件并触发看门狗恢复。
+   */
+  public killHost(shuttingDown = false): void {
+    if (shuttingDown) {
+      this.isShuttingDown = true;
+    }
+    if (this.hostProc) {
+      console.log(`[PluginPool] Force-killing Host process (shuttingDown=${shuttingDown})`);
+      this.clearIdleTimer();
+      // 释放所有等待中的 unloadResolvers，避免退出时挂起
+      for (const resolve of this.unloadResolvers.values()) resolve();
+      this.unloadResolvers.clear();
+      // 释放所有正在等待 pool:ready 的调用者（避免 ensureHostReady 永久挂起）
+      for (const waiter of this.readyWaiters) waiter();
+      this.readyWaiters = [];
+      // 重置加载锁，防止后续 loadPlugin 调用排队在已失效的 promise 后面
+      this.loadLock = Promise.resolve();
+      this.hostProc.kill();
+      // exit handler 会处理后续清理；shuttingDown=true 时跳过崩溃恢复
+    }
+  }
+
+  // ─── 私有方法 ─────────────────────────────────────────────────────────────
+
+  /** 确保 Host 进程已启动并就绪 */
+  private async ensureHostReady(): Promise<void> {
+    if (this.hostReady && this.hostProc) return;
+
+    if (!this.hostProc) {
+      this.startHost();
+    }
+
+    // 等待 pool:ready
+    if (!this.hostReady) {
+      await new Promise<void>((resolve) => {
+        this.readyWaiters.push(resolve);
+      });
+    }
+  }
+
+  /** 启动 Host 进程 */
+  private startHost(): void {
+    const hostScript = join(__dirname, 'plugin-pool-host.js');
+    console.log(`[PluginPool] Starting Host process: ${hostScript}`);
+
+    // 将宿主 node_modules 注入 NODE_PATH，确保池内插件及其 spawn 的子进程
+    // (如 tts-server.cjs / stt-server.cjs) 能解析宿主依赖 (sherpa-onnx-node 等)
+    const hostNodeModules = join(__dirname, '..', 'node_modules');
+    const existingNodePath = process.env.NODE_PATH || '';
+    const nodePath = existingNodePath
+      ? `${hostNodeModules}${delimiter}${existingNodePath}`
+      : hostNodeModules;
+    console.log(`[PluginPool] NODE_PATH for pool host: ${nodePath}`);
+
+    this.hostProc = utilityProcess.fork(hostScript, [], {
+      serviceName: 'plugin-pool-host',
+      stdio: 'pipe',
+      execArgv: ['--max-old-space-size=1024'],
+      env: { ...process.env, NODE_PATH: nodePath },
+    });
+
+    // 消息路由：直接分发到对应插件的 handler (O(1) 路由)
+    this.hostProc.on('message', (msg: unknown) => {
+      const m = msg as Record<string, unknown>;
+
+      // Host 就绪
+      if (m.type === 'pool:ready') {
+        this.hostReady = true;
+        console.log('[PluginPool] Host process ready');
+        for (const waiter of this.readyWaiters) waiter();
+        this.readyWaiters = [];
+        return;
+      }
+
+      // 插件加载完成
+      if (m.type === 'pool:loaded') {
+        const entry = this.entries.get(m.pluginId as string);
+        if (entry) {
+          if (m.success) {
+            entry.loadedResolve?.();
+          } else {
+            entry.loadedReject?.(new Error(m.error as string));
+          }
+          entry.loadedResolve = undefined;
+          entry.loadedReject = undefined;
+        }
+        return;
+      }
+
+      // 插件卸载完成
+      if (m.type === 'pool:unloaded') {
+        const resolve = this.unloadResolvers.get(m.pluginId as string);
+        if (resolve) {
+          resolve();
+          this.unloadResolvers.delete(m.pluginId as string);
+        }
+        return;
+      }
+
+      // 插件自检后主动请求卸载
+      if (m.type === 'pool:self-unloaded') {
+        const pluginId = m.pluginId as string;
+        console.log(`[PluginPool] Plugin "${pluginId}" self-unloaded from pool (pool size: ${this.entries.size})`);
+        this.entries.delete(pluginId);
+        PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+        import('./plugin-manager').then(({ PluginManager }) => {
+          PluginManager.getInstance().handlePluginSelfUnloaded(pluginId);
+        }).catch(err => {
+          console.error(`[PluginPool] Failed to notify PluginManager of self-unload for "${pluginId}":`, err);
+        });
+        if (this.entries.size === 0) {
+          this.startIdleTimer();
+        }
+        return;
+      }
+
+      // 池心跳：Host Runner 统一发送一份，附带所有插件 ID。
+      // 使用池级 OOM 检测，避免多个插件重复触发重启风暴。
+      if (m.type === 'sdk:heartbeat' && Array.isArray(m.poolPluginIds)) {
+        const metrics = m.metrics as import('./plugin-watchdog').PluginMetrics;
+        if (metrics) {
+          PluginWatchdog.getInstance().checkPoolHeartbeat('shared-plugin-pool', m.poolPluginIds as string[], metrics);
+        }
+        return; // 心跳不分发给共享监听器
+      }
+
+      // 池错误：Host Runner 报告未捕获异常
+      if (m.type === 'pool:error') {
+        console.error(`[PluginPool] Host error (plugins: ${m.pluginIds}): ${m.error}`);
+        return;
+      }
+
+      // 其他消息（插件事件、callApi 响应等，带 sourcePluginId）直接路由分发
+      const sourcePid = m.sourcePluginId as string;
+      if (sourcePid) {
+        const handler = this.pooledHandlers.get(sourcePid);
+        if (handler) {
+          try { handler(msg); } catch (err) { console.error(err); }
+        } else {
+          console.warn(`[PluginPool] No handler registered for pooled plugin "${sourcePid}", msg type=${m.type} dropped`);
+        }
+      } else {
+        console.warn(`[PluginPool] Received message without sourcePluginId, type=${m.type} dropped`);
+      }
+    });
+
+    // stdout/stderr 日志 — 行分割后进入 Logger
+    let poolStdoutRemainder = '';
+    this.hostProc.stdout?.on('data', (chunk: Buffer) => {
+      const str = chunk.toString('utf-8');
+      process.stdout.write(str);
+      poolStdoutRemainder += str;
+      const lines = poolStdoutRemainder.split(/\r?\n/);
+      poolStdoutRemainder = lines.pop() || '';
+      for (const line of lines) {
+        addLog('info', 'plugin-pool', line);
+      }
+    });
+    this.hostProc.stdout?.on('end', () => {
+      if (poolStdoutRemainder.trim()) {
+        addLog('info', 'plugin-pool', poolStdoutRemainder);
+      }
+    });
+
+    let poolStderrRemainder = '';
+    this.hostProc.stderr?.on('data', (chunk: Buffer) => {
+      const str = chunk.toString('utf-8');
+      process.stderr.write(str);
+      poolStderrRemainder += str;
+      const lines = poolStderrRemainder.split(/\r?\n/);
+      poolStderrRemainder = lines.pop() || '';
+      for (const line of lines) {
+        addLog('warn', 'plugin-pool:stderr', line);
+      }
+    });
+    this.hostProc.stderr?.on('end', () => {
+      if (poolStderrRemainder.trim()) {
+        addLog('warn', 'plugin-pool:stderr', poolStderrRemainder);
+      }
+    });
+
+    // Host 进程退出
+    this.hostProc.on('exit', (code: number | null) => {
+      console.log(`[PluginPool] Host process EXITED with code ${code} (shuttingDown=${this.isShuttingDown})`);
+      this.hostReady = false;
+      this.hostProc = null;
+      this.loadLock = Promise.resolve(); // 重置加载锁
+
+      // 拒绝所有正在等待 pool:loaded 确认的调用者（避免 15s 超时阻塞退出）
+      for (const entry of this.entries.values()) {
+        if (entry.loadedReject) {
+          entry.loadedReject(new Error('[PluginPool] Host process exited before plugin load completed'));
+          entry.loadedResolve = undefined;
+          entry.loadedReject = undefined;
+        }
+      }
+
+      // 释放所有仍在等待 pool:ready 的调用者（killHost 时可能未来得及清理）
+      for (const waiter of this.readyWaiters) waiter();
+      this.readyWaiters = [];
+
+      // 清理池内插件注册
+      const crashedPluginIds = Array.from(this.entries.keys());
+      this.entries.clear();
+      this.pooledHandlers.clear();
+      this.unloadResolvers.clear();
+
+      // 退出流程中：跳过看门狗崩溃恢复，避免退出阶段重启插件进程
+      if (this.isShuttingDown) {
+        console.log(`[PluginPool] Skipping watchdog crash recovery for ${crashedPluginIds.length} plugins (app is shutting down).`);
+        return;
+      }
+
+      // 正常崩溃：触发看门狗恢复
+      for (const pluginId of crashedPluginIds) {
+        PluginWatchdog.getInstance().handleCrash(pluginId, code);
+      }
+    });
+  }
+
+  /** 启动空闲关闭定时器 */
+  private startIdleTimer(): void {
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      if (this.entries.size === 0 && this.hostProc) {
+        console.log('[PluginPool] Idle timeout, shutting down Host process');
+        this.hostProc.kill();
+        this.hostProc = null;
+        this.hostReady = false;
+      }
+    }, this.IDLE_TIMEOUT_MS);
+    if (this.idleTimer.unref) this.idleTimer.unref();
+  }
+
+  /** 清除空闲关闭定时器 */
+  private clearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+}

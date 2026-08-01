@@ -1,0 +1,105 @@
+diff --git a/src/stores/workspace.ts b/src/stores/workspace.ts
+index 343f1ca..61c5f64 100644
+--- a/src/stores/workspace.ts
++++ b/src/stores/workspace.ts
+@@ -1,7 +1,7 @@
+ import { create } from 'zustand';
+ import { persist } from 'zustand/middleware';
+-import { Model, Actions, DockLocation, TabNode } from 'flexlayout-react';
+-import type { IJsonModel } from 'flexlayout-react';
++import { Model, Actions, DockLocation } from 'flexlayout-react';
++import type { IJsonModel , TabNode } from 'flexlayout-react';
+ import type { FileEntry } from '../types/file-entry';
+ import { useDashboardStore } from './dashboard';
+ 
+@@ -150,6 +150,10 @@ export interface WorkspaceState {
+   registerFolderContextMenuItem: (config: FolderContextMenuItem) => void;
+   unregisterFolderContextMenuItem: (id: string) => void;
+   openWorkspaceTab: (filePath: string | undefined, pluginId: string, extension?: string, articleId?: string, sessionId?: string, replaceActiveTab?: boolean, title?: string, line?: number, customParams?: Record<string, unknown>) => void;
++  /** 兼容别名 */
++  openTab: (options: { filePath?: string; pluginId: string; extension?: string; articleId?: string; sessionId?: string; replaceActiveTab?: boolean; title?: string; line?: number; customParams?: Record<string, unknown> } | string, pluginId?: string) => void;
++  openTerminalTab: (initialCommand?: string, title?: string) => void;
++  createMarkdownTab: (title?: string) => void;
+   updateTabTitle: (tabId: string, newTitle: string) => void;
+   openWorkspaceTabInNewGroup: (filePath: string | undefined, pluginId: string, extension?: string, articleId?: string, sessionId?: string, line?: number) => void;
+   /** Open a URL in an internal browser tab within the workspace */
+@@ -573,6 +577,46 @@ export const useWorkspaceStore = create<WorkspaceState>()(
+         }
+       },
+ 
++      openTab: (options: any, pluginId?: string) => {
++        if (options && typeof options === 'object') {
++          const { filePath, pluginId: pId, extension, articleId, sessionId, replaceActiveTab, title, line, customParams } = options;
++          get().openWorkspaceTab(filePath, pId || pluginId || '', extension, articleId, sessionId, replaceActiveTab, title, line, customParams);
++        } else {
++          get().openWorkspaceTab(options, pluginId || '', undefined, undefined, undefined, false, undefined, undefined, undefined);
++        }
++      },
++
++      openTerminalTab: (initialCommand?: string, title?: string, autoRun: boolean = true) => {
++        const sessionId = `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
++        get().openWorkspaceTab(
++          undefined,
++          'system.terminal',
++          undefined,
++          undefined,
++          sessionId,
++          false,
++          title || '终端',
++          undefined,
++          initialCommand ? { initialCommand, autoCommand: autoRun ? initialCommand : undefined } : undefined
++        );
++      },
++
++      createMarkdownTab: (title?: string) => {
++        const timestamp = Date.now();
++        const docTitle = title || `未命名.md`;
++        const sessionId = `new_md_${timestamp}`;
++        const virtualPath = `${docTitle.endsWith('.md') ? docTitle : `${docTitle}.md`}`;
++        get().openWorkspaceTab(
++          virtualPath,
++          'system.workspace-blank',
++          'md',
++          undefined,
++          sessionId,
++          false,
++          docTitle
++        );
++      },
++
+       openWorkspaceTabInNewGroup: (filePath, pluginId, extension, articleId, sessionId, line) => {
+         const isLoaded = get().layoutLoaded;
+         if (!isLoaded) {
+@@ -1274,7 +1318,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
+           const currentJson = get().layoutJson || defaultLayoutJson;
+           const model = Model.fromJson(currentJson);
+ 
+-          let fileName = doc.title || (doc.filePath ? getFileName(doc.filePath) : (doc.articleId ? '云端文档.md' : '未命名.md'));
++          const fileName = doc.title || (doc.filePath ? getFileName(doc.filePath) : (doc.articleId ? '云端文档.md' : '未命名.md'));
+           model.doAction(
+             Actions.updateNodeAttributes(tabId, {
+               name: fileName,
+@@ -1305,7 +1349,7 @@ export const useWorkspaceStore = create<WorkspaceState>()(
+           const currentJson = get().layoutJson || defaultLayoutJson;
+           const model = Model.fromJson(currentJson);
+ 
+-          let fileName = doc.title || (doc.filePath ? getFileName(doc.filePath) : (doc.articleId ? '云端文档.md' : '未命名.md'));
++          const fileName = doc.title || (doc.filePath ? getFileName(doc.filePath) : (doc.articleId ? '云端文档.md' : '未命名.md'));
+           model.doAction(
+             Actions.updateNodeAttributes(tabId, {
+               name: fileName,
+@@ -1360,8 +1404,14 @@ export const useWorkspaceStore = create<WorkspaceState>()(
+       name: 'berrytrace-workspace-layout',
+       partialize: (state) => ({
+         showLeftSidebar: state.showLeftSidebar,
++        showRightSidebar: state.showRightSidebar,
+         rightSidebarWidth: state.rightSidebarWidth
+       })
+     }
+   )
+ );
++
++if (typeof window !== 'undefined') {
++  (window as any).useWorkspaceStore = useWorkspaceStore;
++}
++

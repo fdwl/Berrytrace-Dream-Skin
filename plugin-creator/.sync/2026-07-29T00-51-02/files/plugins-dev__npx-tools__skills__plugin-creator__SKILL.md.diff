@@ -1,0 +1,22 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+index 45ab3ee..67f27db 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+@@ -1,7 +1,7 @@
+ ---
+ name: plugin-creator
+ description: BerryTrace 插件开发指南。创建、修改、调试 BerryTrace 插件，或将现有的 GitHub 代码库、NPM 命令行工具包包装/封装为可供 AI 调用的本地插件与 MCP 工具。
+-last_synced_git: 000633f55d75e7e21f60f31432faa6db6e8ff0c8
++last_synced_git: 73e0e5451d2676e00efe027fa18bb5ccdf6c621d
+ ---
+ 
+ # BerryTrace 插件开发指南
+@@ -99,7 +99,7 @@ UI 注册、命令、菜单、激活条件全部在 `plugin.json` 声明，不
+ 8. 事件驱动加载 — `contributes.events.listens` 声明的事件会自动唤醒未运行的插件，注意控制声明范围
+ 9. 事件声明规范 — `listens` 声明监听的事件，`emits` 声明发射的事件，未声明的事件不会推送给该插件
+ 10. OEM 内置插件 — 在 `oem.config.json` 的 `builtinPlugins` 白名单中的插件始终启用，用户无法禁用
+-11. view 构建使用全局 shim — `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand` 从 `window` 全局变量读取，无需 external
++11. view 构建使用全局 shim — `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand`、`lucide-react` 均从 `window` 全局变量读取，无需 external；新增宿主全局变量时需同步更新 `plugins-sdk/cli.js` 的 shim 列表（参见代码注释）
+ 12. 进程隔离 — `required`/`recommended` 独立进程，`optional` 共享池，不做运行时动态切换
+ 
+ ---

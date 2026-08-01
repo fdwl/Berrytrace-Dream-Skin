@@ -1,0 +1,10 @@
+diff --git a/electron/plugins/workflow-dag-builder.ts b/electron/plugins/workflow-dag-builder.ts
+index a5371a5..6546ff4 100644
+--- a/electron/plugins/workflow-dag-builder.ts
++++ b/electron/plugins/workflow-dag-builder.ts
+@@ -1,4 +1,4 @@
+-import { WorkflowStep } from './workflow-types';
++import type { WorkflowStep } from './workflow-types';
+ 
+ export interface ExecutionLayer {
+   layerIndex: number;

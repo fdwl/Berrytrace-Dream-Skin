@@ -1,0 +1,103 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-sdk.js b/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-sdk.js
+index ecbd68d..f9232f3 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-sdk.js
++++ b/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-sdk.js
+@@ -1,3 +1,23 @@
++function getFinalToolName(toolName, pluginId, allowedPrefixes) {
++    const parts = pluginId.split('.');
++    const lastPart = parts[parts.length - 1] || '';
++    const defaultPrefix = lastPart.replace(/-/g, '_').toLowerCase().replace(/_tools$/, '').replace(/_agent$/, '');
++    const prefixes = allowedPrefixes && allowedPrefixes.length > 0
++        ? allowedPrefixes.map(p => p.toLowerCase())
++        : [defaultPrefix];
++    // 校验工具名是否以允许的前缀开头
++    let hasValidPrefix = false;
++    for (const p of prefixes) {
++        if (toolName.startsWith(p + '_')) {
++            hasValidPrefix = true;
++            break;
++        }
++    }
++    if (!hasValidPrefix && pluginId !== 'berrytrace.host' && pluginId !== '') {
++        console.warn(`[PluginsSDK] Warning: Tool "${toolName}" from plugin "${pluginId}" does not follow the naming standard. It should be prefixed with "${prefixes[0]}_".`);
++    }
++    return toolName;
++}
+ export class Plugin {
+     app;
+     manifest;
+@@ -21,7 +41,7 @@ export class View {
+         return true;
+     }
+ }
+-export function createPluginSDK(pluginId) {
++export function createPluginSDK(pluginId, options) {
+     // 同时支持 utilityProcess（parentPort）和 child_process.fork（process.send）
+     // 优先级：parentPort（Electron utilityProcess）> process.send（Node.js child_process.fork）
+     const isNodeBackground = typeof process !== 'undefined' && process.versions && process.versions.node
+@@ -139,7 +159,9 @@ export function createPluginSDK(pluginId) {
+             console.log(`[SDK:${pluginId}] Direct MessagePort connected.`);
+         };
+         postMessageImpl = (msg) => {
+-            if (directPort && (msg.type === 'sdk:callApi:stream-chunk' || msg.type === 'sdk:callApi:stream-end' || msg.type === 'sdk:callApi:stream-error')) {
++            const isHighFreqStreamEvent = msg && msg.type === 'sdk:events:emit' &&
++                (msg.eventName === 'agent:step_update' || msg.eventName === 'agent:stream_delta');
++            if (directPort && (isHighFreqStreamEvent || msg.type === 'sdk:callApi:stream-chunk' || msg.type === 'sdk:callApi:stream-end' || msg.type === 'sdk:callApi:stream-error')) {
+                 directPort.postMessage(msg);
+             }
+             else {
+@@ -302,7 +324,7 @@ export function createPluginSDK(pluginId) {
+                     if (manifest) {
+                         const listens = manifest.contributes?.events?.listens || [];
+                         const isDeclared = listens.some((item) => item.name === eventName);
+-                        const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:'];
++                        const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:'];
+                         const isPlatformEvent = prefixes.some(p => eventName.startsWith(p));
+                         if (isPlatformEvent && eventName !== 'commands:execute' && !isDeclared) {
+                             console.warn(`\x1b[33m[SDK:WARN:${pluginId}] Event "${eventName}" is listened in code but NOT declared in plugin.json listens list! CROSS-PROCESS MESSAGES WILL BE SILENTLY LOST.\x1b[0m`);
+@@ -323,7 +345,7 @@ export function createPluginSDK(pluginId) {
+             };
+         };
+         emitEventImpl = (eventName, payload) => {
+-            const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:'];
++            const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:'];
+             const isPlatformEvent = prefixes.some(p => eventName.startsWith(p));
+             if (isPlatformEvent) {
+                 sendToHost({ type: 'sdk:events:emit', eventName, payload });
+@@ -668,7 +690,8 @@ export function createPluginSDK(pluginId) {
+             registerToolHandler: (toolName, handler) => {
+                 const win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : global);
+                 win._mcpHandlers = win._mcpHandlers || new Map();
+-                win._mcpHandlers.set(`${pluginId}:${toolName}`, handler);
++                const finalName = getFinalToolName(toolName, pluginId || '', options?.toolPrefixes);
++                win._mcpHandlers.set(`${pluginId}:${finalName}`, handler);
+             },
+             registerResourceHandler: (uriPattern, handler) => {
+                 console.log('registerResourceHandler', uriPattern, handler);
+@@ -676,8 +699,10 @@ export function createPluginSDK(pluginId) {
+             registerDynamicTool: async (toolSpec, handler) => {
+                 const win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : global);
+                 win._mcpHandlers = win._mcpHandlers || new Map();
+-                win._mcpHandlers.set(`${pluginId}:${toolSpec.name}`, handler);
+-                await callApi('mcp', 'registerDynamicTool', [pluginId, toolSpec]);
++                const finalName = getFinalToolName(toolSpec.name, pluginId || '', options?.toolPrefixes);
++                win._mcpHandlers.set(`${pluginId}:${finalName}`, handler);
++                const finalSpec = { ...toolSpec, name: finalName };
++                await callApi('mcp', 'registerDynamicTool', [pluginId, finalSpec]);
+             },
+             registerSystemPrompt: async (promptId, promptText) => {
+                 await callApi('mcp', 'registerSystemPrompt', [pluginId, { promptId, promptText }]);
+@@ -687,10 +712,11 @@ export function createPluginSDK(pluginId) {
+             },
+             unregisterDynamicTool: async (toolName) => {
+                 const win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : global);
++                const finalName = getFinalToolName(toolName, pluginId || '', options?.toolPrefixes);
+                 if (win._mcpHandlers) {
+-                    win._mcpHandlers.delete(`${pluginId}:${toolName}`);
++                    win._mcpHandlers.delete(`${pluginId}:${finalName}`);
+                 }
+-                await callApi('mcp', 'unregisterDynamicTool', [pluginId, toolName]);
++                await callApi('mcp', 'unregisterDynamicTool', [pluginId, finalName]);
+             },
+             listTools: () => callApi('mcp', 'listTools'),
+             callTool: (name, args) => callApi('mcp', 'callTool', [name, args]),

@@ -1,0 +1,205 @@
+diff --git a/src/views/plugins/workspace/globals.css b/src/views/plugins/workspace/globals.css
+index 5cc793d..3208c41 100644
+--- a/src/views/plugins/workspace/globals.css
++++ b/src/views/plugins/workspace/globals.css
+@@ -26,19 +26,19 @@
+ }
+ 
+ .flexlayout__tabset_header {
+-  background-color: var(--bg-element, #252526);
+-  border-bottom: 1px solid var(--border-color, #3c3c3c);
++  background-color: var(--bg-page, #18181b) !important;
++  border-bottom: 1px solid var(--border-light, rgba(255, 255, 255, 0.08)) !important;
+   box-sizing: border-box;
+ }
+ 
+ .flexlayout__tab {
+-  background-color: var(--bg-page, #1e1e1e);
++  background-color: var(--bg-page, #18181b);
+   overflow: hidden;
+ }
+ 
+ .flexlayout__tab_button {
+   background-color: transparent;
+-  color: var(--text-secondary, #969696);
++  color: var(--text-tertiary, #969696);
+   font-size: 12px;
+   padding: 6px 14px;
+   cursor: pointer;
+@@ -49,44 +49,75 @@
+   border-top-left-radius: 6px;
+   border-top-right-radius: 6px;
+   border-top: 2px solid transparent;
+-  max-width: 140px; /* Tab 设置一个最大宽度 */
++  /* Orca-inspired tab sizing: flex basis 160px, min 88px, max 240px.
++     Tabs shrink toward 88px before the strip scrolls. */
++  flex: 1 1 160px;
++  min-width: 88px;
++  max-width: 240px;
++  flex-shrink: 1;
++  white-space: nowrap;
++  overflow: hidden;
+ }
+ 
+ .flexlayout__tab_button_content {
+   text-overflow: ellipsis;
+   white-space: nowrap;
+   overflow: hidden;
+-  max-width: 80px;
++  min-width: 0;
++  flex: 1;
+ }
+ 
+ .flexlayout__tab_button:hover {
+   background-color: rgba(255, 255, 255, 0.04);
+-  color: var(--text-primary, #ffffff);
++  color: var(--text-secondary, #ffffff);
++}
++
++.flexlayout__tab_button--selected {
++  position: relative;
++  background-color: var(--bg-card, rgba(255, 255, 255, 0.08)) !important;
++  color: var(--text-primary, #ffffff) !important;
++  font-weight: 600;
++  border-top: 2px solid var(--color-brand, #6366f1) !important;
++  border-bottom: 2px solid transparent !important;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25) !important;
++  z-index: 5;
++}
++
++.flexlayout__tab_button--selected .flexlayout__tab_button_trailing {
++  opacity: 1 !important;
++  color: var(--text-secondary, #a1a1aa);
+ }
+ 
+ .flexlayout__tabset_tabbar_outer {
+   overflow: hidden !important;
+-  background-color: var(--bg-page);
++  background-color: var(--bg-page, #18181b) !important;
++}
++
++/* Tab strip scrollable: inner container scrolls horizontally so tabs never
++   shrink below min-width and overlap each other (orca pattern). */
++.flexlayout__tabset_tabbar_inner {
++  overflow-x: auto !important;
++  overflow-y: hidden !important;
++  scroll-behavior: smooth;
++  background-color: var(--bg-page, #18181b) !important;
+ }
+ 
+ .flexlayout__tabset_tabbar_outer_top {
+   border-bottom: 0px !important;
+-  padding: 0px 95px 0px 28px !important; /* 预留 95px 给右侧工具栏与操作按钮 */
++  padding: 0px 95px 0px 8px !important;
+   box-sizing: border-box;
++  position: relative !important; /* anchor for absolute scroll arrow overlays */
++  background-color: var(--bg-page, #18181b) !important;
+ }
+ 
+-/* 限制每个 Tab 标签的伸缩与最大/最小宽度，避免多 Tab 时互相重叠 */
+-.flexlayout__tab_button {
+-  max-width: 150px;
+-  min-width: 64px;
+-  flex-shrink: 1;
+-}
++/* Limit each Tab 标签的伸缩 (merged into the main .flexlayout__tab_button block above) */
+ 
+ .flexlayout__tab_button_content {
+   text-overflow: ellipsis;
+   white-space: nowrap;
+   overflow: hidden;
+-  max-width: 90px;
++  min-width: 0;
++  flex: 1;
+ }
+ 
+ /* 工具栏定位与平台适配 */
+@@ -114,6 +145,24 @@
+   right: 145px !important;
+ }
+ 
++/* Mac 专属适配：
++   当 FlexLayout 在 Mac 下全屏/最大化、Zen模式、或侧边栏收起时，
++   仅在 .flexlayout__tabset_tabbar_inner_tab_container 上应用单重 72px 左边距，
++   紧贴在 macOS 左侧红黄绿 3 个交通灯按钮 (0..68px) 右侧，绝不多移；
++   同时顶部背景统一为 var(--bg-page)，消除浅灰色色块。
++*/
++.platform-mac.sidebar-collapsed .flexlayout__tabset_tabbar_inner_tab_container_top,
++.platform-mac.sidebar-collapsed .flexlayout__tabset_tabbar_inner_tab_container,
++.platform-mac.zen-mode .flexlayout__tabset_tabbar_inner_tab_container_top,
++.platform-mac.zen-mode .flexlayout__tabset_tabbar_inner_tab_container,
++.platform-mac .flexlayout__tabset_maximized .flexlayout__tabset_tabbar_inner_tab_container_top,
++.platform-mac .flexlayout__tabset_maximized .flexlayout__tabset_tabbar_inner_tab_container,
++.platform-mac .flexlayout__tabset--maximized .flexlayout__tabset_tabbar_inner_tab_container_top,
++.platform-mac .flexlayout__tabset--maximized .flexlayout__tabset_tabbar_inner_tab_container {
++  margin-left: 72px !important;
++  padding-left: 0px !important;
++}
++
+ .flexlayout__tab_button--selected {
+   position: relative;
+   background-color: var(--bg-page, #1e1e1e) !important;
+@@ -203,8 +252,28 @@
+ 
+ .flexlayout__splitter_horz:hover::after,
+ .flexlayout__splitter_horz:active::after {
+-  background-color: var(--color-brand, #007acc) !important;
+-  width: 2px;
++  background-color: var(--color-brand, #5b7fff) !important;
++}
++
++.flexlayout__tab_button_bottom.flexlayout__tab_button--selected {
++  background-color: var(--color-brand, #5b7fff) !important;
++}
++
++.flexlayout__tab_button_left.flexlayout__tab_button--selected {
++  background-color: var(--color-brand, #5b7fff);
++}
++
++.flexlayout__tab_button_right.flexlayout__tab_button--selected {
++  border: 2px solid var(--color-brand, #5b7fff);
++}
++
++/* 拖拽指示器高亮 */
++.flexlayout__drag_rect {
++  border: 1px solid var(--color-brand, #5b7fff);
++  background: rgba(0, 122, 204, 0.15);
++  box-shadow: 0 0 10px rgba(0, 122, 204, 0.3);
++  border-radius: 4px;
++  z-index: 1000;
+ }
+ 
+ .flexlayout__splitter_vert::after {
+@@ -217,26 +286,26 @@
+ 
+ .flexlayout__splitter_vert:hover::after,
+ .flexlayout__splitter_vert:active::after {
+-  background-color: var(--color-brand, #007acc) !important;
++  background-color: var(--color-brand, #5b7fff) !important;
+   height: 2px;
+ }
+ 
+ .flexlayout__splitter_drag {
+-  background-color: var(--color-brand, #007acc);
++  background-color: var(--color-brand, #5b7fff);
+   opacity: 0.15;
+ }
+ 
+ .flexlayout__outline_rect {
+-  border: 2px solid var(--color-brand, #007acc);
+-  background: rgba(0, 122, 204, 0.15);
+-  box-shadow: 0 0 10px rgba(0, 122, 204, 0.3);
++  border: 2px solid var(--color-brand, #5b7fff);
++  background: rgba(91, 127, 255, 0.15);
++  box-shadow: 0 0 10px rgba(91, 127, 255, 0.3);
+   border-radius: 4px;
+   z-index: 1000;
+ }
+ 
+ .flexlayout__outline_rect_edge {
+-  background: rgba(0, 122, 204, 0.25);
+-  border: 1px solid var(--color-brand, #007acc);
++  background: rgba(91, 127, 255, 0.25);
++  border: 1px solid var(--color-brand, #5b7fff);
+   z-index: 1000;
+ }

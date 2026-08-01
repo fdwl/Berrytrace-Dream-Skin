@@ -1,0 +1,518 @@
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import { promises as fsPromises } from 'node:fs';
+
+import { app, BrowserWindow, ipcMain } from 'electron';
+import { join } from 'path';
+import type { ApiContext} from './api-context';
+import { BaseApiController } from './api-context';
+import { ElectronMainWindow } from '../../windows/main-window';
+import { ElectronSelection } from '../../services/selection';
+import { PluginManager, getPluginRootDir } from '../plugin-manager';
+import type { SelectionMenuItem } from '../../../src/plugins/SelectionMenuRegistry';
+
+export class WorkspaceController extends BaseApiController {
+  // ── workspace namespace ──
+
+  /**
+   * 获取当前工作区路径。
+   * @returns 工作区路径或 null
+   */
+  async workspace_getPath(): Promise<string | null> {
+    const { WorkspaceManager } = await import('../../services/workspace-manager');
+    const targetWin = BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow();
+    return targetWin ? WorkspaceManager.getInstance().getPathForWindow(targetWin) : null;
+  }
+
+  /**
+   * 获取当前工作区元数据。
+   * @returns { path, name, calendarUuid }
+   */
+  async workspace_getMetadata(): Promise<unknown> {
+    const { WorkspaceManager } = await import('../../services/workspace-manager');
+    const targetWin = BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow();
+    return targetWin ? WorkspaceManager.getInstance().getMetadataForWindow(targetWin) : { path: null, name: '', calendarUuid: 0 };
+  }
+
+  /**
+   * 在主窗口打开工作区标签页。自动显示并聚焦主窗口。
+   * @param filePath 文件路径
+   * @param targetPluginId 目标插件 ID
+   * @param extension 文件扩展名（可选）
+   * @param articleId 文章 ID（可选）
+   * @param sessionId 会话 ID（可选）
+   * @param replaceActiveTab 是否替换当前标签（可选）
+   * @param title 标签标题（可选）
+   * @param line 跳转行号（可选）
+   * @param customParams 自定义参数（可选）
+   */
+  async workspace_openWorkspaceTab(
+    filePath: string | undefined,
+    targetPluginId: string,
+    extension?: string,
+    articleId?: string,
+    sessionId?: string,
+    replaceActiveTab?: boolean,
+    title?: string,
+    line?: number,
+    customParams?: Record<string, unknown>
+  ): Promise<null> {
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!mainWindow.isVisible()) {
+        mainWindow.show();
+      }
+      mainWindow.focus();
+      mainWindow.webContents.send('main:open-workspace-tab', {
+        filePath, pluginId: targetPluginId, extension, articleId, sessionId, replaceActiveTab, title, line, customParams
+      });
+    }
+    return null;
+  }
+
+  /**
+   * 获取最近打开的文档列表。
+   */
+  async workspace_getRecentDocuments(): Promise<unknown[]> {
+    const { WorkspaceManager } = await import('../../services/workspace-manager');
+    const targetWin = BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow();
+    if (!targetWin) return [];
+    return WorkspaceManager.getInstance().getRecentDocuments(targetWin);
+  }
+
+  /**
+   * 添加文档到最近打开记录。
+   * @param filePath 文件路径
+   * @param title 文档标题
+   */
+  async workspace_addRecentDocument(filePath: string, title: string): Promise<null> {
+    const { WorkspaceManager } = await import('../../services/workspace-manager');
+    const targetWin = BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow();
+    if (targetWin) {
+      await WorkspaceManager.getInstance().addRecentDocument(targetWin, filePath, title);
+    }
+    return null;
+  }
+
+  /**
+   * 在工作区中全文搜索文档。
+   * @param options query — 搜索词，workspacePath — 工作区路径
+   * @returns 匹配结果数组 [{ filePath, fileName, snippet, lineNumber, rank }]
+   */
+  async workspace_searchDocuments(options: { query: string; workspacePath: string }): Promise<unknown[]> {
+    const { query, workspacePath } = options;
+    if (!workspacePath || !query) return [];
+
+    try {
+      const { FullTextIndexManager } = await import('../../services/fulltext-index-manager.js');
+      const rows = await FullTextIndexManager.getInstance().searchFiles(query, workspacePath);
+
+      return (rows || []).map((row: any) => ({
+        filePath: row.file_path,
+        fileName: row.file_name,
+        snippet: row.snip,
+        lineNumber: row.line_number,
+        rank: row.rank
+      }));
+    } catch (err) {
+      console.error('[WorkspaceController] FTS search failed:', err);
+      return [];
+    }
+  }
+
+  /**
+   * 获取当前活动标签页的文档大纲。
+   */
+  async workspace_getActiveTabOutline(): Promise<unknown> {
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (!mainWindow || mainWindow.isDestroyed()) return null;
+
+    return new Promise((resolve) => {
+      const token = Math.floor(Math.random() * 1000000);
+      const timeout = setTimeout(() => {
+        resolve(null);
+      }, 3000); // 3 seconds timeout
+
+      ipcMain.once(`workspace:get-active-tab-outline-response:${token}`, (_event, data) => {
+        clearTimeout(timeout);
+        resolve(data);
+      });
+
+      mainWindow.webContents.send('workspace:get-active-tab-outline-request', { token });
+    });
+  }
+
+  /**
+   * 获取宿主 FlexWorkspace 维护的当前全量激活会话与打开标签页上下文。
+   */
+  async workspace_getActiveSessionContext(): Promise<{
+    openTabs: Array<{ tabId?: string; pluginId?: string; title?: string; path?: string; extension?: string; isActive?: boolean }>;
+    activeDocument?: { path?: string; title?: string; selectedText?: string };
+    activeTerminals: Array<{ sessionId: string; cwd?: string; title?: string }>;
+  }> {
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return { openTabs: [], activeTerminals: [] };
+    }
+
+    return new Promise((resolve) => {
+      const token = Math.floor(Math.random() * 1000000);
+      const timeout = setTimeout(() => {
+        resolve({ openTabs: [], activeTerminals: [] });
+      }, 2000);
+
+      ipcMain.once(`workspace:get-active-session-context-response:${token}`, (_event, data) => {
+        clearTimeout(timeout);
+        resolve(data || { openTabs: [], activeTerminals: [] });
+      });
+
+      mainWindow.webContents.send('workspace:get-active-session-context-request', { token });
+    });
+  }
+
+  /**
+   * 通知指定插件导航到文件位置。
+   * @param options pluginId — 目标插件 ID，filePath — 文件路径，lineNumber — 行号（可选），headingText — 标题文本（可选）
+   */
+  async workspace_notifyPluginNavigate(options: {
+    pluginId: string;
+    filePath: string;
+    lineNumber?: number;
+    headingText?: string;
+  }): Promise<null> {
+    const { pluginId: targetPluginId, filePath, lineNumber, headingText } = options;
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('plugin:navigate-to-position', {
+        pluginId: targetPluginId,
+        filePath,
+        lineNumber,
+        headingText
+      });
+    }
+    return null;
+  }
+
+  /**
+   * 查询能处理指定扩展名的插件列表。
+   * @param ext 文件扩展名（如 "md"）
+   */
+  async workspace_getPluginsByExtension(ext: string): Promise<unknown[]> {
+    if (!ext) return [];
+    const pm = PluginManager.getInstance();
+    const plugins = pm.getPluginsByExtension(ext);
+
+    return plugins.map(p => ({
+      id: p.manifest.id,
+      name: p.manifest.name,
+      fileAssociations: p.manifest.fileAssociations || []
+    }));
+  }
+
+  // ── scheduler namespace ──
+
+  /**
+   * 注册定时任务（cron 或 interval）。必须在后台进程注册。
+   * @param options id — 任务 ID，cron — cron 表达式，intervalMs — 间隔毫秒，command — 执行命令（可选），args — 命令参数（可选）
+   * @example
+   * await callApi("scheduler", "register", [{ id: "daily-sync", cron: "0 9 * * *" }]);
+   */
+  async scheduler_register(options: { id: string; cron?: string; intervalMs?: number; command?: string; args?: string[]; cwd?: string }, context: ApiContext): Promise<null> {
+    const { PluginScheduler } = await import('../scheduler');
+    await PluginScheduler.getInstance().register(context.pluginId, options);
+    return null;
+  }
+
+  /**
+   * 注销定时任务。
+   * @param id 任务 ID
+   */
+  async scheduler_unregister(id: string, context: ApiContext): Promise<null> {
+    const { PluginScheduler } = await import('../scheduler');
+    await PluginScheduler.getInstance().unregister(context.pluginId, id);
+    return null;
+  }
+
+  /**
+   * 列出当前插件所有定时任务。
+   */
+  async scheduler_list(context: ApiContext): Promise<unknown[]> {
+    const { PluginScheduler } = await import('../scheduler');
+    return PluginScheduler.getInstance().list(context.pluginId);
+  }
+
+  // ── articles namespace ──
+
+  /**
+   * 读取文章内容。
+   * @param articleId 文章 ID
+   */
+  async articles_get(articleId: string): Promise<unknown> {
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      return new Promise((resolve) => {
+        const token = Math.floor(Math.random() * 1000000);
+        ipcMain.once(`articles:get-response:${token}`, (_event, data) => {
+          resolve(data);
+        });
+        mainWindow.webContents.send('articles:get-request', { id: articleId, token });
+      });
+    }
+    return null;
+  }
+
+  /**
+   * 更新文章标题和内容。
+   * @param articleId 文章 ID
+   * @param title 新标题
+   * @param content 新内容
+   */
+  async articles_update(articleId: string, title: string, content: string): Promise<null> {
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('articles:update-request', { id: articleId, title, content });
+    }
+    return null;
+  }
+
+  // ── context namespace ──
+
+  /**
+   * 获取当前选中文本及来源应用。
+   * @returns { text, appSource } 或 null
+   */
+  async context_getSelection(): Promise<unknown> {
+    const sel = ElectronSelection.getInstance().getCurrentSelectionData();
+    if (sel) {
+      return {
+        text: sel.text,
+        appSource: sel.programName || 'Unknown'
+      };
+    }
+    return null;
+  }
+
+  /**
+   * 获取当前活动应用信息。
+   * @returns { name, title, path, pid }
+   */
+  async context_getActiveApp(): Promise<unknown> {
+    const sel = ElectronSelection.getInstance().getCurrentSelectionData();
+    return {
+      name: sel?.programName || 'Finder',
+      title: sel?.programName || 'Desktop',
+      path: '',
+      pid: 0
+    };
+  }
+
+  // ── plugin namespace ──
+
+  /**
+   * 获取当前插件元信息。
+   * @returns { id, name, version, path }
+   */
+  async plugin_getInfo(context: ApiContext): Promise<unknown> {
+    const pm = PluginManager.getInstance();
+    const realPath = pm.getPluginPath(context.pluginId) || join(getPluginRootDir(), context.pluginId);
+    return {
+      id: context.pluginId,
+      name: context.pluginId,
+      version: '1.0.0',
+      path: realPath
+    };
+  }
+
+  /**
+   * 获取当前插件生命周期上下文。
+   */
+  async plugin_getLifecycleContext(context: ApiContext): Promise<unknown> {
+    const pm = PluginManager.getInstance();
+    return (pm as any).getLifecycleContext(context.pluginId);
+  }
+
+  // ── selectionMenu namespace ──
+
+  /**
+   * 注册划词菜单项。
+   * @param item 菜单项定义（id, label, icon, onClick 等）
+   */
+  async selectionMenu_registerItem(item: SelectionMenuItem, context: ApiContext): Promise<null> {
+    item.pluginId = context.pluginId;
+    ElectronSelection.getInstance().registerSelectionMenuItem(item);
+    return null;
+  }
+
+  /**
+   * 注销划词菜单项。
+   * @param id 菜单项 ID
+   */
+  async selectionMenu_unregisterItem(id: string): Promise<null> {
+    ElectronSelection.getInstance().unregisterSelectionMenuItem(id);
+    return null;
+  }
+
+  /**
+   * 在工作区中打开浏览器标签页（主窗口）。自动显示并聚焦主窗口。
+   * @param url 目标网址
+   * @param title 标签标题（可选）
+   */
+  async workspace_openBrowserTab(url: string, title?: string): Promise<null> {
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!mainWindow.isVisible()) {
+        mainWindow.show();
+      }
+      mainWindow.focus();
+      mainWindow.webContents.send('main:open-browser-tab', { url, title });
+    }
+    return null;
+  }
+
+  async workspace_scanPorts(workspacePath: string): Promise<Array<{ port: number; processName: string; pid: number; cwd: string }>> {
+    if (!workspacePath) return [];
+    const normalizedWsPath = workspacePath.replace(/\\/g, '/').toLowerCase();
+
+    try {
+      const execAsync = promisify(exec);
+      const safeExec = async (cmd: string): Promise<string> => {
+        try {
+          const { stdout } = await execAsync(cmd, { timeout: 3000 });
+          return stdout;
+        } catch (err: any) {
+          if (err && typeof err.stdout === 'string' && err.stdout.trim()) {
+            return err.stdout;
+          }
+          return '';
+        }
+      };
+
+      if (process.platform === 'darwin') {
+        // 1. Get all listening TCP ports
+        const lsofOut = await safeExec('lsof -nP -iTCP -sTCP:LISTEN -F pcn');
+        if (!lsofOut) return [];
+        const ports: Array<{ port: number; processName: string; pid: number }> = [];
+        let currentPid: number | null = null;
+        let currentProcessName = '';
+
+        for (const line of lsofOut.split('\n')) {
+          if (!line) continue;
+          const tag = line[0];
+          const value = line.slice(1);
+          if (tag === 'p') {
+            currentPid = parseInt(value, 10);
+          } else if (tag === 'c') {
+            currentProcessName = value;
+          } else if (tag === 'n' && currentPid != null) {
+            const lastColon = value.lastIndexOf(':');
+            if (lastColon !== -1) {
+              const port = parseInt(value.substring(lastColon + 1), 10);
+              if (Number.isFinite(port)) {
+                ports.push({ port, processName: currentProcessName, pid: currentPid });
+              }
+            }
+          }
+        }
+
+        if (ports.length === 0) return [];
+
+        // 2. Get CWDs for all PIDs
+        const pids = Array.from(new Set(ports.map(p => p.pid)));
+        const cwdOut = await safeExec(`lsof -a -p ${pids.join(',')} -d cwd -Fn`);
+        const cwdMap = new Map<number, string>();
+        let activePid: number | null = null;
+
+        for (const line of cwdOut.split('\n')) {
+          if (!line) continue;
+          const tag = line[0];
+          const value = line.slice(1);
+          if (tag === 'p') {
+            activePid = parseInt(value, 10);
+          } else if (tag === 'n' && activePid != null) {
+            cwdMap.set(activePid, value);
+          }
+        }
+
+        // 3. Filter and map ports belonging to this workspace
+        const results: Array<{ port: number; processName: string; pid: number; cwd: string }> = [];
+        for (const p of ports) {
+          const cwd = cwdMap.get(p.pid);
+          if (cwd) {
+            const normalizedCwd = cwd.replace(/\\/g, '/').toLowerCase();
+            if (normalizedCwd === normalizedWsPath || normalizedCwd.startsWith(normalizedWsPath + '/')) {
+              results.push({
+                port: p.port,
+                processName: p.processName,
+                pid: p.pid,
+                cwd
+              });
+            }
+          }
+        }
+
+        // Deduplicate by port number (keep first)
+        const seenPorts = new Set<number>();
+        return results.filter(r => {
+          if (seenPorts.has(r.port)) return false;
+          seenPorts.add(r.port);
+          return true;
+        }).sort((a, b) => a.port - b.port);
+      }
+    } catch (err) {
+      console.warn('[WorkspaceController] Port scan failed or no ports found:', err);
+    }
+    return [];
+  }
+
+  /**
+   * 读取项目根目录下 .berrytrace/config.json 配置
+   */
+  async workspace_getProjectConfig(workspacePath: string): Promise<Record<string, any>> {
+    if (!workspacePath) return {};
+    try {
+      const configPath = join(workspacePath, '.berrytrace', 'config.json');
+      const content = await fsPromises.readFile(configPath, 'utf-8');
+      return JSON.parse(content);
+    } catch (err) {
+      return {};
+    }
+  }
+
+  /**
+   * 保存配置到项目根目录下 .berrytrace/config.json
+   */
+  async workspace_saveProjectConfig(options: { workspacePath: string; config: Record<string, any> } | string, configArg?: Record<string, any>): Promise<boolean> {
+    let workspacePath = '';
+    let config: Record<string, any> = {};
+
+    if (typeof options === 'string') {
+      workspacePath = options;
+      config = configArg || {};
+    } else if (options && typeof options === 'object') {
+      workspacePath = options.workspacePath;
+      config = options.config || {};
+    }
+
+    if (!workspacePath) return false;
+
+    try {
+      const dirPath = join(workspacePath, '.berrytrace');
+      await fsPromises.mkdir(dirPath, { recursive: true });
+      const configPath = join(dirPath, 'config.json');
+
+      let existing = {};
+      try {
+        const content = await fsPromises.readFile(configPath, 'utf-8');
+        existing = JSON.parse(content);
+      } catch (e) {}
+
+      const merged = { ...existing, ...config, updatedAt: Date.now() };
+      await fsPromises.writeFile(configPath, JSON.stringify(merged, null, 2), 'utf-8');
+      return true;
+    } catch (err) {
+      console.error('[WorkspaceController] Failed to save project config:', err);
+      return false;
+    }
+  }
+}
+

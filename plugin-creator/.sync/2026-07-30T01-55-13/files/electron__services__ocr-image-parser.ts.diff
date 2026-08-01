@@ -1,0 +1,93 @@
+diff --git a/electron/services/ocr-image-parser.ts b/electron/services/ocr-image-parser.ts
+index d9b9551..6d06245 100644
+--- a/electron/services/ocr-image-parser.ts
++++ b/electron/services/ocr-image-parser.ts
+@@ -7,9 +7,24 @@
+ 
+ import * as fs from 'fs'
+ import * as path from 'path'
+-import sharp from 'sharp'
+ import { getOcrModelDir } from '../config/paths'
+ 
++let sharpInstance: any = null
++let isSharpChecked = false
++
++async function getSharp(): Promise<any> {
++  if (isSharpChecked) return sharpInstance
++  isSharpChecked = true
++  try {
++    const sharpModule = await import('sharp')
++    sharpInstance = sharpModule.default || sharpModule
++  } catch (err) {
++    console.warn('⚠️ [OcrImageParser] sharp module unavailable, OCR will fallback to raw buffer:', err)
++    sharpInstance = null
++  }
++  return sharpInstance
++}
++
+ // OCR 单例及缓存定义
+ let ocrServiceInstance: any = null
+ let isInitializing = false
+@@ -32,7 +47,7 @@ async function ensureModelFile(url: string, localPath: string): Promise<void> {
+       if (stats.size > 0) {
+         return
+       }
+-    } catch (e) {
++    } catch (_e) {
+       // 文件无效，重新下载
+     }
+   }
+@@ -133,22 +148,44 @@ export async function parseImageOcr(filePath: string): Promise<string> {
+       return ocrCache.get(cacheKey)!
+     }
+ 
++    // 尺寸门控：图标/缩略图（<20KB）或超大照片（>5MB）跳过 OCR，ROI 极低
++    if (stats.size < 20 * 1024 || stats.size > 5 * 1024 * 1024) {
++      return ''
++    }
++
+     const ocr = await getOcrService()
+     if (!ocr) {
+       return ''
+     }
+ 
+-    // 图片预处理：转灰度 + 超过 2000px 的限制尺寸，保持宽高比
+-    const imagePipeline = sharp(filePath).grayscale()
+-    const metadata = await imagePipeline.metadata()
+-
++    const sharp = await getSharp()
+     let processedBuffer: Buffer
+-    if (metadata.width && metadata.height && (metadata.width > 2000 || metadata.height > 2000)) {
+-      processedBuffer = await imagePipeline
+-        .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+-        .toBuffer()
++
++    if (sharp) {
++      // 图片预处理：转灰度 + 超过 2000px 的限制尺寸，保持宽高比
++      const imagePipeline = sharp(filePath).grayscale()
++      const metadata = await imagePipeline.metadata()
++
++      // 像素门控：极小图（图标/缩略图 <200px）或极大图（高清照片 >4000px）跳过 OCR
++      if (metadata.width && metadata.height) {
++        if (
++          metadata.width < 200 || metadata.height < 200 ||
++          metadata.width > 4000 || metadata.height > 4000
++        ) {
++          return ''
++        }
++      }
++
++      if (metadata.width && metadata.height && (metadata.width > 2000 || metadata.height > 2000)) {
++        processedBuffer = await imagePipeline
++          .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
++          .toBuffer()
++      } else {
++        processedBuffer = await imagePipeline.toBuffer()
++      }
+     } else {
+-      processedBuffer = await imagePipeline.toBuffer()
++      // Sharp 不可用时降级读取原图二进制 Buffer
++      processedBuffer = await fs.promises.readFile(filePath)
+     }
+ 
+     // 转换为 ArrayBuffer (Node.js Buffer -> ArrayBuffer)

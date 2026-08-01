@@ -1,0 +1,13 @@
+diff --git a/electron/config/DbCache.ts b/electron/config/DbCache.ts
+index 070c853..1484bc6 100644
+--- a/electron/config/DbCache.ts
++++ b/electron/config/DbCache.ts
+@@ -75,7 +75,7 @@ class ElectronCache implements ICache {
+     if (this.cache.has(keyStr)) {
+       return this.cache.get(keyStr) as T
+     }
+-    let value = this.store.get(keyStr, defaultValue)
++    const value = this.store.get(keyStr, defaultValue)
+     if (keyStr === 'authToken' || keyStr === 'respLogin') {
+       const decrypted = decryptValue(value)
+       // Only cache in memory if we successfully decrypted it (or it wasn't encrypted in store)

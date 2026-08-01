@@ -1,0 +1,189 @@
+diff --git a/electron/plugins/plugin-activity-tracker.ts b/electron/plugins/plugin-activity-tracker.ts
+new file mode 100644
+index 0000000..c8799aa
+--- /dev/null
++++ b/electron/plugins/plugin-activity-tracker.ts
+@@ -0,0 +1,183 @@
++/**
++ * @architecture-boundary PluginActivityTracker
++ * ─────────────────────────────────────────────────────────────────────────────
++ * 职责与业务流程：
++ * 负责系统与插件的活跃状态跟踪与空闲自动化内存回收机制：
++ *  1. 插件活跃度记录 (recordActivity): 委托给 PluginStateRegistry，每次 IPC 或系统调用
++ *     更新插件最后活跃时间戳。
++ *  2. 插件空闲回收 (startPluginsIdleTracker): 默认 30s 轮询，超过 5 分钟无活动的
++ *     非常驻后台/混合插件自动释放。
++ *     - 跳过条件：声明 resident: true 的常驻插件、悬浮球打开状态、忙碌 session 状态、
++ *       Renderer 正在渲染此插件视图。
++ *  3. 系统锁屏/休眠事件 (startSystemIdleTracker): powerMonitor 事件驱动 + 30s 兜底，
++ *     广播 system:user-idle / user-active。
++ *
++ * 架构变更（P2 重构）：
++ *  - pluginLastActiveTime、activeRenderedPlugins 已迁移到 PluginStateRegistry。
++ *  - recordActivity / setActiveRenderedPlugins 现在直接代理到 PluginStateRegistry。
++ *
++ * AI 修改约束：
++ *  - 严禁将空闲轮询间隔设为 1s 以下，避免在高负载或桌面空闲时占用 CPU。
++ * ─────────────────────────────────────────────────────────────────────────────
++ */
++
++import { powerMonitor } from 'electron';
++import type { ScannedPlugin } from './plugin-scanner';
++import { PluginLauncher } from './plugin-launcher';
++import { pluginStateRegistry } from './plugin-state-registry';
++import { ElectronFloatWeb } from '../windows/float-web';
++
++export class PluginActivityTracker {
++  private static instance: PluginActivityTracker;
++  private systemIdleTrackerInterval: NodeJS.Timeout | null = null;
++  private pluginIdleCheckInterval: NodeJS.Timeout | null = null;
++  private isUserIdleState = false;
++  private idleTrackerStarted = false;
++  private readonly PLUGINS_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟无活动自动释放
++
++  public static getInstance(): PluginActivityTracker {
++    if (!PluginActivityTracker.instance) {
++      PluginActivityTracker.instance = new PluginActivityTracker();
++    }
++    return PluginActivityTracker.instance;
++  }
++
++  /** 记录插件活跃时间（代理到 PluginStateRegistry） */
++  public recordActivity(pluginId: string): void {
++    pluginStateRegistry.recordActivity(pluginId);
++  }
++
++  /** 获取插件最后活跃时间（代理到 PluginStateRegistry） */
++  public getLastActiveTime(pluginId: string): number {
++    return pluginStateRegistry.getLastActiveTime(pluginId);
++  }
++
++  /**
++   * 由 IPC handler 调用，更新 Renderer 当前正在渲染的插件集合（代理到 PluginStateRegistry）。
++   * 这些插件即使超过空闲阈值也不会被自动卸载。
++   */
++  public setActiveRenderedPlugins(pluginIds: string[]): void {
++    // 先把所有旧的 rendered=true 清掉，再设置新的
++    const oldRendered = pluginStateRegistry.getRenderedPluginIds();
++    for (const id of oldRendered) {
++      if (!pluginIds.includes(id)) {
++        pluginStateRegistry.setRendered(id, false);
++      }
++    }
++    for (const id of pluginIds) {
++      pluginStateRegistry.setRendered(id, true);
++    }
++    if (pluginIds.length > 0) {
++      console.log(`[PluginActivityTracker] Active rendered plugins updated: [${pluginIds.join(', ')}]`);
++    }
++  }
++
++  public startIfNeeded(
++    getLoadedPlugins: () => Set<string>,
++    getPlugin: (pluginId: string) => ScannedPlugin | undefined,
++    deactivatePluginFn: (pluginId: string) => Promise<void>,
++    broadcastEventFn: (eventName: string, data: unknown) => void
++  ): void {
++    if (this.idleTrackerStarted) return;
++    this.idleTrackerStarted = true;
++    this.startSystemIdleTracker(broadcastEventFn);
++    this.startPluginsIdleTracker(getLoadedPlugins, getPlugin, deactivatePluginFn);
++  }
++
++  public stopTrackers(): void {
++    if (this.pluginIdleCheckInterval) {
++      clearInterval(this.pluginIdleCheckInterval);
++      this.pluginIdleCheckInterval = null;
++    }
++    if (this.systemIdleTrackerInterval) {
++      clearInterval(this.systemIdleTrackerInterval);
++      this.systemIdleTrackerInterval = null;
++    }
++  }
++
++  private startSystemIdleTracker(broadcastEventFn: (eventName: string, data: unknown) => void): void {
++    if (this.systemIdleTrackerInterval) return;
++
++    const IDLE_THRESHOLD_SEC = 60;
++
++    const onUserActive = () => {
++      if (this.isUserIdleState) {
++        this.isUserIdleState = false;
++        console.log('[PluginManager] System: user became active (event).');
++        broadcastEventFn('system:user-active', null);
++      }
++    };
++
++    const onUserIdle = () => {
++      if (!this.isUserIdleState) {
++        this.isUserIdleState = true;
++        console.log('[PluginManager] System: user became idle (event).');
++        broadcastEventFn('system:user-idle', null);
++      }
++    };
++
++    powerMonitor.on('lock-screen', onUserIdle);
++    powerMonitor.on('suspend', onUserIdle);
++    powerMonitor.on('unlock-screen', onUserActive);
++    powerMonitor.on('resume', onUserActive);
++
++    this.systemIdleTrackerInterval = setInterval(() => {
++      try {
++        const idleTime = powerMonitor.getSystemIdleTime();
++        if (idleTime >= IDLE_THRESHOLD_SEC) {
++          onUserIdle();
++        } else {
++          onUserActive();
++        }
++      } catch { /* ignore */ }
++    }, 30_000);
++  }
++
++  private startPluginsIdleTracker(
++    getLoadedPlugins: () => Set<string>,
++    getPlugin: (pluginId: string) => ScannedPlugin | undefined,
++    deactivatePluginFn: (pluginId: string) => Promise<void>
++  ): void {
++    if (this.pluginIdleCheckInterval) return;
++
++    this.pluginIdleCheckInterval = setInterval(async () => {
++      const now = Date.now();
++      const loadedPlugins = getLoadedPlugins();
++
++      for (const pluginId of loadedPlugins) {
++        const plugin = getPlugin(pluginId);
++        if (ElectronFloatWeb.getInstance().hasPluginWindows(pluginId)) continue;
++
++        if (plugin?.manifest.resident) continue;
++
++        if (PluginLauncher.getInstance().isPluginBusy(pluginId)) {
++          pluginStateRegistry.recordActivity(pluginId);
++          continue;
++        }
++
++        // 如果插件正被 Renderer 渲染（用户正在查看），跳过空闲卸载并刷新时间戳
++        if (pluginStateRegistry.isRendered(pluginId)) {
++          pluginStateRegistry.recordActivity(pluginId);
++          continue;
++        }
++
++        let lastActive = pluginStateRegistry.getLastActiveTime(pluginId);
++        if (lastActive === 0) {
++          pluginStateRegistry.recordActivity(pluginId);
++          lastActive = now;
++        }
++        const timeout = plugin?.manifest.idleTimeout ?? this.PLUGINS_IDLE_TIMEOUT_MS;
++        if (now - lastActive > timeout) {
++          if (plugin && (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid')) {
++            console.log(`[PluginManager] Plugin "${pluginId}" has been idle for ${Math.round((now - lastActive) / 1000)}s (> ${timeout / 1000}s). Automatically unloading background process to free memory...`);
++            try {
++              await deactivatePluginFn(pluginId);
++            } catch (err) {
++              console.error(`[PluginManager] Failed to idle-unload plugin "${pluginId}":`, err);
++            }
++          }
++        }
++      }
++    }, 30000);
++  }
++}

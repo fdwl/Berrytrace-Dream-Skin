@@ -1,0 +1,584 @@
+import { app, shell, BrowserWindow, ipcMain, IpcMainInvokeEvent } from 'electron'
+import { join } from 'path'
+import { exec } from 'child_process'
+import { cache, CacheAttribute } from '../config/index'
+import { ElectronGlobalShortcuts } from './global-shortcuts'
+import { ElectronMenu } from './menu'
+import { ElectronFloatBall } from '../windows/float-ball'
+import { ElectronBufferWindow } from '../windows/buffer-window'
+import { ElectronMainWindow } from '../windows/main-window'
+import { ElectronPublishWindow } from '../windows/publish-window'
+import { PluginManager } from '../plugins/plugin-manager'
+import { WindowController } from '../windows/WindowController'
+import { WorkspaceManager } from './workspace-manager'
+import { ElectronQuickPanelWindow } from '../windows/quick-panel'
+import { PermissionGuideWindow } from '../windows/permission-guide-window'
+import { restartGlobalDoubleTapHook, isDoubleTapPermissionGranted } from './double-tap-detector'
+
+let screenshotLoaded = false
+async function getScreenshotInstance(getLastActiveWindow: () => 'main' | 'publish') {
+  const { ElectronScreenshot } = await import('./screenshot')
+  const instance = ElectronScreenshot.getInstance()
+  if (!screenshotLoaded) {
+    instance.setDependencies({
+      getPublishWindow: () => ElectronPublishWindow.getInstance().getPublishWindow(),
+      getPublishController: () => ElectronPublishWindow.getInstance().getController(),
+      getMainWindow: () => ElectronMainWindow.getInstance().getWindow(),
+      bringWindowToFront: (win: BrowserWindow) => WindowController.bringWindowToFront(win),
+      getLastActiveWindow,
+    })
+    screenshotLoaded = true
+  }
+  return instance
+}
+
+async function getDesktopLockInstance() {
+  const { ElectronDesktopLock } = await import('./desktop-lock')
+  return ElectronDesktopLock.getInstance()
+}
+
+export function registerPreferencesIpcHandlers(
+  getLastActiveWindow: () => 'main' | 'publish',
+  startGlobalMouseHook: () => void,
+  stopGlobalMouseHook: () => void
+) {
+  const broadcastPreferencesChanged = (excludeWebContentsId?: number) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (win.isDestroyed()) return
+      if (excludeWebContentsId != null && win.webContents.id === excludeWebContentsId) return
+      win.webContents.send('pref:changed')
+    })
+  }
+
+  ipcMain.handle('pref:get', () => {
+    const shortcuts = ElectronGlobalShortcuts.getInstance()
+    return {
+      autoLaunch: (cache.get(CacheAttribute.prefAutoLaunch) as boolean) ?? false,
+      globalShortcut:
+        (cache.get(CacheAttribute.prefGlobalShortcut) as string) || shortcuts.getDefaultShortcut(),
+      showMainShortcut:
+        (cache.get(CacheAttribute.prefShowMainShortcut) as string) || shortcuts.getDefaultShowMainShortcut(),
+      bufferShortcut:
+        (cache.get(CacheAttribute.prefBufferShortcut) as string) ||
+        (cache.get('prefPinboardShortcut') as string) ||
+        shortcuts.getDefaultBufferShortcut(),
+      lockShortcut:
+        (cache.get(CacheAttribute.prefLockShortcut) as string) || shortcuts.getDefaultLockShortcut(),
+      screenshotShortcut:
+        (cache.get(CacheAttribute.prefScreenshotShortcut) as string) || shortcuts.getDefaultScreenshotShortcut(),
+      zenShortcut:
+        (cache.get(CacheAttribute.prefZenShortcut) as string) || 'F10',
+      pinShortcut:
+        (cache.get(CacheAttribute.prefPinShortcut) as string) || 'Ctrl+\x60',
+      quickPanelShortcut:
+        (cache.get(CacheAttribute.prefQuickPanelShortcut) as string) || 'Alt+Space',
+      quickPanelShortcuts:
+        (cache.get(CacheAttribute.prefQuickPanelShortcuts) as string) || '[]',
+      quickPanelEnabled: (cache.get(CacheAttribute.prefQuickPanelEnabled) as boolean) ?? false,
+      bufferEnabled: (cache.get(CacheAttribute.prefBufferEnabled) as boolean) ?? false,
+      bufferDisabledApps: (() => {
+        try {
+          return JSON.parse((cache.get(CacheAttribute.prefBufferDisabledApps) as string) || '[]')
+        } catch {
+          return []
+        }
+      })(),
+      searchEngine:
+        (cache.get(CacheAttribute.prefSearchEngine) as string) || 'bing',
+      rightClickLongPress:
+        (cache.get(CacheAttribute.prefRightClickLongPress) as boolean) ?? false,
+      rightClickLongPressDelay:
+        (cache.get(CacheAttribute.prefRightClickLongPressDelay) as number) || 350,
+      rightClickLongPressDisabledApps: (() => {
+        try {
+          return JSON.parse((cache.get(CacheAttribute.prefRightClickLongPressDisabledApps) as string) || '[]')
+        } catch {
+          return []
+        }
+      })(),
+      rightClickLongPressUrl:
+        (cache.get(CacheAttribute.prefRightClickLongPressUrl) as string) || '',
+      doubleTapEnabled:
+        (cache.get(CacheAttribute.prefDoubleTapEnabled) as boolean) ?? true,
+      doubleTapModifier:
+        (cache.get(CacheAttribute.prefDoubleTapModifier) as string) || 'cmd',
+      doubleTapAction:
+        (cache.get(CacheAttribute.prefDoubleTapAction) as string) || 'agent-chat',
+      doubleTapThreshold:
+        (cache.get(CacheAttribute.prefDoubleTapThreshold) as number) || 400,
+      longPressKey:
+        (cache.get(CacheAttribute.prefLongPressKey) as string) || 'alt',
+      longPressDelay:
+        (cache.get(CacheAttribute.prefLongPressDelay) as number) || 500,
+      shortcutBindings:
+        (cache.get(CacheAttribute.prefShortcutBindings) as Record<string, string[]>) || {},
+      fnVoiceEnabled: (cache.get(CacheAttribute.prefFnVoiceEnabled) as boolean) ?? false,
+      fnShiftTranslateEnabled: (cache.get(CacheAttribute.prefFnShiftTranslateEnabled) as boolean) ?? false,
+      fnSpaceMeimeiEnabled: (cache.get(CacheAttribute.prefFnSpaceMeimeiEnabled) as boolean) ?? false,
+      aiSidebarEnabled: (cache.get(CacheAttribute.prefAiSidebarEnabled) as boolean) ?? true,
+      fnAutoSendEnabled: (cache.get(CacheAttribute.prefFnAutoSendEnabled) as boolean) ?? false,
+    }
+  })
+
+  ipcMain.handle('pref:applyAutoLaunch', () => {
+    // We will let main.ts handle autoLaunch logic or export applyAutoLaunch
+    // But since it's just a login item settings, we can implement it directly:
+    const enabled = (cache.get(CacheAttribute.prefAutoLaunch) as boolean) ?? false
+    app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true })
+  })
+
+  ipcMain.handle('pref:getAutoLaunchStatus', () => {
+    const settings = app.getLoginItemSettings()
+    return settings.openAtLogin
+  })
+
+  ipcMain.handle('pref:reloadShortcuts', () => {
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+  })
+
+  ipcMain.handle('pref:getSystemShortcuts', () => {
+    const shortcuts = ElectronGlobalShortcuts.getInstance()
+    return {
+      defaultShortcut: shortcuts.getDefaultShortcut(),
+      defaultShowMainShortcut: shortcuts.getDefaultShowMainShortcut(),
+      defaultBufferShortcut: shortcuts.getDefaultBufferShortcut(),
+      defaultLockShortcut: shortcuts.getDefaultLockShortcut(),
+      defaultScreenshotShortcut: shortcuts.getDefaultScreenshotShortcut(),
+    }
+  })
+
+  ipcMain.handle('pref:getLockConfig', () => {
+    return {
+      hasPassword: !!cache.get(CacheAttribute.desktopLockPassword),
+    }
+  })
+
+  ipcMain.handle('pref:setLockPassword', async (_event: IpcMainInvokeEvent, password: string | null) => {
+    const lockManager = await getDesktopLockInstance()
+    if (password) {
+      lockManager.setPassword(password)
+    } else {
+      lockManager.clearPassword()
+    }
+    broadcastPreferencesChanged(_event.sender.id)
+  })
+
+  ipcMain.handle('pref:verifyLockPassword', async (_event: IpcMainInvokeEvent, password: string) => {
+    const lock = await getDesktopLockInstance()
+    return lock.verifyPassword(password)
+  })
+
+  ipcMain.handle('pref:setAutoLaunch', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefAutoLaunch, enabled)
+    app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true })
+    broadcastPreferencesChanged(_event.sender.id)
+  })
+
+  ipcMain.handle('pref:setScreenshotShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefScreenshotShortcut, shortcut)
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setGlobalShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefGlobalShortcut, shortcut)
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setShowMainShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefShowMainShortcut, shortcut)
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setBufferShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefBufferShortcut, shortcut)
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setLockShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefLockShortcut, shortcut)
+    ElectronMenu.getInstance().setupMenu()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setZenShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefZenShortcut, shortcut)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setPinShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefPinShortcut, shortcut)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setQuickPanelShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+    cache.set(CacheAttribute.prefQuickPanelShortcut, shortcut)
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setQuickPanelShortcuts', (_event: IpcMainInvokeEvent, shortcutsJson: string) => {
+    cache.set(CacheAttribute.prefQuickPanelShortcuts, shortcutsJson)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setRightClickLongPress', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefRightClickLongPress, enabled)
+    if (enabled) {
+      startGlobalMouseHook()
+    } else {
+      stopGlobalMouseHook()
+    }
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setRightClickLongPressDelay', (_event: IpcMainInvokeEvent, delay: number) => {
+    cache.set(CacheAttribute.prefRightClickLongPressDelay, delay)
+    const enabled = (cache.get(CacheAttribute.prefRightClickLongPress) as boolean) ?? false
+    if (enabled) {
+      stopGlobalMouseHook()
+      startGlobalMouseHook()
+    }
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('quick-panel:execute', async (_event: IpcMainInvokeEvent, type: string, target: string) => {
+    try {
+      console.log(`[quick-panel:execute] type=${type}, target=${target}`)
+      switch (type) {
+        case 'url': {
+          const isInternal = target.startsWith('berrytrace://') || target.startsWith('berrytrace-dev://')
+          ElectronFloatBall.getInstance().openFloatWebWindow(target, isInternal)
+          return true
+        }
+        case 'url-external': {
+          shell.openExternal(target)
+          return true
+        }
+        case 'file':
+        case 'folder': {
+          const err = await shell.openPath(target)
+          if (err) {
+            console.error('Failed to open path:', err)
+            return false
+          }
+          return true
+        }
+        case 'command':
+          return new Promise<boolean>((resolve) => {
+            exec(target, (error) => {
+              if (error) {
+                console.error('Failed to execute command:', error)
+                resolve(false)
+              } else {
+                resolve(true)
+              }
+            })
+          })
+        case 'system': {
+          if (target === 'screenshot') {
+            getScreenshotInstance(getLastActiveWindow).then((s) => s.triggerScreenshot())
+          } else if (target === 'lock') {
+            const win = ElectronMainWindow.getInstance().getWindow()
+            getDesktopLockInstance().then((l) => l.triggerLock(win))
+          } else if (target === 'open-main') {
+            ElectronMainWindow.getInstance().showWindow()
+          } else if (target === 'new-note') {
+            ElectronBufferWindow.getInstance().toggleBufferWindow()
+          } else if (target === 'toggle-zen') {
+            const win = ElectronMainWindow.getInstance().getWindow()
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('zen:toggle')
+            }
+          } else if (target === 'toggle-buffer') {
+            ElectronBufferWindow.getInstance().toggleBufferWindow()
+          } else if (target === 'open-buffer-clipboard') {
+            ElectronBufferWindow.getInstance().showBufferWindowWithTab('clipboard')
+          } else if (target === 'open-buffer-notes') {
+            ElectronBufferWindow.getInstance().showBufferWindowWithTab('global')
+          } else if (target === 'open-pref') {
+            ElectronMainWindow.getInstance().openPreferences()
+          } else if (target.startsWith('open-plugin:')) {
+            const pluginId = target.substring('open-plugin:'.length)
+            const plugin = PluginManager.getInstance().getPlugin(pluginId)
+            if (plugin && (plugin.manifest as { type?: string }).type === 'window') {
+              PluginManager.getInstance().openPluginWindow(pluginId)
+            } else {
+              ElectronMainWindow.getInstance().openPlugin(pluginId)
+            }
+          } else if (target.startsWith('save-to-buffer:')) {
+            const text = target.substring('save-to-buffer:'.length)
+            const noteItem = {
+              uuid: `temp_note_${Date.now()}`,
+              content: JSON.stringify({ say: text.trim(), spaceId: 'buffer' }),
+              event_date: new Date().toISOString(),
+              keywords: ['临时笔记'],
+              spaceId: 'buffer'
+            }
+            ElectronBufferWindow.getInstance().addBufferItem(noteItem)
+          } else if (target.startsWith('save-to-workspace:')) {
+            const text = target.substring('save-to-workspace:'.length)
+            const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(_event.sender)
+            if (workspacePath) {
+              const safeText = text.substring(0, 15).replace(/[\\/:*?"<>|]/g, '_').trim()
+              const timestamp = new Date().toISOString().replace(new RegExp('[' + '-:T' + ']', 'g'), '').substring(0, 14)
+              const fileName = `quick_note_${safeText || 'empty'}_${timestamp}.md`
+              const fileContent = `# Quick Note\n\n${text}\n`
+              const targetPath = await WorkspaceManager.getInstance().createFile(workspacePath, fileName, workspacePath, fileContent)
+              
+              const mainWindow = ElectronMainWindow.getInstance().getWindow()
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('note-tools:open-file', { filePath: targetPath })
+              }
+            }
+          }
+          return true
+        }
+        default:
+          return false
+      }
+    } catch (e) {
+      console.error('Error executing quick panel action:', e)
+      return false
+    }
+  })
+
+  ipcMain.handle('pref:setSearchEngine', (_event: IpcMainInvokeEvent, engine: string) => {
+    cache.set(CacheAttribute.prefSearchEngine, engine)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setBufferEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefBufferEnabled, enabled)
+    import('./selection').then(({ ElectronSelection }) => {
+      if (enabled) {
+        ElectronSelection.getInstance().initSelectionHook()
+      } else {
+        ElectronSelection.getInstance().stopSelectionHook()
+        ElectronSelection.getInstance().destroySelectionMenuWindow()
+      }
+    }).catch(err => {
+      console.error('[preferences-manager] Failed to dynamically toggle SelectionHook:', err)
+    })
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setBufferDisabledApps', (_event: IpcMainInvokeEvent, apps: string[]) => {
+    cache.set(CacheAttribute.prefBufferDisabledApps, JSON.stringify(apps))
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setRightClickLongPressDisabledApps', (_event: IpcMainInvokeEvent, apps: string[]) => {
+    cache.set(CacheAttribute.prefRightClickLongPressDisabledApps, JSON.stringify(apps))
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setRightClickLongPressUrl', (_event: IpcMainInvokeEvent, url: string) => {
+    cache.set(CacheAttribute.prefRightClickLongPressUrl, url)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setDoubleTapEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefDoubleTapEnabled, enabled)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setDoubleTapModifier', (_event: IpcMainInvokeEvent, modifier: string) => {
+    cache.set(CacheAttribute.prefDoubleTapModifier, modifier)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setDoubleTapAction', (_event: IpcMainInvokeEvent, action: string) => {
+    cache.set(CacheAttribute.prefDoubleTapAction, action)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setDoubleTapThreshold', (_event: IpcMainInvokeEvent, threshold: number) => {
+    cache.set(CacheAttribute.prefDoubleTapThreshold, threshold)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setLongPressKey', (_event: IpcMainInvokeEvent, key: string) => {
+    cache.set(CacheAttribute.prefLongPressKey, key)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setLongPressDelay', (_event: IpcMainInvokeEvent, delay: number) => {
+    cache.set(CacheAttribute.prefLongPressDelay, delay)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setShortcutBindings', (_event: IpcMainInvokeEvent, bindings: Record<string, string[]>) => {
+    cache.set(CacheAttribute.prefShortcutBindings, JSON.stringify(bindings))
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setFnVoiceEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefFnVoiceEnabled, enabled)
+    restartGlobalDoubleTapHook()
+    import('../windows/fn-voice-panel').then(({ ElectronFnVoicePanelWindow }) => {
+      if (enabled) {
+        ElectronFnVoicePanelWindow.getInstance().ensureWindow()
+      } else {
+        ElectronFnVoicePanelWindow.getInstance().destroy()
+      }
+    }).catch(err => {
+      console.error('[preferences-manager] Failed to toggle fn-voice-panel window:', err)
+    })
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setFnShiftTranslateEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefFnShiftTranslateEnabled, enabled)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setFnSpaceMeimeiEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefFnSpaceMeimeiEnabled, enabled)
+    restartGlobalDoubleTapHook()
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setQuickPanelEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefQuickPanelEnabled, enabled)
+    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+    if (!enabled) {
+      import('../windows/quick-panel').then(({ ElectronQuickPanelWindow }) => {
+        ElectronQuickPanelWindow.getInstance().destroy()
+      }).catch(err => {
+        console.error('[preferences-manager] Failed to destroy quick-panel on disable:', err)
+      })
+    }
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setAiSidebarEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefAiSidebarEnabled, enabled)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:setFnAutoSendEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+    cache.set(CacheAttribute.prefFnAutoSendEnabled, enabled)
+    broadcastPreferencesChanged(_event.sender.id)
+    return true
+  })
+
+  ipcMain.handle('pref:getDoubleTapPermissionStatus', () => {
+    return isDoubleTapPermissionGranted()
+  })
+
+  ipcMain.handle('pref:requestPermissionGuide', (_event: IpcMainInvokeEvent, type: 'accessibility' | 'screen') => {
+    console.log(`[PreferencesManager] IPC handler pref:requestPermissionGuide triggered with type: ${type}`)
+    if (process.platform !== 'darwin') {
+      console.warn('[PreferencesManager] requestPermissionGuide is only supported on macOS (darwin)')
+      return
+    }
+    try {
+      PermissionGuideWindow.getInstance().openGuide(type)
+    } catch (err) {
+      console.error('[PreferencesManager] Error opening permission guide window:', err)
+    }
+  })
+
+  ipcMain.on('pref:startDragApp', (event) => {
+    if (process.platform !== 'darwin') return
+    const appPath = app.getPath('exe').replace(/\/Contents\/MacOS\/.*$/, '')
+    let iconPath = join(app.getAppPath(), 'public', 'icon.png')
+    if (app.isPackaged) {
+      iconPath = join(app.getAppPath(), 'dist', 'icon.png')
+    }
+    console.log('[DragApp] Starting native app drag from:', appPath, 'icon:', iconPath)
+    event.sender.startDrag({
+      file: appPath,
+      icon: iconPath
+    })
+    // After drag starts, immediately re-activate System Settings so the Electron main window
+    // doesn't cover it. We use a short delay to let the drag initiate first.
+    setTimeout(() => {
+      exec(`osascript -e 'tell application "System Settings" to activate'`, (err) => {
+        if (err) {
+          // Fallback for older macOS (System Preferences)
+          exec(`osascript -e 'tell application "System Preferences" to activate'`)
+        }
+      })
+    }, 50)
+  })
+
+
+  ipcMain.handle('quick-panel:toggle', (_event: IpcMainInvokeEvent, mode?: string) => {
+    ElectronQuickPanelWindow.getInstance().toggleQuickPanelWindow(mode)
+    return true
+  })
+
+  ipcMain.handle('publish:eventCreated', (_event: IpcMainInvokeEvent, eventPayload: unknown) => {
+    console.log('[main][ipc] publish:eventCreated <—— publishWindow', eventPayload && typeof eventPayload === 'object' ? Object.keys(eventPayload as object) : eventPayload)
+    const mainWindow = ElectronMainWindow.getInstance().getWindow()
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      console.log('[main][ipc] publish:onEventCreated ——> mainWindow')
+      mainWindow.webContents.send('publish:onEventCreated', eventPayload)
+    } else {
+      console.warn('[main][ipc] publish:eventCreated 丢弃：mainWindow 不存在/已销毁')
+    }
+  })
+
+  ipcMain.handle('publish:eventDraft', (_event: IpcMainInvokeEvent, eventPayload: unknown) => {
+    console.log('[main][ipc] publish:eventDraft <—— publishWindow', eventPayload && typeof eventPayload === 'object' ? Object.keys(eventPayload as object) : eventPayload)
+    const mainWindow = ElectronMainWindow.getInstance().getWindow()
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      console.log('[main][ipc] publish:onEventDraft ——> mainWindow')
+      mainWindow.webContents.send('publish:onEventDraft', eventPayload)
+    } else {
+      console.warn('[main][ipc] publish:eventDraft 丢弃：mainWindow 不存在/已销毁')
+    }
+  })
+
+  ipcMain.handle('publish:eventProgress', (_event: IpcMainInvokeEvent, eventPayload: unknown) => {
+    if (eventPayload && typeof eventPayload === 'object') {
+      const p = eventPayload as { calendar_uuid?: string | number; text?: string; progress?: number }
+      console.log('[main][ipc] publish:eventProgress <——', `uuid=${p.calendar_uuid}`, `progress=${p.progress}`, `text.len=${p.text?.length ?? 0}`)
+    }
+    const mainWindow = ElectronMainWindow.getInstance().getWindow()
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('publish:onEventProgress', eventPayload)
+    } else {
+      console.warn('[main][ipc] publish:eventProgress 丢弃：mainWindow 不存在/已销毁')
+    }
+  })
+}

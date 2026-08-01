@@ -1,0 +1,24 @@
+diff --git a/electron/plugins/plugin-install.ts b/electron/plugins/plugin-install.ts
+index 34ea70e..89739f5 100644
+--- a/electron/plugins/plugin-install.ts
++++ b/electron/plugins/plugin-install.ts
+@@ -4,7 +4,8 @@ import * as path from 'path';
+ import * as fs from 'fs';
+ import { fileURLToPath } from 'url';
+ import AdmZip from 'adm-zip';
+-import { verifyPackageSignature, PluginManifest, SignatureJson } from './signature-verifier';
++import type { PluginManifest, SignatureJson } from './signature-verifier';
++import { verifyPackageSignature } from './signature-verifier';
+ import { PluginManager, getPluginRootDir } from './plugin-manager';
+ import { ElectronMainWindow } from '../windows/main-window';
+ import { ElectronFloatBall } from '../windows/float-ball';
+@@ -263,7 +264,9 @@ async function syncPluginSkills(pluginDir: string, pluginId: string): Promise<vo
+               console.log(`[PluginInstall] 🗑️ Cleaned up obsolete skill [${existingName}] for updated plugin [${pluginId}]`);
+             }
+           }
+-        } catch {}
++        } catch {
++          // ignore
++        }
+       }
+     }

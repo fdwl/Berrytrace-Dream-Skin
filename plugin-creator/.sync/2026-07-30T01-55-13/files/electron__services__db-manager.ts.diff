@@ -1,0 +1,42 @@
+diff --git a/electron/services/db-manager.ts b/electron/services/db-manager.ts
+index 1b8a8ee..768fc77 100644
+--- a/electron/services/db-manager.ts
++++ b/electron/services/db-manager.ts
+@@ -13,7 +13,7 @@ async function getWordsModule() {
+   return _wordsModule
+ }
+ import { WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME } from '../../src/config/constants'
+-import { GLOBAL_MIGRATIONS, WORKSPACE_MIGRATIONS, runMigrations, createGlobalTables } from './db-migrations'
++import { GLOBAL_MIGRATIONS, WORKSPACE_MIGRATIONS, runMigrations, createGlobalTables, createWorkspaceTables } from './db-migrations'
+ 
+ const __filename = fileURLToPath(import.meta.url)
+ const __dirname = dirname(__filename)
+@@ -147,7 +147,8 @@ export class DatabaseManager {
+     this.loadVecExtension(db)
+ 
+     // 运行 workspace 数据库迁移
+-    runMigrations(db, WORKSPACE_MIGRATIONS, 'DbChatSession')
++    createWorkspaceTables(db)
++    runMigrations(db, WORKSPACE_MIGRATIONS, 'FtsFileIndex')
+ 
+     // 缓存
+     this.workspaceDBs.set(workspacePath, { db, path: dbPath })
+@@ -202,10 +203,18 @@ export class DatabaseManager {
+   //  gradually migrate callers to use getGlobalDB() or getWorkspaceDB()
+   
+   public query(sql: string, params: SQLInputValue[] = []): unknown[] {
++    if (!this.isReady()) {
++      console.warn('[DatabaseManager] query() called before global database initialization. Returning empty array.')
++      return []
++    }
+     return this.getGlobalDB().prepare(sql).all(...params) as unknown[]
+   }
+ 
+   public execute(sql: string, params: SQLInputValue[] = []): { changes: number; lastInsertRowid: number } {
++    if (!this.isReady()) {
++      console.warn('[DatabaseManager] execute() called before global database initialization.')
++      return { changes: 0, lastInsertRowid: 0 }
++    }
+     const stmt = this.getGlobalDB().prepare(sql)
+     const result = stmt.run(...params)
+     return {

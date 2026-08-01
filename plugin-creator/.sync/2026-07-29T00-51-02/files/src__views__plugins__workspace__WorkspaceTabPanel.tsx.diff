@@ -1,0 +1,244 @@
+diff --git a/src/views/plugins/workspace/WorkspaceTabPanel.tsx b/src/views/plugins/workspace/WorkspaceTabPanel.tsx
+index 3131f35..3a4e2e8 100644
+--- a/src/views/plugins/workspace/WorkspaceTabPanel.tsx
++++ b/src/views/plugins/workspace/WorkspaceTabPanel.tsx
+@@ -1,10 +1,10 @@
+ import React, { useEffect, useMemo, useState, useRef, useCallback } from 'react';
+ import { useAppStore } from '../../../stores/app';
+ import { isBinaryFile } from '../../../utils/fileTypeDetector';
++import { showToast } from '../../../utils/ui';
+ import { PluginRegistry } from '../../../plugins/PluginRegistry';
+ import { useWorkspaceStore, type LayoutNode } from '../../../stores/workspace';
+ import SidebarPanel from './SidebarPanel';
+-import { useWorkspaceScanner } from '../../../layouts/hooks/useWorkspaceScanner';
+ import { WorkspaceVirtualList } from '../../../components/WorkspaceVirtualList';
+ import TerminalTabPanel from './TerminalTabPanel';
+ import BrowserTabPanel from './BrowserTabPanel';
+@@ -28,18 +28,22 @@ interface WorkspaceTabPanelProps {
+   extension?: string;
+   visible: boolean;
+   sessionId?: string;
+-  customParams?: Record<string, any>;
++  customParams?: Record<string, string>;
++}
++
++interface AssociatedPlugin {
++  id: string;
++  isActive: boolean;
++  fileAssociations?: string[];
+ }
+ 
+ const findTabNameInLayout = (node: LayoutNode, targetId: string): string | null => {
+   if (!node) return null;
+-  if (node.id === targetId && node.type === 'tab') {
+-    return node.name || null;
+-  }
+-  if (node.children && Array.isArray(node.children)) {
++  if (node.id === targetId) return node.name || null;
++  if (node.children) {
+     for (const child of node.children) {
+-      const name = findTabNameInLayout(child, targetId);
+-      if (name) return name;
++      const found = findTabNameInLayout(child, targetId);
++      if (found) return found;
+     }
+   }
+   return null;
+@@ -60,7 +64,7 @@ export default function WorkspaceTabPanel({
+     if (typeof window === 'undefined') return null;
+     const instance = PluginRegistry.getInstance().getPluginInstance(pluginId);
+     if (instance) {
+-      const manifest = (instance as any).manifest || {};
++      const manifest = ((instance as unknown as Record<string, unknown>).manifest as Record<string, unknown>) || {};
+       return {
+         id: pluginId,
+         name: manifest.name || '',
+@@ -126,24 +130,27 @@ export default function WorkspaceTabPanel({
+           }
+         });
+ 
+-        setExpandedFolders(prev => {
+-          const next = new Set(prev);
+-          pathsToExpand.forEach(p => next.add(p));
+-          return next;
++        requestAnimationFrame(() => {
++          setExpandedFolders(prev => {
++            const next = new Set(prev);
++            pathsToExpand.forEach(p => next.add(p));
++            return next;
++          });
+         });
+       }
+     }
+   }, [filePath]);
+ 
+-  const lazyLoadFolder = (folderPath: string) => {
+-    const win = window as any;
+-    if (win.__startWorkspaceScan) {
++  const lazyLoadFolder = useCallback((folderPath: string) => {
++    const win = window as unknown as Record<string, unknown>;
++    const startScan = win.__startWorkspaceScan as ((folder: string, opts: Record<string, unknown>) => void) | undefined;
++    if (startScan) {
+       console.log('[WorkspaceTabPanel] Triggering lazy load for folder:', folderPath);
+       const folderEntry = scannedFiles.find(f => f.path === folderPath);
+       const startDepth = folderEntry ? folderEntry.depth + 1 : 1;
+-      win.__startWorkspaceScan(folderPath, { maxDepth: 1, batchSize: 1000, incremental: true, startDepth });
++      startScan(folderPath, { maxDepth: 1, batchSize: 1000, incremental: true, startDepth });
+     }
+-  };
++  }, [scannedFiles]);
+ 
+   const handleFolderToggle = useCallback((folderPath: string) => {
+     const isCurrentlyExpanded = expandedFolders.has(folderPath);
+@@ -160,11 +167,10 @@ export default function WorkspaceTabPanel({
+     if (!isCurrentlyExpanded) {
+       lazyLoadFolder(folderPath);
+     }
+-  }, [expandedFolders]);
++  }, [expandedFolders, lazyLoadFolder]);
+ 
+   const tabHistories = useWorkspaceStore(state => state.tabHistories);
+   const workspaceActions = useWorkspaceStore(state => state.workspaceActions);
+-  const activeViews = useWorkspaceStore(state => state.activeViews);
+   const layoutJson = useWorkspaceStore(state => state.layoutJson);
+   const outlines = useWorkspaceStore(state => state.outlines);
+   const registeredPanels = useWorkspaceStore(state => state.registeredPanels);
+@@ -260,7 +266,6 @@ export default function WorkspaceTabPanel({
+   }, []);
+ 
+   // Compute applicable plugin actions
+-  const activeView = activeViews[tabId];
+   const viewType = PluginRegistry.getInstance().resolveWorkspaceViewType(pluginId);
+   const activeExtension = extension || (filePath ? filePath.split('.').pop() || '' : '');
+ 
+@@ -280,7 +285,9 @@ export default function WorkspaceTabPanel({
+ 
+   // Listen for view registration to handle asynchronously loaded plugins
+   useEffect(() => {
+-    setViewRegistered(false);
++    requestAnimationFrame(() => {
++      setViewRegistered(false);
++    });
+     const handleRegistered = (e: Event) => {
+       const detail = (e as CustomEvent<{ viewType: string }>).detail;
+       const targetViewType = PluginRegistry.getInstance().resolveWorkspaceViewType(pluginId);
+@@ -302,8 +309,10 @@ export default function WorkspaceTabPanel({
+       pluginId === 'system.browser' ||
+       pluginId === 'system.unsupported-file'
+     ) {
+-      setLoading(false);
+-      setErrorMsg(null);
++      requestAnimationFrame(() => {
++        setLoading(false);
++        setErrorMsg(null);
++      });
+       return;
+     }
+ 
+@@ -338,7 +347,7 @@ export default function WorkspaceTabPanel({
+       });
+       return unsubscribe;
+     }
+-  }, [pluginId]);
++  }, [pluginId, initialPlugin]);
+ 
+   // 2. Disable default window dragging if configured in plugin
+   useEffect(() => {
+@@ -394,7 +403,7 @@ export default function WorkspaceTabPanel({
+             theme,
+             sessionId,
+             customParams
+-          } as any)).catch((err: unknown) => {
++          } as unknown as Record<string, string>)).catch((err: unknown) => {
+             console.error(`[WorkspaceTabPanel] Error in view.onOpen for ${viewType}:`, err);
+           });
+           useWorkspaceStore.getState().setActiveView(tabId, activeViewRef.current);
+@@ -405,7 +414,7 @@ export default function WorkspaceTabPanel({
+     return () => {
+       if (timer) clearTimeout(timer);
+     };
+-  }, [plugin, pluginId, loading, filePath, articleId, theme, visible, sessionId, viewRegistered, tabId]);
++  }, [plugin, pluginId, loading, filePath, articleId, theme, visible, sessionId, viewRegistered, tabId, customParams]);
+ 
+   // Cleanup view on unmount
+   useEffect(() => {
+@@ -621,10 +630,10 @@ export default function WorkspaceTabPanel({
+ 
+           {/* Right Column: File virtual directory */}
+           {showFileTree && !zenMode && (
+-            <div className="w-[260px] shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)] text-[var(--text-primary,#ffffff)]">
++            <div className="w-[260px] shrink-0 flex flex-col min-h-0 bg-[var(--bg-page)] border-l border-[var(--border-light)] text-[var(--text-primary,#ffffff)]">
+               {/* Search Header */}
+-              <div className="p-2 border-b border-[var(--border-light,#3c3c3c)] shrink-0">
+-                <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[rgba(0,0,0,0.12)] border border-[var(--border-light,#3c3c3c)]">
++              <div className="p-2 border-b border-[var(--border-light)] shrink-0">
++                <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[var(--bg-card)] border border-[var(--border-light)]">
+                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-[var(--text-tertiary)]">
+                     <circle cx="11" cy="11" r="8" />
+                     <line x1="21" y1="21" x2="16.65" y2="16.65" />
+@@ -663,7 +672,7 @@ export default function WorkspaceTabPanel({
+                     } else if (window.electronAPI?.plugins?.getList) {
+                       try {
+                         const list = await window.electronAPI.plugins.getList();
+-                        const matching = list.find((p: any) =>
++                        const matching = list.find((p: AssociatedPlugin) =>
+                           p.isActive && p.fileAssociations?.some((assoc: string) => assoc.toLowerCase().replace(/^\./, '') === ext)
+                         );
+                         if (matching) {
+@@ -788,8 +797,22 @@ export default function WorkspaceTabPanel({
+           </div>
+ 
+           {/* Center: File path display */}
+-          <div className="text-[12px] text-[var(--text-secondary,#cccccc)] font-medium max-w-[400px] truncate" title={filePath || ''}>
+-            {relPath}
++          <div
++            className={`text-[12px] text-[var(--text-secondary,#cccccc)] font-medium max-w-[400px] truncate ${
++              filePath ? 'cursor-pointer hover:text-white transition-colors' : ''
++            }`}
++            title={filePath ? `${filePath} (点击复制路径)` : ''}
++            onClick={() => {
++              if (filePath) {
++                navigator.clipboard.writeText(filePath).then(() => {
++                  showToast('已复制文件路径');
++                }).catch(() => {
++                  showToast('复制失败');
++                });
++              }
++            }}
++          >
++            {filePath || ''}
+           </div>
+ 
+           {/* Right: Options Button & Dropdown */}
+@@ -873,7 +896,7 @@ export default function WorkspaceTabPanel({
+                       >
+                         <span>{action.label}</span>
+                         {isActive && (
+-                          <span className="text-[var(--color-brand,#007acc)] font-bold ml-2">✓</span>
++                          <span className="text-[var(--color-brand,#5b7fff)] font-bold ml-2">✓</span>
+                         )}
+                       </div>
+                       {action.divider === 'after' && (
+@@ -1072,10 +1095,10 @@ export default function WorkspaceTabPanel({
+ 
+             {/* Right: Directory File Tree */}
+             {showFileTree && !zenMode && (
+-              <div className="w-[260px] shrink-0 flex flex-col min-h-0 bg-[var(--bg-sidebar)] text-[var(--text-primary,#ffffff)]">
++              <div className="w-[260px] shrink-0 flex flex-col min-h-0 bg-[var(--bg-page)] border-l border-[var(--border-light)] text-[var(--text-primary,#ffffff)]">
+                 {/* Search Header */}
+-                <div className="p-2 border-b border-[var(--border-light,#3c3c3c)] shrink-0">
+-                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[rgba(0,0,0,0.12)] border border-[var(--border-light,#3c3c3c)]">
++                <div className="p-2 border-b border-[var(--border-light)] shrink-0">
++                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[var(--bg-card)] border border-[var(--border-light)]">
+                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-[var(--text-tertiary)]">
+                       <circle cx="11" cy="11" r="8" />
+                       <line x1="21" y1="21" x2="16.65" y2="16.65" />
+@@ -1112,7 +1135,7 @@ export default function WorkspaceTabPanel({
+                       if (window.electronAPI?.plugins?.getList) {
+                         try {
+                           const list = await window.electronAPI.plugins.getList();
+-                          const matching = list.find((p: any) =>
++                          const matching = list.find((p: AssociatedPlugin) =>
+                             p.isActive && p.fileAssociations?.some((assoc: string) => assoc.toLowerCase().replace(/^\./, '') === ext)
+                           );
+                           if (matching) {

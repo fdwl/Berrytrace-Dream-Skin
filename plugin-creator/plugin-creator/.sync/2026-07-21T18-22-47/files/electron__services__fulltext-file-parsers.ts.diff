@@ -1,0 +1,13 @@
+diff --git a/electron/services/fulltext-file-parsers.ts b/electron/services/fulltext-file-parsers.ts
+index debefa6..17f13e9 100644
+--- a/electron/services/fulltext-file-parsers.ts
++++ b/electron/services/fulltext-file-parsers.ts
+@@ -388,6 +388,7 @@ export function getSupportedExts(): string[] {
+   return [
+     '.md', '.txt', '.pdf', '.docx', '.pptx', '.xlsx',
+     '.doc', '.ppt', '.xls',
+-    '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.gif'
++    '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.gif',
++    '.workflow'
+   ]
+ }

@@ -1,0 +1,528 @@
+diff --git a/plugins-sdk/types.ts b/plugins-sdk/types.ts
+index 2ac63cc..8c5b7e0 100644
+--- a/plugins-sdk/types.ts
++++ b/plugins-sdk/types.ts
+@@ -5,6 +5,43 @@ import type {
+   BerrytraceCommandMap,
+   BerrytraceCommandName,
+ } from './event-catalog.js';
++
++function getFinalToolName(toolName: string, pluginId: string, allowedPrefixes?: string[]): string {
++  const parts = pluginId.split('.');
++  const lastPart = parts[parts.length - 1] || '';
++  const defaultPrefix = lastPart.replace(/-/g, '_').toLowerCase().replace(/_tools$/, '').replace(/_agent$/, '');
++
++  const prefixes = allowedPrefixes && allowedPrefixes.length > 0
++    ? allowedPrefixes.map(p => p.toLowerCase())
++    : [defaultPrefix];
++
++  // 校验工具名是否以允许的前缀开头
++  let hasValidPrefix = false;
++  for (const p of prefixes) {
++    if (toolName.startsWith(p + '_')) {
++      hasValidPrefix = true;
++      break;
++    }
++  }
++
++  if (!hasValidPrefix && pluginId !== 'berrytrace.host' && pluginId !== '') {
++    console.warn(`[PluginsSDK] Warning: Tool "${toolName}" from plugin "${pluginId}" does not follow the naming standard. It should be prefixed with "${prefixes[0]}_".`);
++  }
++
++  return toolName;
++}
++
++
++export interface SSHHostProfile {
++  host: string;
++  hostname?: string;
++  user?: string;
++  port?: number;
++  identityFile?: string;
++  proxyCommand?: string;
++  name?: string;
++}
++
+ /**
+  * 莓莓印记 (BerryTrace) 插件 SDK 类型定义文件
+  *
+@@ -263,6 +300,44 @@ export interface AIApi extends Omit<GeneratedAIApi, 'chat' | 'chatStream' | 'run
+    * await sdk.ai.unregisterAgentProvider('plugin_xxx');
+    */
+   unregisterAgentProvider(serverId: string): Promise<void>;
++
++  /**
++   * 获取所有已注册的 AI 服务商列表（包含支持的模型）
++   */
++  getAiServers(): Promise<Array<{
++    id: string;
++    name: string;
++    provider: string;
++    model: string;
++    supportedModels?: string[];
++    baseUrl?: string;
++    apiKey?: string;
++  }>>;
++
++  /**
++   * 获取 capability → { serverId, model } 映射
++   */
++  getCapabilityModels(): Promise<Record<string, { serverId: string; model: string }>>;
++
++  /**
++   * 绑定具体能力槽位使用的 AI 服务商与模型名
++   */
++  setCapabilityModel(capability: string, serverId: string, model: string): Promise<void>;
++
++  /**
++   * 获取指定服务商对应的全量已解析 LLM 配置
++   */
++  getServerLlmConfig(serverId: string): Promise<{
++    provider: string;
++    model: string;
++    apiKey?: string;
++    baseUrl?: string;
++  } | null>;
++
++  /**
++   * 获取 Voice Settings 配置对象
++   */
++  getVoiceSettings(): Promise<any>;
+ }
+ 
+ export interface ActiveAppInfo {
+@@ -572,7 +647,7 @@ export interface FileSystemAPI extends Omit<GeneratedFileSystemAPI, 'readFile' |
+    * // 在应用数据目录下写入文件
+    * await sdk.filesystem.writeFile(dataDir + '/my-data.json', JSON.stringify(data));
+    */
+-  getSafePath(name: 'userData' | 'documents' | 'desktop' | 'temp' | 'skills'): Promise<string>;
++  getSafePath(name: 'userData' | 'documents' | 'desktop' | 'temp' | 'skills' | 'pluginData'): Promise<string>;
+ 
+   /**
+    * 在文件管理器中显示文件（跨平台）
+@@ -1224,12 +1299,27 @@ export interface RegisterViewConfig {
+   /** 视图唯一标识，如 'com.berrytrace.plugin.xxx:workspace' */
+   viewType: string;
+   /** View 类（需继承 View 基类），接受 (container, sdk) 构造参数 */
+-  viewClass: new (container: HTMLElement, app: unknown) => unknown;
++  viewClass: new (container: HTMLElement, app: any) => unknown;
+   /** 声明此 View 渲染在哪里以及对应的元信息 */
+   placement: ViewPlacement;
+ }
+ 
++export interface TabCreateMenuItem {
++  id: string;
++  pluginId?: string;
++  label: string;
++  description?: string;
++  category: 'system' | 'ssh' | 'agent' | string;
++  iconName?: string;
++  keywords?: string[];
++  enabled?: boolean;
++  order?: number;
++  onSelect: (context: { tabsetId?: string; worktreeId?: string }) => void | Promise<void>;
++}
++
+ export interface WorkspaceAPI extends Omit<GeneratedWorkspaceAPI, 'getPath' | 'getMetadata' | 'openWorkspaceTab'> {
++  registerTabMenuItem(item: TabCreateMenuItem): () => void;
++  unregisterTabMenuItem(id: string): void;
+   /**
+    * @deprecated 请使用顶层方法 `sdk.registerView()` 代替。
+    * 向后兼容别名，内部委托到 `sdk.registerView`。
+@@ -1326,7 +1416,7 @@ export interface WorkspaceAPI extends Omit<GeneratedWorkspaceAPI, 'getPath' | 'g
+    * sdk.workspace.registerRibbonIcon('id', () => `<svg>...${progress}%</svg>`, 'Title', onClick);
+    *
+    * // React 组件（带 Canvas 动画、hover 效果等）
+-   * sdk.workspace.registerRibbonIcon('id', 
++   * sdk.workspace.registerRibbonIcon('id',
+    *   () => React.createElement(AnimatedIcon, { active: true, progress: 45 }),
+    *   'Title', onClick);
+    */
+@@ -1836,7 +1926,9 @@ export interface SettingsTabConfig {
+   /** Tab 图标（可选 SVG 字符串） */
+   icon?: string;
+   /** 已注册的视图类型标识（需先通过 workspace.registerView 注册） */
+-  viewType: string;
++  viewType?: string;
++  /** 直接传入 React 组件（宿主内部注册） */
++  component?: React.ComponentType<{ showSaved?: () => void }>;
+   /** 排序权重，数字越小越靠前，默认 100 */
+   order?: number;
+   /** 插件 ID，用于获取插件实例（提供 SDK） */
+@@ -1976,6 +2068,33 @@ export interface GeneratedAIApi {
+      */
+   getAgentKernelStatus(): Promise<unknown>;
+ 
++  /**
++     * 获取所有已注册的 AI 服务商及其模型列表。
++     */
++  getAiServers(): Promise<unknown>;
++
++  /**
++     * 获取按能力分配的服务商与模型映射（供 cline-agent 等插件读取当前 capability→{serverId, model} 配置）
++     */
++  getCapabilityModels(): Promise<unknown>;
++
++  getServerLlmConfig(options: string | { serverId: string }): Promise<unknown>;
++
++  /**
++     * 获取渲染进程中的 Voice Settings
++     */
++  getVoiceSettings(): Promise<unknown>;
++
++  /**
++     * 离开 Agent 内核会话。
++     */
++  leaveAgentSession(options: { sessionId: string } | string): Promise<null>;
++
++  /**
++     * 预热 Agent 内核会话进程。
++     */
++  prewarmAgentSession(options: { agentId: string; model?: string; sessionId?: string }): Promise<null>;
++
+   /**
+      * 启动 AI Agent 任务。自动获取 LLM 配置，找到可用的 Agent 内核插件，发送任务到后台进程异步执行。
+      * @param options sessionId — 会话 ID（可选），task — 任务描述，history — 历史对话，workDir — 工作目录，activeDocument — 当前文档信息，llmConfig — LLM 配置（可选），maxSteps — 最大步数，systemPrompt — 系统提示词，skipDefaultSystemPrompt — 跳过默认提示词
+@@ -2098,6 +2217,11 @@ export interface GeneratedFileSystemAPI {
+      */
+   extractZip(zipPath: string, destDir: string, overwrite?: boolean): Promise<null>;
+ 
++  /**
++     * 获取指定文件/程序的原生 OS 图标（Base64 PNG data URL）。
++     */
++  getFileIcon(filePath: string): Promise<string>;
++
+   /**
+      * 获取系统安全路径。仅允许 userData / documents / desktop / temp。
+      * @param name 路径名：'userData' | 'documents' | 'desktop' | 'temp'
+@@ -2118,6 +2242,11 @@ export interface GeneratedFileSystemAPI {
+      */
+   mkdir(path: string): Promise<null>;
+ 
++  /**
++     * 按需切片读取文件。只读取指定 offset 和 length 范围的 Buffer，绝不全量装载超大文件。
++     */
++  readChunk(filePath: string, offset: any, length: any, encoding: any): Promise<string>;
++
+   /**
+      * 列出目录下的文件和子目录。
+      * @param path 目录路径
+@@ -2300,15 +2429,16 @@ export interface GeneratedMcpAPI {
+      */
+   callTool(toolName: string, toolArgs: Record<string, unknown>): Promise<unknown>;
+ 
++  deleteProfile(id: string): Promise<boolean>;
++
++  listProfiles(): Promise<unknown[]>;
++
+   /**
+      * 列出所有已注册的系统提示词。
+      */
+   listSystemPrompts(): Promise<unknown>;
+ 
+-  /**
+-     * 列出所有已注册的 MCP 工具。
+-     */
+-  listTools(): Promise<unknown>;
++  listTools(): Promise<unknown[]>;
+ 
+   /**
+      * 动态注册 MCP 工具（运行时注册，非 plugin.json 声明）。
+@@ -2324,6 +2454,8 @@ export interface GeneratedMcpAPI {
+      */
+   registerSystemPrompt(callerPluginId: string, options: { promptId: string; promptText: string }): Promise<null>;
+ 
++  saveProfile(profile: any): Promise<unknown>;
++
+   /**
+      * 注销动态 MCP 工具。
+      * @param callerPluginId 调用插件 ID
+@@ -2337,12 +2469,20 @@ export interface GeneratedMcpAPI {
+      * @param promptId 提示词 ID
+      */
+   unregisterSystemPrompt(callerPluginId: string, promptId: string): Promise<null>;
++
++  updateScopeToken(params: { token: string; allowedTools?: string[]; allowedPlugins?: string[] }): Promise<boolean>;
+ }
+ 
+ /**
+  * plugin Namespace API (Generated)
+  */
+ export interface GeneratedPluginInfoAPI {
++  /**
++     * 按需确保加载目标插件 Manifest/服务。
++     * @param targetPluginId 目标插件 ID
++     */
++  ensurePluginLoaded(targetPluginId: string): Promise<unknown>;
++
+   /**
+      * 获取当前插件元信息。
+      * @returns { id, name, version, path }
+@@ -2353,6 +2493,11 @@ export interface GeneratedPluginInfoAPI {
+      * 获取当前插件生命周期上下文。
+      */
+   getLifecycleContext(): Promise<unknown>;
++
++  /**
++     * 检查指定插件是否被启用。
++     */
++  isPluginEnabled(targetPluginId: string): Promise<boolean>;
+ }
+ 
+ /**
+@@ -2468,6 +2613,20 @@ export interface GeneratedSelectionMenuAPI {
+  * storage Namespace API (Generated)
+  */
+ export interface GeneratedStorageAPI {
++  clear(): Promise<null>;
++
++  delete(key: string): Promise<null>;
++
++  get(key: string, defaultValue: unknown): Promise<unknown>;
++
++  getItem(key: string, defaultValue: unknown): Promise<unknown>;
++
++  removeItem(key: string): Promise<null>;
++
++  set(key: string, value: unknown): Promise<null>;
++
++  setItem(key: string, value: unknown): Promise<null>;
++
+   db: {
+     /**
+        * 执行 SQL 语句。SELECT / PRAGMA 返回查询结果数组，其他语句返回 lastInsertRowid 和 changes。
+@@ -2485,15 +2644,8 @@ export interface GeneratedStorageAPI {
+   };
+ 
+   kv: {
+-    /**
+-       * 清空当前插件所有键值对数据。
+-       */
+     clear(): Promise<null>;
+ 
+-    /**
+-       * 删除指定键值对。
+-       * @param key 键名
+-       */
+     delete(key: string): Promise<null>;
+ 
+     /**
+@@ -2503,11 +2655,6 @@ export interface GeneratedStorageAPI {
+        */
+     get(key: string, defaultValue: unknown): Promise<unknown>;
+ 
+-    /**
+-       * 写入键值对数据，会覆盖已有值。
+-       * @param key 键名
+-       * @param value 值（任意 JSON 可序列化类型）
+-       */
+     set(key: string, value: unknown): Promise<null>;
+   };
+ }
+@@ -2584,7 +2731,7 @@ export interface GeneratedSystemAPI {
+      * 自动读取解析用户主目录 ~/.ssh/config 配置文件与密钥列表
+      */
+   getSSHConfigProfiles(_options: unknown): Promise<{
+-    profiles: any[];
++    profiles: SSHHostProfile[];
+     keys: string[];
+     configExists: boolean;
+   }>;
+@@ -2623,6 +2770,11 @@ export interface GeneratedSystemAPI {
+      */
+   isFocusedInInputArea(): Promise<{ isInput: boolean; isEditable: boolean; role: string }>;
+ 
++  /**
++     * 终止指定 Session 会话下的所有运行中子进程（终端、脚本）
++     */
++  killSessionProcesses(sessionId: string): Promise<boolean>;
++
+   /**
+      * 启动一个应用程序（如果已运行则将其激活置前）。
+      * appName: 应用名称（如 "微信"、"WeChat"、"Google Chrome"）或 bundle ID（如 "com.tencent.xinWeChat"）。
+@@ -2748,11 +2900,6 @@ export interface GeneratedSystemAPI {
+      */
+   simulateType(options: { text: string }): Promise<boolean>;
+ 
+-  /**
+-     * 触发 4 阶段 SSH 堡垒机与内网 DB 连通性测试
+-     */
+-  testSSHTunnelConnectivity(options: { sshConfig: any }): Promise<any>;
+-
+   /**
+      * 切换快速面板（语音助手面板）的显示/隐藏。
+      */
+@@ -2949,6 +3096,11 @@ export interface GeneratedWorkspaceAPI {
+      */
+   getPluginsByExtension(ext: string): Promise<unknown[]>;
+ 
++  /**
++     * 读取项目根目录下 .berrytrace/config.json 配置
++     */
++  getProjectConfig(workspacePath: string): Promise<Record<string, any>>;
++
+   /**
+      * 获取最近打开的文档列表。
+      */
+@@ -2986,6 +3138,13 @@ export interface GeneratedWorkspaceAPI {
+      */
+   openWorkspaceTab(filePath: string | undefined, targetPluginId: string, extension?: string, articleId?: string, sessionId?: string, replaceActiveTab?: boolean, title?: string, line?: number, customParams?: Record<string, unknown>): Promise<null>;
+ 
++  /**
++     * 保存配置到项目根目录下 .berrytrace/config.json
++     */
++  saveProjectConfig(options: { workspacePath: string; config: Record<string, any> } | string, configArg?: Record<string, any>): Promise<boolean>;
++
++  scanPorts(workspacePath: string): Promise<Array<{ port: number; processName: string; pid: number; cwd: string }>>;
++
+   /**
+      * 在工作区中全文搜索文档。
+      * @param options query — 搜索词，workspacePath — 工作区路径
+@@ -3124,14 +3283,18 @@ declare global {
+       View: typeof View;
+     };
+   }
+-  const berrytrace: BerryTraceSDK & {
++  var berrytrace: BerryTraceSDK & {
+     Plugin: typeof Plugin;
+     View: typeof View;
+   };
+ }
+ 
+ 
+-export function createPluginSDK(pluginId?: string): BerryTraceSDK {
++export interface PluginSdkOptions {
++  toolPrefixes?: string[];
++}
++
++export function createPluginSDK(pluginId?: string, options?: PluginSdkOptions): BerryTraceSDK {
+   // 同时支持 utilityProcess（parentPort）和 child_process.fork（process.send）
+   // 优先级：parentPort（Electron utilityProcess）> process.send（Node.js child_process.fork）
+   const isNodeBackground = typeof process !== 'undefined' && process.versions && process.versions.node
+@@ -3252,7 +3415,10 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+     };
+ 
+     postMessageImpl = (msg: any) => {
+-      if (directPort && (msg.type === 'sdk:callApi:stream-chunk' || msg.type === 'sdk:callApi:stream-end' || msg.type === 'sdk:callApi:stream-error')) {
++      const isHighFreqStreamEvent = msg && msg.type === 'sdk:events:emit' &&
++        (msg.eventName === 'agent:step_update' || msg.eventName === 'agent:stream_delta');
++
++      if (directPort && (isHighFreqStreamEvent || msg.type === 'sdk:callApi:stream-chunk' || msg.type === 'sdk:callApi:stream-end' || msg.type === 'sdk:callApi:stream-error')) {
+         directPort.postMessage(msg);
+       } else {
+         sendToHost(msg);
+@@ -3400,7 +3566,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+           if (manifest) {
+             const listens = manifest.contributes?.events?.listens || [];
+             const isDeclared = listens.some((item: any) => item.name === eventName);
+-            const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:'];
++            const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:'];
+             const isPlatformEvent = prefixes.some(p => eventName.startsWith(p));
+             if (isPlatformEvent && eventName !== 'commands:execute' && !isDeclared) {
+               console.warn(`\x1b[33m[SDK:WARN:${pluginId}] Event "${eventName}" is listened in code but NOT declared in plugin.json listens list! CROSS-PROCESS MESSAGES WILL BE SILENTLY LOST.\x1b[0m`);
+@@ -3422,7 +3588,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+     };
+ 
+     emitEventImpl = (eventName, payload) => {
+-      const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:'];
++      const prefixes = ['agent:', 'workspace:', 'context:', 'system:', 'plugins:', 'voice:'];
+       const isPlatformEvent = prefixes.some(p => eventName.startsWith(p));
+       if (isPlatformEvent) {
+         sendToHost({ type: 'sdk:events:emit', eventName, payload });
+@@ -3537,7 +3703,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+     let resultTokenCounter = 1;
+     const pendingResults = new Map<number, { resolve: (val: any) => void; reject: (err: any) => void; timer: ReturnType<typeof setTimeout> }>();
+     const resultCallbackId = `sdk:callApiResult:${pluginId || 'generic'}`;
+- 
++
+     // 监听来自 preload 的 callApiResult 响应
+     (window as any).electronAPI.ipc.on(resultCallbackId, (data: any) => {
+       const { token, success, result, error } = data;
+@@ -3549,7 +3715,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+         else pending.reject(new Error(error || 'callApiResult failed'));
+       }
+     });
+- 
++
+     callApiResultImpl = (apiName, methodName, args, timeoutMs = 30000) => {
+       return new Promise((resolve, reject) => {
+         const token = resultTokenCounter++;
+@@ -3562,7 +3728,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+         (window as any).electronAPI.callApiResult(apiName, methodName, processArgs(args || []), pluginId, token, resultCallbackId);
+       });
+     };
+- 
++
+     if (pluginId) {
+       (window as any).electronAPI.ipc.on(`plugin:callback:${pluginId}`, (data: any) => {
+         const { callbackId, args } = data;
+@@ -3577,7 +3743,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+         }
+       });
+     }
+- 
++
+     onEventImpl = (eventName, cb) => {
+       const domHandler = (e: Event) => {
+         const detail = (e as CustomEvent).detail;
+@@ -3607,7 +3773,7 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+         if (idx !== -1) list.splice(idx, 1);
+       };
+     };
+- 
++
+     emitEventImpl = (eventName, payload) => {
+       window.dispatchEvent(new CustomEvent(`sdk:event:${eventName}`, { detail: [payload] }));
+       (window as any).electronAPI.ipc.send(eventName, payload);
+@@ -3707,10 +3873,10 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+     callApiResult,
+     postMessage: (msg: any) => postMessageImpl(msg),
+     log: createApiProxy('log', {
+-      info: (msg: string) => callApi('log', 'info', [msg]),
+-      warn: (msg: string) => callApi('log', 'warn', [msg]),
+-      error: (msg: string) => callApi('log', 'error', [msg]),
+-      debug: (msg: string) => callApi('log', 'debug', [msg]),
++      info: (msg: string) => callApi('log', 'info', [msg]).catch((err) => { console.log(`[Plugin:${pluginId}:info]`, msg); }),
++      warn: (msg: string) => callApi('log', 'warn', [msg]).catch((err) => { console.warn(`[Plugin:${pluginId}:warn]`, msg); }),
++      error: (msg: string) => callApi('log', 'error', [msg]).catch((err) => { console.error(`[Plugin:${pluginId}:error]`, msg); }),
++      debug: (msg: string) => callApi('log', 'debug', [msg]).catch((err) => { console.debug(`[Plugin:${pluginId}:debug]`, msg); }),
+     }),
+     plugin: createApiProxy('plugin', {
+       getInfo: () => callApi('plugin', 'getInfo') as Promise<PluginInfo>,
+@@ -3748,7 +3914,8 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+       registerToolHandler: (toolName: string, handler: (args: Record<string, unknown>) => Promise<McpToolResult>) => {
+         const win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : global) as any;
+         win._mcpHandlers = win._mcpHandlers || new Map();
+-        win._mcpHandlers.set(`${pluginId}:${toolName}`, handler);
++        const finalName = getFinalToolName(toolName, pluginId || '', options?.toolPrefixes);
++        win._mcpHandlers.set(`${pluginId}:${finalName}`, handler);
+       },
+       registerResourceHandler: (uriPattern: string, handler: (params: Record<string, string>) => Promise<McpResourceResult>) => {
+         console.log('registerResourceHandler', uriPattern, handler);
+@@ -3759,8 +3926,10 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+       ) => {
+         const win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : global) as any;
+         win._mcpHandlers = win._mcpHandlers || new Map();
+-        win._mcpHandlers.set(`${pluginId}:${toolSpec.name}`, handler);
+-        await callApi('mcp', 'registerDynamicTool', [pluginId, toolSpec]);
++        const finalName = getFinalToolName(toolSpec.name, pluginId || '', options?.toolPrefixes);
++        win._mcpHandlers.set(`${pluginId}:${finalName}`, handler);
++        const finalSpec = { ...toolSpec, name: finalName };
++        await callApi('mcp', 'registerDynamicTool', [pluginId, finalSpec]);
+       },
+       registerSystemPrompt: async (promptId: string, promptText: string) => {
+         await callApi('mcp', 'registerSystemPrompt', [pluginId, { promptId, promptText }]);
+@@ -3770,10 +3939,11 @@ export function createPluginSDK(pluginId?: string): BerryTraceSDK {
+       },
+       unregisterDynamicTool: async (toolName: string) => {
+         const win = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : global) as any;
++        const finalName = getFinalToolName(toolName, pluginId || '', options?.toolPrefixes);
+         if (win._mcpHandlers) {
+-          win._mcpHandlers.delete(`${pluginId}:${toolName}`);
++          win._mcpHandlers.delete(`${pluginId}:${finalName}`);
+         }
+-        await callApi('mcp', 'unregisterDynamicTool', [pluginId, toolName]);
++        await callApi('mcp', 'unregisterDynamicTool', [pluginId, finalName]);
+       },
+       listTools: () => callApi('mcp', 'listTools') as Promise<unknown[]>,
+       callTool: (name: string, args: Record<string, unknown>) => callApi('mcp', 'callTool', [name, args]) as Promise<unknown>,

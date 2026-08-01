@@ -1,0 +1,231 @@
+diff --git a/electron/services/mouse-hook.ts b/electron/services/mouse-hook.ts
+index 4fd705f..6ca39fd 100644
+--- a/electron/services/mouse-hook.ts
++++ b/electron/services/mouse-hook.ts
+@@ -6,8 +6,9 @@ import type { ChildProcess } from 'child_process'
+ import { createRequire } from 'module'
+ import { cache, CacheAttribute } from '../config/index'
+ import { ElectronQuickPanelWindow } from '../windows/quick-panel'
+-import { ElectronFloatBall } from '../windows/float-ball'
++import { ElectronFloatWeb } from '../windows/float-web'
+ import { getShortcutActionRegistry } from './shortcut-action-registry'
++import { KeybindingsManager } from './keybindings-manager'
+ 
+ const require = createRequire(import.meta.url)
+ const __filename = fileURLToPath(import.meta.url)
+@@ -61,22 +62,35 @@ export function getMouseHook(): MouseHook | null {
+   return mouseHook
+ }
+ 
++import { ShortcutActivationDispatcher } from './shortcut-activation-dispatcher'
++
+ export function startGlobalMouseHook() {
+   const tStart = performance.now()
+-  const enabled = (cache.get(CacheAttribute.prefRightClickLongPress) as boolean) ?? true
+-  if (!enabled) {
+-    console.log('[MouseHook] Global right-click long-press feature is disabled by user settings.')
++  const enabled = (cache.get(CacheAttribute.prefRightClickLongPress) as boolean) ?? false
++
++  // 动态检索 KeybindingsManager 是否有绑定 right_click:long_press 手势的规则
++  let hasRightClickKeybinding = false
++  try {
++    const keybindings = KeybindingsManager.getInstance().getEffectiveKeybindings()
++    hasRightClickKeybinding = keybindings.some((rule: { gesture?: string }) => rule.gesture === 'right_click:long_press')
++  } catch (_e) {
++    /* ignore error retrieving effective keybindings */
++  }
++
++  if (!enabled && !hasRightClickKeybinding) {
++    console.log('[NativeHook:Mouse:STATUS] Mouse hook is disabled by user settings. Helper process will NOT be spawned.')
++    stopGlobalMouseHook()
+     return
+   }
+ 
+   const hook = getMouseHook()
+   if (!hook) {
+-    console.error('[MouseHook] Native module not loaded, cannot start.')
++    console.error('🚨 [NativeHook:Mouse:ERROR] Native module not loaded, cannot start.')
+     return
+   }
+ 
+   if (isMouseHookRunning || mouseHookProcess) {
+-    console.log('[MouseHook] Global mouse hook is already running, skipping start.')
++    console.log('[NativeHook:Mouse:STATUS] Global mouse hook is already running, skipping start.')
+     return
+   }
+ 
+@@ -86,28 +100,13 @@ export function startGlobalMouseHook() {
+   if (process.platform === 'darwin') {
+     const tPerm = performance.now()
+     const hasPermission = hook.isAccessibilityGranted()
+-    console.log(`[MouseHook] Accessibility permission check took ${(performance.now() - tPerm).toFixed(1)}ms`)
++    console.log(`[NativeHook:Mouse:STATUS] Accessibility permission check took ${(performance.now() - tPerm).toFixed(1)}ms`)
+ 
+     if (!hasPermission) {
+-    shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility').catch((err) => {
+-            console.error('[Main] Failed to open accessibility preferences:', err)
+-          })
+-    //   console.warn('[MouseHook] Accessibility permission missing on macOS.')
+-    //   dialog.showMessageBox({
+-    //     type: 'warning',
+-    //     title: '需要系统权限',
+-    //     message: '“莓莓印记” 需要您授予“无障碍/辅助功能”权限以启用鼠标右键长按唤起快捷面板的功能。',
+-    //     buttons: ['去设置', '稍后'],
+-    //     defaultId: 0,
+-    //     cancelId: 1
+-    //   }).then(({ response }) => {
+-    //     if (response === 0) {
+-    //       shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility').catch((err) => {
+-    //         console.error('[Main] Failed to open accessibility preferences:', err)
+-    //       })
+-    //     }
+-    //   })
+-    //   return
++      console.warn('⚠️ [NativeHook:Mouse:WARN] Accessibility permission missing on macOS.')
++      shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility').catch((err) => {
++        console.error('🚨 [NativeHook:Mouse:ERROR] Failed to open accessibility preferences:', err)
++      })
+     }
+   }
+ 
+@@ -120,14 +119,14 @@ export function startGlobalMouseHook() {
+     ? join(__dirname, '..', process.platform === 'win32' ? 'build-win' : 'build-mac', 'Release', helperName)
+     : join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', helperName)
+ 
+-  console.log(`[MouseHook] Spawning global mouse hook helper: ${helperPath} (delay: ${delay}ms)...`)
++  console.log(`[NativeHook:Mouse:START] Spawning global mouse hook helper: ${helperPath} (delay: ${delay}ms)...`)
+ 
+   try {
+     const tSpawn = performance.now()
+     mouseHookProcess = spawn(helperPath, [delay.toString(), '10', process.pid.toString()], {
+       stdio: ['pipe', 'pipe', 'pipe']
+     })
+-    console.log(`[MouseHook] Helper spawn took ${(performance.now() - tSpawn).toFixed(1)}ms (total start duration: ${(performance.now() - tStart).toFixed(1)}ms)`)
++    console.log(`[NativeHook:Mouse:START] Helper spawn took ${(performance.now() - tSpawn).toFixed(1)}ms (total start duration: ${(performance.now() - tStart).toFixed(1)}ms)`)
+ 
+     isMouseHookRunning = true
+ 
+@@ -141,67 +140,73 @@ export function startGlobalMouseHook() {
+         if (!trimmed) continue
+         try {
+           const parsed = JSON.parse(trimmed)
+-          console.log('[MouseHook] Received event from helper process:', parsed)
++          console.log('[NativeHook:Mouse:EVENT] Event received from helper process:', parsed)
+           if (parsed.event === 'long_press') {
+-            const appId = parsed.appId || ''
+-            let disabledApps: string[]
+-            try {
+-              disabledApps = JSON.parse((cache.get(CacheAttribute.prefRightClickLongPressDisabledApps) as string) || '[]')
+-            } catch {
+-              disabledApps = []
+-            }
+-            if (appId && disabledApps.includes(appId.toLowerCase())) {
+-              console.log(`[MouseHook] Suppressed because app is disabled: ${appId}`)
+-              continue
+-            }
+-            const customUrl = (cache.get(CacheAttribute.prefRightClickLongPressUrl) as string) || ''
+-            if (customUrl.trim()) {
+-              const urlToOpen = customUrl.replace(/%appId%/g, encodeURIComponent(appId))
+-              if (urlToOpen.startsWith('berrytrace://') || urlToOpen.startsWith('berrytrace-dev://')) {
+-                try {
+-                  const urlObj = new URL(urlToOpen)
+-                  const action = urlObj.hostname || urlObj.host
+-                  if (action === 'show-main') {
+-                    import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-                      ElectronMainWindow.getInstance().toggleWindow()
+-                    })
+-                  } else if (action === 'screenshot') {
+-                    import('./screenshot').then(({ ElectronScreenshot }) => {
+-                      ElectronScreenshot.getInstance().triggerScreenshot()
+-                    })
+-                  } else if (action === 'lock') {
+-                    import('./desktop-lock').then(({ ElectronDesktopLock }) => {
++            console.log('[NativeHook:Mouse:EVENT] Right-click long press detected!')
++            ShortcutActivationDispatcher.getInstance().handleGesture('right_click:long_press').then((handled) => {
++              if (handled) {
++                console.log('[NativeHook:Mouse:ACTION] Handled right_click:long_press via ShortcutActivationDispatcher')
++                return
++              }
++
++              const appId = parsed.appId || ''
++              let disabledApps: string[]
++              try {
++                disabledApps = JSON.parse((cache.get(CacheAttribute.prefRightClickLongPressDisabledApps) as string) || '[]')
++              } catch {
++                disabledApps = []
++              }
++              if (appId && disabledApps.includes(appId.toLowerCase())) {
++                console.log(`[NativeHook:Mouse:SUPPRESSED] App disabled: ${appId}`)
++                return
++              }
++              const customUrl = (cache.get(CacheAttribute.prefRightClickLongPressUrl) as string) || 'berrytrace://quick-panel'
++              if (customUrl.trim()) {
++                const urlToOpen = customUrl.replace(/%appId%/g, encodeURIComponent(appId))
++                if (urlToOpen.startsWith('berrytrace://') || urlToOpen.startsWith('berrytrace-dev://')) {
++                  try {
++                    const urlObj = new URL(urlToOpen)
++                    const action = urlObj.hostname || urlObj.host
++                    if (action === 'show-main') {
+                       import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-                        const win = ElectronMainWindow.getInstance().getWindow()
+-                        ElectronDesktopLock.getInstance().triggerLock(win)
++                        ElectronMainWindow.getInstance().toggleWindow()
++                      })
++                    } else if (action === 'screenshot') {
++                      import('./screenshot').then(({ ElectronScreenshot }) => {
++                        ElectronScreenshot.getInstance().triggerScreenshot()
++                      })
++                    } else if (action === 'lock') {
++                      import('./desktop-lock').then(({ ElectronDesktopLock }) => {
++                        import('../windows/main-window').then(({ ElectronMainWindow }) => {
++                          const win = ElectronMainWindow.getInstance().getWindow()
++                          ElectronDesktopLock.getInstance().triggerLock(win)
++                        })
+                       })
+-                    })
+-                  } else if (action === 'quick-panel') {
+-                    ElectronQuickPanelWindow.getInstance().toggleQuickPanelWindow()
+-                  } else if (action === 'buffer') {
+-                    import('../windows/buffer-window').then(({ ElectronBufferWindow }) => {
+-                      ElectronBufferWindow.getInstance().toggleBufferWindow()
+-                    })
+-                  } else {
++                    } else if (action === 'quick-panel') {
++                      ElectronQuickPanelWindow.getInstance().toggleQuickPanelWindow()
++                    } else {
++                      try {
++                        ElectronFloatWeb.getInstance().openFloatWebWindow(urlToOpen, true)
++                      } catch (err) {
++                        console.error('Failed to open float ball window:', err)
++                      }
++                    }
++                  } catch (_e) {
+                     try {
+-                      ElectronFloatBall.getInstance().openFloatWebWindow(urlToOpen, true)
++                      ElectronFloatWeb.getInstance().openFloatWebWindow(urlToOpen, true)
+                     } catch (err) {
+                       console.error('Failed to open float ball window:', err)
+                     }
+                   }
+-                } catch (e) {
+-                  try {
+-                    ElectronFloatBall.getInstance().openFloatWebWindow(urlToOpen, true)
+-                  } catch (err) {
+-                    console.error('Failed to open float ball window:', err)
+-                  }
++                } else {
++                  shell.openExternal(urlToOpen)
+                 }
+               } else {
+-                shell.openExternal(urlToOpen)
++                ElectronQuickPanelWindow.getInstance().showQuickPanelAtCursor(appId)
+               }
+-            } else {
+-              ElectronQuickPanelWindow.getInstance().showQuickPanelAtCursor(appId)
+-            }
++            }).catch((err) => {
++              console.error('🚨 [NativeHook:Mouse:ERROR] Error handling right_click:long_press:', err)
++            })
+           } else if (parsed.event === 'button_press') {
+             // ── Onboarding intercept mode: forward to onboarding guide ──
+             const onboardingIntercept = (cache.get('_onboardingInterceptMode') as boolean) ?? false

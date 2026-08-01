@@ -1,0 +1,253 @@
+import { dialog, BrowserWindow } from 'electron';
+import type { PluginApiController, ApiContext } from './controllers/api-context';
+import { SystemController } from './controllers/system';
+import { StorageController } from './controllers/storage';
+import { AiController, handleProxyAiResponse } from './controllers/ai';
+import { WorkspaceController } from './controllers/workspace';
+import { SearchController } from './controllers/search-controller';
+import { LocalAiController } from './controllers/local-ai';
+import { PublishController } from './controllers/publish';
+import { HooksController } from './controllers/hooks';
+import { PluginManager } from './plugin-manager';
+import * as PluginConfig from './plugin-config-repository';
+import { TerminalController } from './controllers/terminal';
+import { BrowserController } from './controllers/browser';
+import { ComputerUseController } from './controllers/computer-use-controller';
+import { cache } from '../config/index';
+import { CacheAttribute } from '../../src/config/CacheAttribute';
+
+import { WorkflowController } from './controllers/workflow-controller';
+import { SecurityController } from './controllers/security';
+
+export { handleProxyAiResponse };
+
+const SENSITIVE_APIS = new Set([
+  'system:execCommand',
+  'system:registerGlobalShortcut',
+  'filesystem:writeFile',
+  'filesystem:deleteFile',
+  'filesystem:renameFile',
+  'filesystem:mkdir',
+  'filesystem:removeDir',
+  'filesystem:downloadFile',
+]);
+
+interface ApiCallRecord {
+  timestamp: number;
+  apiName: string;
+  methodName: string;
+}
+
+class ApiCallMonitor {
+  private static instance: ApiCallMonitor;
+  private calls = new Map<string, ApiCallRecord[]>();
+  private alertedPlugins = new Set<string>();
+
+  private constructor() {}
+
+  public static getInstance(): ApiCallMonitor {
+    if (!ApiCallMonitor.instance) {
+      ApiCallMonitor.instance = new ApiCallMonitor();
+    }
+    return ApiCallMonitor.instance;
+  }
+
+  public logCall(pluginId: string, apiName: string, methodName: string): void {
+    if (!this.calls.has(pluginId)) {
+      this.calls.set(pluginId, []);
+    }
+    const history = this.calls.get(pluginId)!;
+    history.push({ timestamp: Date.now(), apiName, methodName });
+
+    // Keep only last 30 seconds of history
+    const cutoff = Date.now() - 30000;
+    while (history.length > 0 && history[0].timestamp < cutoff) {
+      history.shift();
+    }
+  }
+
+  public getCallCountInLastMs(pluginId: string, ms: number): number {
+    const history = this.calls.get(pluginId);
+    if (!history) return 0;
+    const cutoff = Date.now() - ms;
+    return history.filter(h => h.timestamp >= cutoff).length;
+  }
+
+  public checkAndAlert(pluginId: string, apiName: string, methodName: string): void {
+    const key = `${apiName}:${methodName}`;
+    if (!SENSITIVE_APIS.has(key)) return;
+
+    // Check user trusted list in cache
+    const userTrusted = PluginConfig.getUserTrustedPlugins();
+    if (userTrusted.includes(pluginId)) {
+      // User has explicitly trusted this plugin, log and allow
+      this.logCall(pluginId, apiName, methodName);
+      return;
+    }
+
+    const isObserving = PluginManager.getInstance().getPlugin(pluginId)?.isObserving ?? false;
+    if (isObserving) {
+      // 10 seconds window threshold (including current call)
+      const count = this.getCallCountInLastMs(pluginId, 10000) + 1;
+      if (count > 30) {
+        const errorMsg = `[安全警报] 观察期插件 "${pluginId}" 触发了过高频次的敏感系统操作 (${key})，已自动实施安全挂起。`;
+        console.error(errorMsg);
+
+        if (!this.alertedPlugins.has(pluginId)) {
+          this.alertedPlugins.add(pluginId);
+          
+          const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+          const response = dialog.showMessageBoxSync(win!, {
+            type: 'warning',
+            title: '智能安全挂起预警',
+            message: `观察期插件 "${pluginId}" 行为异常已挂起`,
+            detail: `检测到该插件正在高频调用敏感 API (${key})。\n\n你可以决定是否信任该插件（信任后将不再对其拦截），或立即禁用该插件。`,
+            buttons: ['继续信任并运行', '禁用该插件', '暂不处理'],
+            cancelId: 2,
+            defaultId: 0,
+          });
+
+          // Reset alert flag after 60 seconds
+          setTimeout(() => {
+            this.alertedPlugins.delete(pluginId);
+          }, 60000);
+
+          if (response === 0) {
+            // Option 0: Continue to trust and run
+            const list = PluginConfig.getUserTrustedPlugins();
+            if (!list.includes(pluginId)) {
+              list.push(pluginId);
+              PluginConfig.trustPlugin(pluginId);
+            }
+            console.log(`[安全警报] 用户已选择信任插件 "${pluginId}"，已解除安全观察期审查限制。`);
+            // Do NOT throw error! Log this call and allow execution.
+            this.logCall(pluginId, apiName, methodName);
+            return;
+          } else if (response === 1) {
+            // Option 1: Disable the plugin
+            PluginManager.getInstance().togglePlugin(pluginId, false).then(() => {
+              console.log(`[安全警报] 用户已选择禁用插件 "${pluginId}"。`);
+            }).catch((err) => {
+              console.error(`[安全警报] 禁用插件 "${pluginId}" 失败:`, err);
+            });
+          }
+        }
+
+        throw new Error(errorMsg);
+      }
+    }
+
+    // Only log the call if it passed the check and was not blocked
+    this.logCall(pluginId, apiName, methodName);
+  }
+}
+
+export class ApiDispatcher {
+  private static instance: ApiDispatcher;
+  private controllers = new Map<string, PluginApiController>();
+
+  private constructor() {
+    const systemCtrl = new SystemController();
+    const storageCtrl = new StorageController();
+    const aiCtrl = new AiController();
+    const workspaceCtrl = new WorkspaceController();
+
+    // Map namespaces to controllers
+    this.controllers.set('system', systemCtrl);
+    this.controllers.set('dialog', systemCtrl);
+    this.controllers.set('log', systemCtrl);
+    this.controllers.set('window', systemCtrl);
+    this.controllers.set('user', systemCtrl);
+    this.controllers.set('commands', systemCtrl);
+
+    this.controllers.set('storage', storageCtrl);
+    this.controllers.set('filesystem', storageCtrl);
+
+    this.controllers.set('ai', aiCtrl);
+    this.controllers.set('mcp', aiCtrl);
+
+    this.controllers.set('workspace', workspaceCtrl);
+    this.controllers.set('scheduler', workspaceCtrl);
+    this.controllers.set('articles', workspaceCtrl);
+    this.controllers.set('context', workspaceCtrl);
+    this.controllers.set('plugin', workspaceCtrl);
+    this.controllers.set('selectionMenu', workspaceCtrl);
+
+    const workflowCtrl = new WorkflowController();
+    this.controllers.set('workflow', workflowCtrl);
+    this.controllers.set('context', workflowCtrl);
+
+    const searchCtrl = new SearchController();
+    this.controllers.set('search', searchCtrl);
+
+    const localAiCtrl = new LocalAiController();
+    this.controllers.set('local-ai', localAiCtrl);
+
+    const publishCtrl = new PublishController();
+    this.controllers.set('publish', publishCtrl);
+
+    const hooksCtrl = new HooksController();
+    this.controllers.set('hooks', hooksCtrl);
+
+    const terminalCtrl = new TerminalController();
+    this.controllers.set('terminal', terminalCtrl);
+
+    const browserCtrl = new BrowserController();
+    this.controllers.set('browser', browserCtrl);
+
+    const computerUseCtrl = new ComputerUseController();
+    this.controllers.set('computerUse', computerUseCtrl);
+
+    const securityCtrl = new SecurityController();
+    this.controllers.set('security', securityCtrl);
+  }
+
+  public static getInstance(): ApiDispatcher {
+    if (!ApiDispatcher.instance) {
+      ApiDispatcher.instance = new ApiDispatcher();
+    }
+    return ApiDispatcher.instance;
+  }
+
+  public getController(apiName: string): PluginApiController | undefined {
+    return this.controllers.get(apiName);
+  }
+
+  public async dispatch(
+    pluginId: string,
+    apiName: string,
+    methodName: string,
+    args: unknown[],
+    callbacks?: { onChunk?: (chunk: string) => void },
+    sender?: Electron.WebContents
+  ): Promise<unknown> {
+    // Audit check and rate-limiting
+    ApiCallMonitor.getInstance().checkAndAlert(pluginId, apiName, methodName);
+
+    // Record plugin activity for idle unloading
+    try {
+      PluginManager.getInstance().recordPluginActivity(pluginId);
+    } catch {
+      // no-op
+    }
+
+    const controller = this.controllers.get(apiName);
+    if (!controller) {
+      throw new Error(`Plugin API namespace not found: ${apiName}`);
+    }
+    const context: ApiContext = { pluginId, sender, callbacks, apiName };
+    return controller.execute(methodName, args, context);
+  }
+}
+
+// Backwards compatibility function replacing the export from api-implementation.ts
+export async function dispatchPluginApiCall(
+  pluginId: string,
+  apiName: string,
+  methodName: string,
+  args: unknown[],
+  callbacks?: { onChunk?: (chunk: string) => void },
+  sender?: Electron.WebContents
+): Promise<unknown> {
+  return ApiDispatcher.getInstance().dispatch(pluginId, apiName, methodName, args, callbacks, sender);
+}

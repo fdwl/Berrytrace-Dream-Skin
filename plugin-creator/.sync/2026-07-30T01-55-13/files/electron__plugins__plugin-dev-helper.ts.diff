@@ -1,0 +1,295 @@
+diff --git a/electron/plugins/plugin-dev-helper.ts b/electron/plugins/plugin-dev-helper.ts
+new file mode 100644
+index 0000000..8ea5bae
+--- /dev/null
++++ b/electron/plugins/plugin-dev-helper.ts
+@@ -0,0 +1,289 @@
++/**
++ * @architecture-boundary PluginDevHelper
++ * ─────────────────────────────────────────────────────────────────────────────
++ * 职责与业务流程：
++ * 负责开发态（Unpacked）插件的目录扫描、路径持久化、SDK 依赖软链接保障：
++ *  1. ensureSdkInPluginsHome: 自动将 `berrytrace-plugin-sdk` 软链接至 ~/.berrytrace/node_modules/
++ *  2. loadUnpackedPlugin: 加载未打包本地插件目录并校验 plugin.json。
++ *  3. loadPersistedDevPlugins: 生产/开发态目录对齐与持久化清理。
++ * ─────────────────────────────────────────────────────────────────────────────
++ */
++
++import { app } from 'electron';
++import { join, dirname } from 'path';
++import * as fsSync from 'fs';
++import { createRequire } from 'module';
++import { BERRYTRACE_HOME } from '../config/paths';
++import { McpHost } from './mcp-host';
++import { PluginScanner, type ScannedPlugin } from './plugin-scanner';
++import { FullTextIndexManager } from '../services/fulltext-index-manager';
++
++/**
++ * 在打包环境中定位 SDK 源目录。
++ *
++ * 查找顺序：
++ * 1. 优先：asar.unpacked/node_modules/berrytrace-plugin-sdk (子进程可直接物理访问)
++ * 2. Fallback: asar/node_modules/berrytrace-plugin-sdk (主进程通过 Electron asar 虚拟 fs 可读取，
++ *    拷贝到真实路径后子进程可访问)
++ *
++ * 这个 Fallback 解决了当 SDK 只被打入 asar 而不在 asar.unpacked 时的发列问题。
++ */
++function resolveSdkSrcDirForPackaged(): { path: string; source: 'unpacked' | 'asar' } | null {
++  const unpackedPath = join(dirname(app.getAppPath()), 'app.asar.unpacked', 'node_modules', 'berrytrace-plugin-sdk');
++  if (fsSync.existsSync(join(unpackedPath, 'package.json'))) {
++    return { path: unpackedPath, source: 'unpacked' };
++  }
++  // Fallback: 主进程可通过 Electron 虚拟 fs 读取 asar 内部文件
++  const asarPath = join(app.getAppPath(), 'node_modules', 'berrytrace-plugin-sdk');
++  if (fsSync.existsSync(join(asarPath, 'package.json'))) {
++    return { path: asarPath, source: 'asar' };
++  }
++  return null;
++}
++
++export function ensureSdkInPluginsHome(): void {
++  try {
++    let sdkSrcDir: string | null = null;
++
++    if (app.isPackaged) {
++      const result = resolveSdkSrcDirForPackaged();
++      if (result) {
++        sdkSrcDir = result.path;
++        console.log(`[PluginManager] SDK source resolved from ${result.source}: ${sdkSrcDir}`);
++      }
++    } else {
++      // 开发环境：通过 createRequire 解析 SDK 入口文件位置
++      try {
++        const r = createRequire(import.meta.url);
++        const sdkEntry = r.resolve('berrytrace-plugin-sdk');
++        sdkSrcDir = join(dirname(sdkEntry), '..');
++      } catch {
++        // SDK 未安装则跳过
++        return;
++      }
++    }
++
++    if (!sdkSrcDir) {
++      console.warn('[PluginManager] SDK source not found, skipping ensureSdkInPluginsHome');
++      return;
++    }
++
++    const targetDir = join(BERRYTRACE_HOME, 'node_modules', 'berrytrace-plugin-sdk');
++    fsSync.mkdirSync(dirname(targetDir), { recursive: true });
++
++    if (app.isPackaged) {
++      // 打包环境：独立 Node 子进程无法通过软链接读取 app.asar 内部文件，必须物理拷贝
++      // 如果目标已存在且 package.json 匹配，跳过拷贝（避免已安装时重复拷贝）
++      const targetPkg = join(targetDir, 'package.json');
++      if (fsSync.existsSync(targetPkg)) {
++        const srcPkg = fsSync.readFileSync(join(sdkSrcDir, 'package.json'), 'utf8');
++        const dstPkg = fsSync.readFileSync(targetPkg, 'utf8');
++        if (srcPkg === dstPkg) {
++          return; // 已是最新版本
++        }
++      }
++      fsSync.rmSync(targetDir, { recursive: true, force: true });
++      fsSync.cpSync(sdkSrcDir, targetDir, { recursive: true });
++      console.log(`[PluginManager] SDK physically copied to plugins home (asar.unpacked mode): ${targetDir}`);
++    } else {
++      // 开发环境：优先使用软链接
++      try {
++        const stat = fsSync.lstatSync(targetDir);
++        if (stat.isSymbolicLink()) {
++          const linkTarget = fsSync.readlinkSync(targetDir);
++          if (linkTarget === sdkSrcDir && fsSync.existsSync(join(targetDir, 'package.json'))) {
++            return;
++          }
++        }
++        fsSync.rmSync(targetDir, { recursive: true, force: true });
++      } catch (e) {
++        const errCode = (e as Record<string, unknown> | null | undefined)?.code;
++        if (errCode !== 'ENOENT') {
++          try { fsSync.rmSync(targetDir, { recursive: true, force: true }); } catch {
++            // ignore
++          }
++        }
++      }
++
++      try {
++        fsSync.symlinkSync(sdkSrcDir, targetDir, 'junction');
++        console.log(`[PluginManager] SDK symlinked: ${targetDir} → ${sdkSrcDir}`);
++      } catch (_linkErr) {
++        // 软链接创建失败（权限不足等），退化为物理拷贝
++        fsSync.cpSync(sdkSrcDir, targetDir, { recursive: true });
++        console.log(`[PluginManager] SDK fallback physically copied to plugins home: ${targetDir}`);
++      }
++    }
++  } catch (err) {
++    console.warn('[PluginManager] Failed to ensure SDK in plugins home:', err);
++  }
++}
++
++/**
++ * 确保 berrytrace-plugin-sdk 物理存在于插件自身的 node_modules/ 目录中。
++ *
++ * ESM `import 'berrytrace-plugin-sdk'` 按目录上溯查找 node_modules，完全忽略 NODE_PATH。
++ * 此函数在插件启动前将 SDK 物理拷贝到插件目录下，使 ESM 解析一定能找到它。
++ *
++ * @param pluginPath 插件根目录，例如 ~/.berrytrace/plugins/com.berrytrace.plugin.cline_agent
++ */
++export function ensureSdkCopiedToPlugin(pluginPath: string): void {
++  try {
++    let sdkSrcDir: string | null = null;
++
++    if (app.isPackaged) {
++      const result = resolveSdkSrcDirForPackaged();
++      if (result) {
++        sdkSrcDir = result.path;
++        if (result.source === 'asar') {
++          console.log(`[PluginManager] SDK source from asar (main process readable, will copy to real fs): ${sdkSrcDir}`);
++        }
++      }
++    } else {
++      // 开发环境：通过 createRequire 解析 SDK 位置（与 ensureSdkInPluginsHome 逻辑一致）
++      try {
++        const r = createRequire(import.meta.url);
++        const sdkEntry = r.resolve('berrytrace-plugin-sdk');
++        sdkSrcDir = join(dirname(sdkEntry), '..');
++      } catch {
++        // SDK 未安装则跳过
++        return;
++      }
++    }
++
++    if (!sdkSrcDir) {
++      console.error(`[PluginManager] 🚨 Cannot copy SDK to plugin "${pluginPath}": SDK not found in asar.unpacked or asar. Plugin WILL fail with ERR_MODULE_NOT_FOUND.`);
++      return;
++    }
++
++    const targetDir = join(pluginPath, 'node_modules', 'berrytrace-plugin-sdk');
++    fsSync.mkdirSync(dirname(targetDir), { recursive: true });
++
++    // 检查是否已是最新版本（对比 package.json）
++    const targetPkg = join(targetDir, 'package.json');
++    if (fsSync.existsSync(targetPkg)) {
++      try {
++        const srcVersion = JSON.parse(fsSync.readFileSync(join(sdkSrcDir, 'package.json'), 'utf8')).version;
++        const dstVersion = JSON.parse(fsSync.readFileSync(targetPkg, 'utf8')).version;
++        if (srcVersion === dstVersion) {
++          return; // 已是最新版本，跳过
++        }
++      } catch {
++        // 解析失败，继续拷贝
++      }
++    }
++
++    fsSync.rmSync(targetDir, { recursive: true, force: true });
++    fsSync.cpSync(sdkSrcDir, targetDir, { recursive: true });
++    console.log(`[PluginManager] SDK copied to plugin node_modules: ${targetDir}`);
++  } catch (err) {
++    console.warn(`[PluginManager] Failed to copy SDK to plugin ${pluginPath}:`, err);
++  }
++}
++
++export function getDevPluginsFile(): string {
++  const sharedFile = join(BERRYTRACE_HOME, 'dev-plugins.json');
++  const legacyFile = join(app.getPath('userData'), 'dev-plugins.json');
++  if (!fsSync.existsSync(sharedFile) && fsSync.existsSync(legacyFile)) {
++    try {
++      fsSync.copyFileSync(legacyFile, sharedFile);
++      console.log('[PluginManager] Successfully migrated dev-plugins.json to shared BERRYTRACE_HOME');
++    } catch (e) {
++      console.warn('[PluginManager] Failed to migrate dev-plugins.json to shared home:', e);
++    }
++  }
++  return sharedFile;
++}
++
++export async function loadPersistedDevPlugins(
++  pluginsMap?: Map<string, ScannedPlugin>,
++  registerStaticContributionsFn?: (plugin: ScannedPlugin) => void
++): Promise<void> {
++  const file = getDevPluginsFile();
++  if (!fsSync.existsSync(file)) return;
++
++  try {
++    const raw = fsSync.readFileSync(file, 'utf8');
++    const data = JSON.parse(raw) as { paths?: string[] };
++    if (!Array.isArray(data?.paths)) return;
++
++    for (const dir of data.paths) {
++      if (fsSync.existsSync(dir)) {
++        try {
++          const scanned = await PluginScanner.scanPluginFolder(dir, true);
++          if (scanned && pluginsMap) {
++            scanned.isDevFolder = true;
++            pluginsMap.set(scanned.manifest.id, scanned);
++            if (registerStaticContributionsFn) {
++              registerStaticContributionsFn(scanned);
++            }
++            console.log(`[PluginDevHelper] Loaded persisted dev plugin: ${scanned.manifest.id} (${dir})`);
++          }
++        } catch (err) {
++          console.warn(`[PluginDevHelper] Failed to load persisted dev plugin at ${dir}:`, err);
++        }
++      }
++    }
++  } catch (err) {
++    console.warn('[PluginDevHelper] Failed to read dev-plugins.json:', err);
++  }
++}
++
++export async function persistDevPluginPath(pluginId: string, dir: string): Promise<void> {
++  const file = getDevPluginsFile();
++  let paths: string[] = [];
++  if (fsSync.existsSync(file)) {
++    try {
++      const data = JSON.parse(fsSync.readFileSync(file, 'utf8')) as { paths: string[] };
++      if (Array.isArray(data?.paths)) paths = data.paths;
++    } catch {
++      // ignore
++    }
++  }
++  if (!paths.includes(dir)) {
++    paths.push(dir);
++    try {
++      fsSync.writeFileSync(file, JSON.stringify({ paths }), 'utf8');
++    } catch (err) {
++      console.error(`[PluginManager] Failed to write dev-plugins.json:`, err);
++    }
++  }
++}
++
++export async function loadUnpackedPlugin(
++  pluginPath: string,
++  pluginsMap: Map<string, ScannedPlugin>,
++  isPluginEnabledFn: (id: string) => boolean,
++  registerStaticContributionsFn: (plugin: ScannedPlugin) => void,
++  startBackgroundPluginFn: (id: string) => Promise<void>,
++  startMainPluginFn: (id: string) => Promise<void>,
++  notifyPluginsChangedFn: () => void
++): Promise<ScannedPlugin> {
++  console.log(`[PluginManager] Loading unpacked development plugin from: ${pluginPath}`);
++  const scanned = await PluginScanner.scanPluginFolder(pluginPath, true);
++  if (!scanned) {
++    throw new Error(`目录中未找到有效的 plugin.json: ${pluginPath}`);
++  }
++
++  scanned.isDevFolder = true;
++  pluginsMap.set(scanned.manifest.id, scanned);
++
++  await persistDevPluginPath(scanned.manifest.id, pluginPath);
++
++  if (isPluginEnabledFn(scanned.manifest.id)) {
++    McpHost.getInstance().unregisterPluginMcp(scanned.manifest.id);
++    registerStaticContributionsFn(scanned);
++    if (scanned.manifest.type === 'background' || scanned.manifest.type === 'hybrid') {
++      await startBackgroundPluginFn(scanned.manifest.id);
++    } else if (scanned.manifest.type === 'main') {
++      await startMainPluginFn(scanned.manifest.id);
++    }
++  }
++
++  try {
++    FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
++  } catch (_e) { /* empty */ }
++
++  notifyPluginsChangedFn();
++  return scanned;
++}

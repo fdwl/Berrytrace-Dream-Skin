@@ -1,0 +1,13 @@
+diff --git a/electron/plugins/hook-registry.ts b/electron/plugins/hook-registry.ts
+index 1af80dc..7a7df75 100644
+--- a/electron/plugins/hook-registry.ts
++++ b/electron/plugins/hook-registry.ts
+@@ -9,7 +9,7 @@
+  */
+ 
+ import { BrowserWindow, ipcMain } from 'electron';
+-import { IPluginProcess } from './plugin-process-adapter';
++import type { IPluginProcess } from './plugin-process-adapter';
+ 
+ interface HookEntry {
+   pluginId: string;

@@ -1,0 +1,274 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js b/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js
+index ff9afc2..76c45f1 100755
+--- a/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js
++++ b/plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js
+@@ -3429,7 +3429,7 @@ async function performSdkBuild(pluginPath) {
+         name: "berrytrace-global-react-plugin",
+         setup(buildContext) {
+           buildContext.onResolve({ filter: /.*/ }, (args) => {
+-            const matches = ["react", "react-dom", "react-dom/client", "zustand"];
++            const matches = ["react", "react-dom", "react-dom/client", "zustand", "lucide-react", "xterm", "xterm-addon-fit", "react-tooltip"];
+             if (matches.includes(args.path) || args.path.startsWith("react/") || args.path.startsWith("react-dom/")) {
+               return { path: args.path, namespace: "global-react-ns" };
+             }
+@@ -3520,6 +3520,190 @@ async function performSdkBuild(pluginPath) {
+                 loader: "js"
+               };
+             }
++            if (args.path === "lucide-react") {
++              return {
++                contents: `
++                  const _L = (typeof window !== 'undefined' ? window : globalThis).__lucide || {};
++                  export default _L;
++                  // Proxy getter\uFF1A\u4EFB\u610F named import \u5747\u4ECE window.__lucide \u53D6\uFF0C\u5B9E\u73B0\u6309\u9700\u8BBF\u95EE
++                  export const Loader2         = _L.Loader2;
++                  export const CheckCircle2    = _L.CheckCircle2;
++                  export const AlertCircle     = _L.AlertCircle;
++                  export const Circle          = _L.Circle;
++                  export const Wrench          = _L.Wrench;
++                  export const X               = _L.X;
++                  export const Terminal        = _L.Terminal;
++                  export const Database        = _L.Database;
++                  export const FileCode        = _L.FileCode;
++                  export const Sparkles        = _L.Sparkles;
++                  export const RefreshCw       = _L.RefreshCw;
++                  export const Upload          = _L.Upload;
++                  export const Server          = _L.Server;
++                  export const HardDrive       = _L.HardDrive;
++                  export const Globe           = _L.Globe;
++                  export const Plus            = _L.Plus;
++                  export const Trash2          = _L.Trash2;
++                  export const Lock            = _L.Lock;
++                  export const Settings2       = _L.Settings2;
++                  export const Zap             = _L.Zap;
++                  export const Eye             = _L.Eye;
++                  export const MoreVertical    = _L.MoreVertical;
++                  export const ArrowLeft       = _L.ArrowLeft;
++                  export const ArrowRight      = _L.ArrowRight;
++                  export const ArrowUp         = _L.ArrowUp;
++                  export const ArrowDown       = _L.ArrowDown;
++                  export const Link2           = _L.Link2;
++                  export const AlertTriangle   = _L.AlertTriangle;
++                  export const Save            = _L.Save;
++                  export const ChevronDown     = _L.ChevronDown;
++                  export const ChevronUp       = _L.ChevronUp;
++                  export const ChevronLeft     = _L.ChevronLeft;
++                  export const ChevronRight    = _L.ChevronRight;
++                  export const Info            = _L.Info;
++                  export const Search          = _L.Search;
++                  export const Copy            = _L.Copy;
++                  export const ExternalLink    = _L.ExternalLink;
++                  export const Check           = _L.Check;
++                  export const Edit            = _L.Edit;
++                  export const Edit2           = _L.Edit2;
++                  export const Edit3           = _L.Edit3;
++                  export const Pencil          = _L.Pencil;
++                  export const Folder          = _L.Folder;
++                  export const FolderOpen      = _L.FolderOpen;
++                  export const File            = _L.File;
++                  export const FileText        = _L.FileText;
++                  export const Network         = _L.Network;
++                  export const Shield          = _L.Shield;
++                  export const Key             = _L.Key;
++                  export const Clock           = _L.Clock;
++                  export const Activity        = _L.Activity;
++                  export const Table           = _L.Table;
++                  export const Code            = _L.Code;
++                  export const Filter          = _L.Filter;
++                  export const List            = _L.List;
++                  export const Grid            = _L.Grid;
++                  export const Settings        = _L.Settings;
++                  export const User            = _L.User;
++                  export const Users           = _L.Users;
++                  export const Home            = _L.Home;
++                  export const Bell            = _L.Bell;
++                  export const LogOut          = _L.LogOut;
++                  export const LogIn           = _L.LogIn;
++                  export const Power           = _L.Power;
++                  export const Download        = _L.Download;
++                  export const Share           = _L.Share;
++                  export const Share2          = _L.Share2;
++                  export const Star            = _L.Star;
++                  export const Heart           = _L.Heart;
++                  export const Tag             = _L.Tag;
++                  export const Tags            = _L.Tags;
++                  export const Bookmark        = _L.Bookmark;
++                  export const Link            = _L.Link;
++                  export const Image           = _L.Image;
++                  export const Video           = _L.Video;
++                  export const Music           = _L.Music;
++                  export const Package         = _L.Package;
++                  export const Layers          = _L.Layers;
++                  export const GitBranch       = _L.GitBranch;
++                  export const BarChart        = _L.BarChart;
++                  export const BarChart2       = _L.BarChart2;
++                  export const LineChart       = _L.LineChart;
++                  export const PieChart        = _L.PieChart;
++                  export const TrendingUp      = _L.TrendingUp;
++                  export const TrendingDown    = _L.TrendingDown;
++                  export const Map             = _L.Map;
++                  export const Menu            = _L.Menu;
++                  export const MoreHorizontal  = _L.MoreHorizontal;
++                  export const Clipboard       = _L.Clipboard;
++                  export const ClipboardCheck  = _L.ClipboardCheck;
++                  export const ThumbsUp        = _L.ThumbsUp;
++                  export const ThumbsDown      = _L.ThumbsDown;
++                  export const Flag            = _L.Flag;
++                  export const Paperclip       = _L.Paperclip;
++                  export const MinusCircle     = _L.MinusCircle;
++                  export const PlusCircle      = _L.PlusCircle;
++                  export const RefreshCcw      = _L.RefreshCcw;
++                  export const RotateCcw       = _L.RotateCcw;
++                  export const RotateCw        = _L.RotateCw;
++                  export const Cpu             = _L.Cpu;
++                  export const Wifi            = _L.Wifi;
++                  export const WifiOff         = _L.WifiOff;
++                  export const Bot             = _L.Bot;
++                  export const Wand            = _L.Wand;
++                  export const Wand2           = _L.Wand2;
++                  export const Microscope      = _L.Microscope;
++                  export const FlaskConical    = _L.FlaskConical;
++                  export const Play            = _L.Play;
++                  export const Pause           = _L.Pause;
++                  export const Stop            = _L.Stop;
++                  export const Volume2         = _L.Volume2;
++                  export const VolumeX         = _L.VolumeX;
++                  export const Maximize        = _L.Maximize;
++                  export const Minimize        = _L.Minimize;
++                  export const ChevronUpDown   = _L.ChevronUpDown;
++                  export const ChevronsUpDown  = _L.ChevronsUpDown;
++                  export const SortAsc         = _L.SortAsc;
++                  export const SortDesc        = _L.SortDesc;
++                  export const LayoutGrid      = _L.LayoutGrid;
++                  export const LayoutList      = _L.LayoutList;
++                  export const Sidebar         = _L.Sidebar;
++                  export const PanelLeft       = _L.PanelLeft;
++                  export const PanelRight      = _L.PanelRight;
++                  export const MessageSquare   = _L.MessageSquare;
++                  export const MessageCircle   = _L.MessageCircle;
++                  export const Send            = _L.Send;
++                  export const AtSign          = _L.AtSign;
++                  export const Hash            = _L.Hash;
++                  export const AlertOctagon    = _L.AlertOctagon;
++                  export const XCircle         = _L.XCircle;
++                  export const CheckCircle     = _L.CheckCircle;
++                  export const HelpCircle      = _L.HelpCircle;
++                  export const Lightbulb       = _L.Lightbulb;
++                  export const Zap2            = _L.Zap2;
++                  export const Gauge           = _L.Gauge;
++                  export const Sliders         = _L.Sliders;
++                  export const SlidersHorizontal = _L.SlidersHorizontal;
++                  export const Mic             = _L.Mic;
++                  export const PackageCheck    = _L.PackageCheck;
++                  export const Square          = _L.Square;
++                  export const Monitor         = _L.Monitor;
++                  export const Cloud           = _L.Cloud;
++                  export const Cat             = _L.Cat;
++                  export const Swords          = _L.Swords;
++                  export const Ghost           = _L.Ghost;
++                  export const Moon            = _L.Moon;
++                `,
++                loader: "js"
++              };
++            }
++            if (args.path === "xterm") {
++              return {
++                contents: `
++                  const XTerm = (typeof window !== 'undefined' ? window : globalThis).XTerm || {};
++                  export const Terminal = XTerm.Terminal;
++                `,
++                loader: "js"
++              };
++            }
++            if (args.path === "xterm-addon-fit") {
++              return {
++                contents: `
++                  const XTerm = (typeof window !== 'undefined' ? window : globalThis).XTerm || {};
++                  export const FitAddon = XTerm.FitAddon;
++                `,
++                loader: "js"
++              };
++            }
++            if (args.path === "react-tooltip") {
++              return {
++                contents: `
++                  const ReactTooltip = (typeof window !== 'undefined' ? window : globalThis).ReactTooltip;
++                  export default ReactTooltip;
++                  export const Tooltip = ReactTooltip;
++                `,
++                loader: "js"
++              };
++            }
+             return null;
+           });
+         }
+@@ -3618,7 +3802,7 @@ async function performSdkBuild(pluginPath) {
+         platform: "browser",
+         target: ["es2022"],
+         format: "esm",
+-        minify: false,
++        minify: true,
+         jsxFactory: "React.createElement",
+         jsxFragment: "React.Fragment",
+         plugins: [globalHostImportsPlugin, aliasPlugin, cssPlugin, globalSdkPlugin, globalReactPlugin],
+@@ -3759,6 +3943,15 @@ function packPlugin(pluginPath = process.cwd()) {
+       const parts = normalizedPath.split("/");
+       const firstPart = parts[0];
+       const part0Lower = firstPart.toLowerCase();
++      const fileNameLower = parts[parts.length - 1].toLowerCase();
++      if (part0Lower === ".git" || part0Lower === "private_key.pem" || part0Lower === "public_key.pem" || part0Lower === ".ds_store" || fileNameLower === ".ds_store" || normalizedPath.endsWith(".btp") || part0Lower === ".gitignore" || part0Lower === "package-lock.json" || part0Lower === "pnpm-lock.yaml" || part0Lower === "yarn.lock" || part0Lower === "src" || part0Lower === "scripts" || part0Lower === ".github" || part0Lower === ".idea" || part0Lower === ".vscode" || part0Lower === ".cursor" || fileNameLower.endsWith(".map") || parts.includes("test") || parts.includes("tests") || parts.includes("__tests__") || parts.includes("docs") || fileNameLower.endsWith(".cpp") || fileNameLower.endsWith(".hpp") || fileNameLower.endsWith(".c") || fileNameLower.endsWith(".h") || fileNameLower.endsWith(".o") || fileNameLower.endsWith(".obj")) {
++        return false;
++      }
++      if (fileNameLower.endsWith(".ts") || fileNameLower.endsWith(".tsx")) {
++        if (!fileNameLower.endsWith(".d.ts")) {
++          return false;
++        }
++      }
+       if (part0Lower === "node_modules") {
+         if (pluginPath.includes(".berrytrace") && pluginPath.includes("pack-")) {
+           return true;
+@@ -3787,23 +3980,14 @@ function packPlugin(pluginPath = process.cwd()) {
+         }
+         return false;
+       }
+-      if (part0Lower === ".git" || part0Lower === "private_key.pem" || part0Lower === "public_key.pem" || part0Lower === ".ds_store" || normalizedPath.endsWith(".btp") || part0Lower === ".gitignore" || part0Lower === "package-lock.json" || part0Lower === "pnpm-lock.yaml" || part0Lower === "yarn.lock" || part0Lower === "src" || part0Lower === "scripts" || part0Lower === ".github" || part0Lower === ".idea" || part0Lower === ".vscode" || part0Lower === ".cursor") {
+-        return false;
+-      }
+       if (hasDist) {
+         const isMetaFile = parts.length === 1 && (firstPart === "plugin.json" || firstPart === "package.json" || firstPart.endsWith(".json") || firstPart.endsWith(".md") || firstPart.toLowerCase() === "license" || firstPart.toLowerCase() === "licence");
+-        const isInAllowedDir = part0Lower === "dist" || part0Lower === "skills" || part0Lower === ".skills" || part0Lower === "node_modules";
++        const isInAllowedDir = part0Lower === "dist" || part0Lower === "skills" || part0Lower === ".skills";
+         return isInAllowedDir || isMetaFile;
+       } else {
+-        const fileNameLower = parts[parts.length - 1].toLowerCase();
+         if (fileNameLower === "tsconfig.json" || fileNameLower.startsWith("tsconfig.") || fileNameLower.startsWith("vite.config.") || fileNameLower.startsWith("webpack.config.") || fileNameLower.startsWith("tailwind.config.") || fileNameLower.startsWith("postcss.config.") || fileNameLower.startsWith("eslint.config.") || fileNameLower.startsWith(".eslintrc") || fileNameLower.startsWith(".prettierrc")) {
+           return false;
+         }
+-        if (fileNameLower.endsWith(".ts") || fileNameLower.endsWith(".tsx") || fileNameLower.endsWith(".vue") || fileNameLower.endsWith(".scss") || fileNameLower.endsWith(".sass") || fileNameLower.endsWith(".less")) {
+-          if (!fileNameLower.endsWith(".d.ts")) {
+-            return false;
+-          }
+-        }
+         return true;
+       }
+     });
+@@ -3837,7 +4021,18 @@ function packPlugin(pluginPath = process.cwd()) {
+   zip.addFile("signature.json", Buffer.from(JSON.stringify(signatureData, null, 2), "utf8"));
+   const outputFilename = `${id}-${version}.btp`;
+   const outputPath = path2.join(pluginPath, outputFilename);
+-  zip.writeZip(outputPath);
++  if (fs2.existsSync(outputPath)) {
++    try {
++      fs2.unlinkSync(outputPath);
++    } catch (e) {
++    }
++  }
++  try {
++    zip.writeZip(outputPath);
++  } catch (err) {
++    console.error(`\u{1F6A8} [Packager:ERROR] \u5199\u5165\u63D2\u4EF6\u5305 ${outputPath} \u5931\u8D25: ${err.message}`);
++    throw err;
++  }
+   console.log(`
+ \u2713 \u63D2\u4EF6\u6253\u5305\u548C\u7B7E\u540D\u6210\u529F\uFF01`);
+   console.log(`\u5B89\u88C5\u5305\u5DF2\u4FDD\u5B58\u81F3: ${outputPath}`);

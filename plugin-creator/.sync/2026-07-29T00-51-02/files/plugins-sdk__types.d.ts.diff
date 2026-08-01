@@ -1,0 +1,224 @@
+diff --git a/plugins-sdk/types.d.ts b/plugins-sdk/types.d.ts
+index 0550172..1b25d3d 100644
+--- a/plugins-sdk/types.d.ts
++++ b/plugins-sdk/types.d.ts
+@@ -1,4 +1,13 @@
+ import type { BerrytraceEventMap, BerrytraceEventName, BerrytraceCommandMap, BerrytraceCommandName } from './event-catalog.js';
++export interface SSHHostProfile {
++    host: string;
++    hostname?: string;
++    user?: string;
++    port?: number;
++    identityFile?: string;
++    proxyCommand?: string;
++    name?: string;
++}
+ /**
+  * 莓莓印记 (BerryTrace) 插件 SDK 类型定义文件
+  *
+@@ -241,6 +250,33 @@ export interface AIApi extends Omit<GeneratedAIApi, 'chat' | 'chatStream' | 'run
+      * await sdk.ai.unregisterAgentProvider('plugin_xxx');
+      */
+     unregisterAgentProvider(serverId: string): Promise<void>;
++    /**
++     * 获取所有已注册的 AI 服务商列表（包含支持的模型）
++     */
++    getAiServers(): Promise<Array<{
++        id: string;
++        name: string;
++        provider: string;
++        model: string;
++        supportedModels?: string[];
++        baseUrl?: string;
++        apiKey?: string;
++    }>>;
++    getCapabilityModels(): Promise<Record<string, { serverId: string; model: string }>>;
++    setCapabilityModel(capability: string, serverId: string, model: string): Promise<void>;
++    /**
++     * 获取指定服务商对应的全量已解析 LLM 配置
++     */
++    getServerLlmConfig(serverId: string): Promise<{
++        provider: string;
++        model: string;
++        apiKey?: string;
++        baseUrl?: string;
++    } | null>;
++    /**
++     * 获取 Voice Settings 配置对象
++     */
++    getVoiceSettings(): Promise<any>;
+ }
+ export interface ActiveAppInfo {
+     name: string;
+@@ -533,7 +569,7 @@ export interface FileSystemAPI extends Omit<GeneratedFileSystemAPI, 'readFile' |
+      * // 在应用数据目录下写入文件
+      * await sdk.filesystem.writeFile(dataDir + '/my-data.json', JSON.stringify(data));
+      */
+-    getSafePath(name: 'userData' | 'documents' | 'desktop' | 'temp' | 'skills'): Promise<string>;
++    getSafePath(name: 'userData' | 'documents' | 'desktop' | 'temp' | 'skills' | 'pluginData'): Promise<string>;
+     /**
+      * 在文件管理器中显示文件（跨平台）
+      * @param filePath 文件路径
+@@ -1147,7 +1183,7 @@ export interface OpenTabOptions {
+  * 声明一个 View 被渲染到系统的哪个位置，以及该位置所需的元信息。
+  * 与 RegisterViewConfig.placement 配合使用。
+  */
+-export type ViewPlacement = 
++export type ViewPlacement =
+ /** 工作区 Tab（主编辑视图，通过 fileAssociations 路由或直接打开） */
+ {
+     type: 'workspace';
+@@ -1200,7 +1236,24 @@ export interface RegisterViewConfig {
+     /** 声明此 View 渲染在哪里以及对应的元信息 */
+     placement: ViewPlacement;
+ }
++export interface TabCreateMenuItem {
++    id: string;
++    pluginId?: string;
++    label: string;
++    description?: string;
++    category: 'system' | 'ssh' | 'agent' | string;
++    iconName?: string;
++    keywords?: string[];
++    enabled?: boolean;
++    order?: number;
++    onSelect: (context: {
++        tabsetId?: string;
++        worktreeId?: string;
++    }) => void | Promise<void>;
++}
+ export interface WorkspaceAPI extends Omit<GeneratedWorkspaceAPI, 'getPath' | 'getMetadata' | 'openWorkspaceTab'> {
++    registerTabMenuItem(item: TabCreateMenuItem): () => void;
++    unregisterTabMenuItem(id: string): void;
+     /**
+      * @deprecated 请使用顶层方法 `sdk.registerView()` 代替。
+      * 向后兼容别名，内部委托到 `sdk.registerView`。
+@@ -1873,6 +1926,21 @@ export interface GeneratedAIApi {
+        * @returns { isRunning, pluginId, activeSessions }
+        */
+     getAgentKernelStatus(): Promise<unknown>;
++    /**
++       * 获取所有已注册的 AI 服务商及其模型列表。
++       */
++    getAiServers(): Promise<unknown>;
++    /**
++       * 获取按能力分配的服务商与模型映射（供 cline-agent 等插件读取当前 capability→{serverId, model} 配置）
++       */
++    getCapabilityModels(): Promise<unknown>;
++    getServerLlmConfig(options: string | {
++        serverId: string;
++    }): Promise<unknown>;
++    /**
++       * 获取渲染进程中的 Voice Settings
++       */
++    getVoiceSettings(): Promise<unknown>;
+     /**
+        * 启动 AI Agent 任务。自动获取 LLM 配置，找到可用的 Agent 内核插件，发送任务到后台进程异步执行。
+        * @param options sessionId — 会话 ID（可选），task — 任务描述，history — 历史对话，workDir — 工作目录，activeDocument — 当前文档信息，llmConfig — LLM 配置（可选），maxSteps — 最大步数，systemPrompt — 系统提示词，skipDefaultSystemPrompt — 跳过默认提示词
+@@ -1987,6 +2055,10 @@ export interface GeneratedFileSystemAPI {
+        * @param overwrite 是否覆盖已有文件，默认 true
+        */
+     extractZip(zipPath: string, destDir: string, overwrite?: boolean): Promise<null>;
++    /**
++       * 获取指定文件/程序的原生 OS 图标（Base64 PNG data URL）。
++       */
++    getFileIcon(filePath: string): Promise<string>;
+     /**
+        * 获取系统安全路径。仅允许 userData / documents / desktop / temp。
+        * @param name 路径名：'userData' | 'documents' | 'desktop' | 'temp'
+@@ -2004,6 +2076,10 @@ export interface GeneratedFileSystemAPI {
+        * @param path 目录路径
+        */
+     mkdir(path: string): Promise<null>;
++    /**
++       * 按需切片读取文件。只读取指定 offset 和 length 范围的 Buffer，绝不全量装载超大文件。
++       */
++    readChunk(filePath: string, offset: any, length: any, encoding: any): Promise<string>;
+     /**
+        * 列出目录下的文件和子目录。
+        * @param path 目录路径
+@@ -2177,6 +2253,8 @@ export interface GeneratedMcpAPI {
+        * await callApi("mcp", "callTool", [{ toolName: "search_tool", toolArgs: { query: "ffmpeg" } }]);
+        */
+     callTool(toolName: string, toolArgs: Record<string, unknown>): Promise<unknown>;
++    deleteProfile(id: string): Promise<boolean>;
++    listProfiles(): Promise<unknown[]>;
+     /**
+        * 列出所有已注册的系统提示词。
+        */
+@@ -2185,6 +2263,7 @@ export interface GeneratedMcpAPI {
+        * 列出所有已注册的 MCP 工具。
+        */
+     listTools(): Promise<unknown>;
++    listTools(): Promise<unknown[]>;
+     /**
+        * 动态注册 MCP 工具（运行时注册，非 plugin.json 声明）。
+        * @param callerPluginId 调用插件 ID
+@@ -2204,6 +2283,7 @@ export interface GeneratedMcpAPI {
+         promptId: string;
+         promptText: string;
+     }): Promise<null>;
++    saveProfile(profile: any): Promise<unknown>;
+     /**
+        * 注销动态 MCP 工具。
+        * @param callerPluginId 调用插件 ID
+@@ -2216,6 +2296,11 @@ export interface GeneratedMcpAPI {
+        * @param promptId 提示词 ID
+        */
+     unregisterSystemPrompt(callerPluginId: string, promptId: string): Promise<null>;
++    updateScopeToken(params: {
++        token: string;
++        allowedTools?: string[];
++        allowedPlugins?: string[];
++    }): Promise<boolean>;
+ }
+ /**
+  * plugin Namespace API (Generated)
+@@ -2484,7 +2569,7 @@ export interface GeneratedSystemAPI {
+        * 自动读取解析用户主目录 ~/.ssh/config 配置文件与密钥列表
+        */
+     getSSHConfigProfiles(_options: unknown): Promise<{
+-        profiles: any[];
++        profiles: SSHHostProfile[];
+         keys: string[];
+         configExists: boolean;
+     }>;
+@@ -2524,6 +2609,10 @@ export interface GeneratedSystemAPI {
+         isEditable: boolean;
+         role: string;
+     }>;
++    /**
++       * 终止指定 Session 会话下的所有运行中子进程（终端、脚本）
++       */
++    killSessionProcesses(sessionId: string): Promise<boolean>;
+     /**
+        * 启动一个应用程序（如果已运行则将其激活置前）。
+        * appName: 应用名称（如 "微信"、"WeChat"、"Google Chrome"）或 bundle ID（如 "com.tencent.xinWeChat"）。
+@@ -2689,12 +2778,6 @@ export interface GeneratedSystemAPI {
+     simulateType(options: {
+         text: string;
+     }): Promise<boolean>;
+-    /**
+-       * 触发 4 阶段 SSH 堡垒机与内网 DB 连通性测试
+-       */
+-    testSSHTunnelConnectivity(options: {
+-        sshConfig: any;
+-    }): Promise<any>;
+     /**
+        * 切换快速面板（语音助手面板）的显示/隐藏。
+        */
+@@ -3030,9 +3113,12 @@ declare global {
+             View: typeof View;
+         };
+     }
+-    const berrytrace: BerryTraceSDK & {
++    var berrytrace: BerryTraceSDK & {
+         Plugin: typeof Plugin;
+         View: typeof View;
+     };
+ }
+-export declare function createPluginSDK(pluginId?: string): BerryTraceSDK;
++export interface PluginSdkOptions {
++    toolPrefixes?: string[];
++}
++export declare function createPluginSDK(pluginId?: string, options?: PluginSdkOptions): BerryTraceSDK;

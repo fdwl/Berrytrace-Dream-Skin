@@ -1,0 +1,417 @@
+import { app, shell, net, clipboard, nativeImage, ipcMain, dialog, BrowserWindow, OpenDialogOptions } from 'electron'
+import fs, { promises as fsPromises } from 'fs'
+import { join, basename } from 'path'
+import { normalizePath } from '../utils/path-utils'
+import { RipgrepService } from './ripgrep-service'
+
+/** 精准浅层扫描项目目录下的 .workflow 文件 (最多 2 层：根目录及 1 级常用子目录) */
+async function scanShallowWorkflowFiles(projectDir: string): Promise<string[]> {
+  if (!projectDir || !fs.existsSync(projectDir)) {
+    return [];
+  }
+  const results: string[] = [];
+  const startTime = Date.now();
+  console.log(`[WorkflowScanner:scanDir] ========= 开始浅层扫描 =========`);
+  console.log(`[WorkflowScanner:scanDir] 目标路径: "${projectDir}"`);
+
+  try {
+    const rootEntries = await fsPromises.readdir(projectDir, { withFileTypes: true });
+    console.log(`[WorkflowScanner:scanDir] 根目录项共计 ${rootEntries.length} 项`);
+
+    for (const entry of rootEntries) {
+      // 1. 过滤所有以 . 开头的隐藏文件夹/文件
+      if (entry.name.startsWith('.')) continue;
+
+      // 2. 过滤常见的构建/依赖目录
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'build' || entry.name === 'out') continue;
+
+      const fullPath = join(projectDir, entry.name);
+
+      // 1 层：根目录下的 *.workflow 文件（放宽 isFile() 判断，提升软链/Dirent 兼容性）
+      if (entry.name.endsWith('.workflow')) {
+        console.log(`[WorkflowScanner:scanDir] 匹配根目录文件: "${fullPath}"`);
+        results.push(fullPath);
+      } 
+      // 2 层：1 级子目录 (如 docs, workflows 等)
+      else if (entry.isDirectory()) {
+        try {
+          const subEntries = await fsPromises.readdir(fullPath, { withFileTypes: true });
+          for (const sub of subEntries) {
+            if (sub.name.startsWith('.')) continue;
+            if (sub.name.endsWith('.workflow')) {
+              const subFullPath = join(fullPath, sub.name);
+              console.log(`[WorkflowScanner:scanDir] 匹配子目录文件: "${subFullPath}"`);
+              results.push(subFullPath);
+            }
+          }
+        } catch (subErr) {
+          console.warn(`[WorkflowScanner:scanDir] 无法读取子目录 "${fullPath}":`, subErr);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[WorkflowScanner:scanDir] 无法读取根目录 "${projectDir}":`, err);
+  }
+
+  console.log(`[WorkflowScanner:scanDir] 扫描结束: 找到 ${results.length} 个 .workflow 文件 (耗时 ${Date.now() - startTime}ms)`);
+  console.log(`[WorkflowScanner:scanDir] =================================`);
+  return results;
+}
+
+export function registerFileIpcHandlers(handleOpenFile: (filePath: string, line?: number) => void) {
+  // 统一使用 workspace: 规范前缀注册工程工作流扫描 IPC
+  ipcMain.handle('workspace:scanProjectWorkflows', async (_event, projectPath: string) => {
+    console.log(`[WorkspaceManager:scanProjectWorkflows] 收到扫描请求，项目路径: "${projectPath}"`);
+    if (!projectPath) return [];
+
+    try {
+      const normalized = normalizePath(projectPath);
+      const pathsToScan = new Set<string>();
+      pathsToScan.add(normalized);
+
+      // 判断路径是否已经是 docs 目录
+      const isDocsDir = normalized.endsWith('/docs') || normalized.endsWith('\\docs') || basename(normalized) === 'docs';
+      if (isDocsDir) {
+        // 已经是 docs 目录，追加父目录
+        pathsToScan.add(normalizePath(join(normalized, '..')));
+      } else {
+        // 非 docs 目录，追加 docs 子目录
+        pathsToScan.add(normalizePath(join(normalized, 'docs')));
+      }
+
+      let allFiles: string[] = [];
+
+      for (const targetDir of Array.from(pathsToScan)) {
+        try {
+          const found = await RipgrepService.getInstance().findWorkflowFiles(targetDir);
+          if (found && found.length > 0) {
+            console.log(`[WorkspaceManager:scanProjectWorkflows] ripgrep 在 "${targetDir}" 搜寻到 ${found.length} 个文件`);
+            allFiles = allFiles.concat(found);
+          }
+        } catch (rgErr) {
+          console.warn(`[WorkspaceManager:scanProjectWorkflows] ripgrep 扫描 "${targetDir}" 出错:`, rgErr);
+        }
+
+        // 备选浅层扫描保底
+        try {
+          const shallowFound = await scanShallowWorkflowFiles(targetDir);
+          allFiles = allFiles.concat(shallowFound);
+        } catch { /* ignore */ }
+      }
+
+      // 去重
+      const uniqueFiles = Array.from(new Set(allFiles));
+      console.log(`[WorkspaceManager:scanProjectWorkflows] 去重后获得 ${uniqueFiles.length} 个文件:`, uniqueFiles);
+
+      // 读取每个文件内容
+      const items = await Promise.all(
+        uniqueFiles.map(async (filePath) => {
+          try {
+            const content = await fsPromises.readFile(filePath, 'utf-8');
+            return { path: filePath, name: basename(filePath), content };
+          } catch (err) {
+            console.error(`[WorkspaceManager:scanProjectWorkflows] 读取文件失败 "${filePath}":`, err);
+            return null;
+          }
+        })
+      );
+
+      const validItems = items.filter(Boolean);
+      console.log(`[WorkspaceManager:scanProjectWorkflows] 成功返回 ${validItems.length} 个工作流定义`);
+      return validItems;
+    } catch (err) {
+      console.error('[WorkspaceManager:scanProjectWorkflows] 扫描失败:', err);
+      return [];
+    }
+  })
+
+  ipcMain.handle('workspace:readWorkflowContent', async (_event, filePath: string) => {
+    console.log(`[WorkspaceManager:readWorkflowContent] 收到读文件请求: "${filePath}"`);
+    try {
+      const normalized = normalizePath(filePath);
+      const content = await fsPromises.readFile(normalized, 'utf-8');
+      console.log(`[WorkspaceManager:readWorkflowContent] 成功读取 "${filePath}" (${content.length} 字节)`);
+      return content;
+    } catch (err) {
+      console.error('[WorkspaceManager:readWorkflowContent] 失败:', err);
+      return '';
+    }
+  })
+
+  ipcMain.handle('file:read', async (_event, filePath: string) => {
+    try {
+      const normalizedPath = normalizePath(filePath)
+      const data = await fsPromises.readFile(normalizedPath)
+      await fsPromises.unlink(normalizedPath).catch((err) => {
+        console.warn('Failed to delete temp screenshot file:', err)
+      })
+      return data.buffer
+    } catch (err) {
+      console.error('Failed to read file:', err)
+      throw err
+    }
+  })
+
+  ipcMain.handle('util:fetchFavicon', async (_event, targetUrl: string) => {
+    try {
+      const urlObj = new URL(targetUrl)
+      const domain = urlObj.hostname
+      // Use favicon.im API
+      const faviconUrl = `https://favicon.im/${domain}`
+
+      const response = await net.fetch(faviconUrl, { redirect: 'follow' })
+      if (!response.ok) return null
+
+      const arrayBuffer = await response.arrayBuffer()
+      const buffer = Buffer.from(arrayBuffer)
+
+      const userDataPath = app.getPath('userData')
+      const iconDir = join(userDataPath, 'favicons')
+      await fsPromises.mkdir(iconDir, { recursive: true })
+
+      const iconPath = join(iconDir, `${domain}.png`)
+      await fsPromises.writeFile(iconPath, buffer)
+
+      return `file://${iconPath}`
+    } catch (e) {
+      console.error('Failed to fetch favicon:', e)
+      return null
+    }
+  })
+
+  ipcMain.handle('util:fetchPageTitle', async (_event, targetUrl: string) => {
+    try {
+      const response = await net.fetch(targetUrl, {
+        redirect: 'follow',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+      })
+      if (!response.ok) return null
+      const html = await response.text()
+      // 从 HTML 中提取 <title>...</title>
+      const match = html.match(/<title[^>]*>([^<]+)<\/title>/i)
+      if (match && match[1]) {
+        return match[1].trim().replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+      }
+      return null
+    } catch (e) {
+      console.error('Failed to fetch page title:', e)
+      return null
+    }
+  })
+
+  ipcMain.handle('file:open-via-plugin', async (_event, filePath: string, line?: number) => {
+    handleOpenFile(normalizePath(filePath), line)
+    return true
+  })
+
+  ipcMain.handle('file:show-in-folder', async (_event, filePath: string) => {
+    shell.showItemInFolder(normalizePath(filePath))
+    return true
+  })
+
+  ipcMain.handle('file:open-path', async (_event, filePath: string) => {
+    const err = await shell.openPath(normalizePath(filePath))
+    if (err) {
+      console.error('Failed to open path:', err)
+      return false
+    }
+    return true
+  })
+
+  ipcMain.handle('clipboard:write-image-data-url', async (_event, dataUrl: string) => {
+    const img = nativeImage.createFromDataURL(dataUrl)
+    clipboard.writeImage(img)
+    return true
+  })
+
+  ipcMain.handle('clipboard:read-file-paths', async () => {
+    try {
+      const formats = clipboard.availableFormats()
+      console.log('[clipboard:read-file-paths] available formats:', formats)
+
+      // Helper: parse file:// URI lines into local paths
+      const parseFileUris = (uriText: string): string[] => {
+        return uriText
+          .split(/\r?\n/)
+          .map(l => l.trim())
+          .filter(l => l.startsWith('file://') && !l.startsWith('#'))
+          .map(l => {
+            try {
+              return decodeURIComponent(new URL(l).pathname)
+            } catch {
+              return null
+            }
+          })
+          .filter((p): p is string => !!p)
+      }
+
+      // Windows: try CF_HDROP first, then PowerShell fallback (symmetric with macOS osascript)
+      if (process.platform === 'win32') {
+        // Attempt 1: CF_HDROP via Electron clipboard API
+        if (formats.includes('CF_HDROP')) {
+          try {
+            const raw = clipboard.readBuffer('CF_HDROP')
+            // DROPFILES header is 20 bytes; byte at offset 16 is pWide (1=UTF-16LE, 0=ANSI)
+            const pWide = raw[16] !== 0
+            const DROPFILES_HEADER_SIZE = 20
+            const buf = raw.subarray(DROPFILES_HEADER_SIZE)
+            const paths: string[] = []
+
+            if (pWide) {
+              // UTF-16LE: each char is 2 bytes, terminated by 2 zero bytes
+              let i = 0
+              while (i < buf.length - 1) {
+                let end = i
+                while (end < buf.length - 1 && (buf[end] !== 0 || buf[end + 1] !== 0)) {
+                  end += 2
+                }
+                if (end === i) break
+                paths.push(buf.subarray(i, end).toString('utf16le'))
+                i = end + 2
+              }
+            } else {
+              // ANSI: single-byte null-terminated strings
+              let i = 0
+              while (i < buf.length) {
+                let end = i
+                while (end < buf.length && buf[end] !== 0) end++
+                if (end === i) break
+                paths.push(buf.subarray(i, end).toString('latin1'))
+                i = end + 1
+              }
+            }
+
+            if (paths.length > 0) {
+              console.log('[clipboard:read-file-paths] Windows CF_HDROP paths:', paths)
+              return paths
+            }
+          } catch (hdropErr) {
+            console.warn('[clipboard:read-file-paths] CF_HDROP parse failed:', hdropErr)
+          }
+        }
+
+        // Attempt 2: PowerShell fallback — same strategy as macOS osascript
+        try {
+          const { spawnSync } = await import('child_process')
+          const psScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$files = [System.Windows.Forms.Clipboard]::GetFileDropList()
+if ($files -and $files.Count -gt 0) { $files -join "\`n" }
+`.trim()
+          const res = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+            encoding: 'utf8',
+            timeout: 5000,
+          })
+          const output = (res.stdout || '').trim()
+          console.log('[clipboard:read-file-paths] PowerShell result:', JSON.stringify(output))
+          if (output) {
+            const paths = output.split('\n').map(p => p.trim()).filter(Boolean)
+            if (paths.length > 0) {
+              console.log('[clipboard:read-file-paths] Windows PowerShell paths:', paths)
+              return paths
+            }
+          }
+        } catch (psErr) {
+          console.warn('[clipboard:read-file-paths] PowerShell fallback failed:', psErr)
+        }
+
+        // No file paths found on Windows
+        console.log('[clipboard:read-file-paths] No file paths found in Windows clipboard')
+        return []
+      }
+
+      // macOS: Electron's clipboard.read() cannot access NSFilenamesPboardType directly.
+      // Use osascript (AppleScript) via a temp script file to reliably read Finder-copied file paths.
+      if (process.platform === 'darwin') {
+        try {
+          const { spawnSync } = await import('child_process')
+          const { writeFileSync, unlinkSync } = await import('fs')
+          const { tmpdir } = await import('os')
+          const { join: pathJoin } = await import('path')
+
+          // Write the AppleScript to a temp file to avoid shell-quoting issues with « » chars
+          const scriptPath = pathJoin(tmpdir(), `bt_clip_${Date.now()}.scpt`)
+          const appleScript = `
+try
+  set theFiles to (the clipboard as «class furl» list)
+  set posixList to {}
+  repeat with f in theFiles
+    set end of posixList to POSIX path of f
+  end repeat
+  set AppleScript's text item delimiters to "\n"
+  return posixList as text
+on error
+  try
+    return POSIX path of (the clipboard as «class furl»)
+  on error
+    return ""
+  end try
+end try
+`
+          writeFileSync(scriptPath, appleScript, 'utf8')
+          const res = spawnSync('osascript', [scriptPath], { encoding: 'utf8', timeout: 3000 })
+          try { unlinkSync(scriptPath) } catch { /* ignore */ }
+
+          const output = (res.stdout || '').trim()
+          console.log('[clipboard:read-file-paths] osascript result:', JSON.stringify(output))
+
+          if (output) {
+            const paths = output
+              .split('\n')
+              .map(p => p.trim())
+              // Remove trailing slash from directories
+              .map(p => (p.endsWith('/') && p.length > 1 ? p.slice(0, -1) : p))
+              .filter(Boolean)
+            if (paths.length > 0) {
+              console.log('[clipboard:read-file-paths] macOS osascript paths:', paths)
+              return paths
+            }
+          }
+        } catch (osaErr) {
+          console.warn('[clipboard:read-file-paths] osascript failed:', osaErr)
+        }
+      }
+
+
+      // Linux / fallback: try text/uri-list
+      if (formats.includes('text/uri-list')) {
+        const uriList = clipboard.read('text/uri-list')
+        if (uriList) {
+          const paths = parseFileUris(uriList)
+          if (paths.length > 0) {
+            console.log('[clipboard:read-file-paths] text/uri-list paths:', paths)
+            return paths
+          }
+        }
+      }
+
+      // Last fallback: text/plain
+      if (formats.includes('text/plain')) {
+        const text = clipboard.readText()
+        if (text && text.includes('file://')) {
+          const paths = parseFileUris(text)
+          if (paths.length > 0) {
+            console.log('[clipboard:read-file-paths] text/plain file:// paths:', paths)
+            return paths
+          }
+        }
+      }
+
+      console.log('[clipboard:read-file-paths] No file paths found in clipboard')
+      return []
+    } catch (err) {
+      console.error('[clipboard:read-file-paths] Failed to read clipboard file paths:', err)
+      return []
+    }
+  })
+
+  ipcMain.handle('dialog:showOpenDialog', async (event, options: OpenDialogOptions) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (win) {
+      return dialog.showOpenDialog(win, options)
+    }
+    return dialog.showOpenDialog(options)
+  })
+}

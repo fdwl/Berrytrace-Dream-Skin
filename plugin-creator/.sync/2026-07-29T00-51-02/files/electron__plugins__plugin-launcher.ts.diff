@@ -1,0 +1,163 @@
+diff --git a/electron/plugins/plugin-launcher.ts b/electron/plugins/plugin-launcher.ts
+index 31ad381..bf37d1e 100644
+--- a/electron/plugins/plugin-launcher.ts
++++ b/electron/plugins/plugin-launcher.ts
+@@ -4,16 +4,21 @@ import { promises as fs } from 'fs';
+ import { pathToFileURL } from 'url';
+ import { fork } from 'child_process';
+ import { createRequire } from 'module';
+-import { PluginManifest } from './plugin-verifier';
++import type { PluginManifest } from './plugin-verifier';
+ import { dispatchPluginApiCall } from './api-dispatcher';
+ import { McpHost } from './mcp-host';
+ import { HookRegistry } from './hook-registry';
+ import { EventSubscriptionRegistry } from './event-subscription-registry';
+ import { addLog } from '../services/logger';
+ import { PluginWatchdog } from './plugin-watchdog';
+-import { IPluginProcess, UtilityProcessAdapter, ChildProcessAdapter, PooledProcessAdapter } from './plugin-process-adapter';
++import type { IPluginProcess} from './plugin-process-adapter';
++import { UtilityProcessAdapter, ChildProcessAdapter, PooledProcessAdapter } from './plugin-process-adapter';
+ import { PluginPool } from './plugin-pool';
+ import { PluginIsolationPolicy } from './plugin-isolation-policy';
++import { fileURLToPath } from 'url';
++import { autoWrapDocumentHandle } from '../services/document-center.js';
++
++const __dirname = dirname(fileURLToPath(import.meta.url));
+ 
+ /**
+  * 解析宿主 app 的 node_modules 目录路径。
+@@ -25,7 +30,7 @@ import { PluginIsolationPolicy } from './plugin-isolation-policy';
+  * berrytrace-plugin-sdk 等宿主依赖，即使插件安装在 ~/.berrytrace/plugins/。
+  */
+ function resolveHostNodeModulesPath(): string {
+-  return join(app.getAppPath(), 'node_modules');
++  return join(__dirname, '..', 'node_modules');
+ }
+ 
+ export class PluginLauncher {
+@@ -42,6 +47,8 @@ export class PluginLauncher {
+   private mainPlugins = new Map<string, any>();
+   private busyPlugins = new Set<string>();
+   private sessionToPluginMap = new Map<string, string>();
++  /** 反向索引：pluginId → sessionId 集合，O(1) 替代 isPluginBusy 中的 O(n) 遍历 */
++  private pluginToSessions = new Map<string, Set<string>>();
+   private stderrBuffers = new Map<string, string[]>();
+ 
+   private registeredForwarders = new Set<string>();
+@@ -68,7 +75,7 @@ export class PluginLauncher {
+ 
+       // Transfer Port1 to the Renderer
+       win.webContents.postMessage('plugin:connect-port', { type: 'plugin:connect-port', pluginId }, [port1]);
+-      
++
+       // Transfer Port2 to the Plugin Process
+       proc.sendMessage({ type: 'plugin:connect-port', pluginId }, [port2]);
+       console.log(`[PluginLauncher] Sent direct MessagePorts for "${pluginId}"`);
+@@ -153,10 +160,9 @@ export class PluginLauncher {
+ 
+   public isPluginBusy(pluginId: string): boolean {
+     if (this.busyPlugins.has(pluginId)) return true;
+-    for (const [sessId, pId] of this.sessionToPluginMap.entries()) {
+-      if (pId === pluginId) return true;
+-    }
+-    return false;
++    // O(1) 反向索引查找（取代原有 O(n) 遍历 sessionToPluginMap）
++    const sessions = this.pluginToSessions.get(pluginId);
++    return sessions !== undefined && sessions.size > 0;
+   }
+ 
+   public getBackgroundProcesses() {
+@@ -180,7 +186,11 @@ export class PluginLauncher {
+   public emitToBackgroundPlugin(pluginId: string, eventName: string, payload: unknown): void {
+     const proc = this.backgroundProcesses.get(pluginId);
+     if (proc) {
+-      proc.sendMessage({ type: 'sdk:events:on', eventName, payload });
++      autoWrapDocumentHandle(payload, eventName).then((safePayload) => {
++        proc.sendMessage({ type: 'sdk:events:on', eventName, payload: safePayload });
++      }).catch(() => {
++        proc.sendMessage({ type: 'sdk:events:on', eventName, payload });
++      });
+     }
+   }
+ 
+@@ -436,10 +446,14 @@ export class PluginLauncher {
+       this.backgroundProcesses.delete(pluginId);
+       this.rawUtilityProcesses.delete(pluginId);
+       this.busyPlugins.delete(pluginId);
+-      for (const [sessId, pId] of this.sessionToPluginMap.entries()) {
+-        if (pId === pluginId) {
++      // 同步清理反向索引
++      const exitSessions = this.pluginToSessions.get(pluginId);
++      if (exitSessions) {
++        for (const sessId of exitSessions) {
+           this.sessionToPluginMap.delete(sessId);
++          this.activeAgentSessions.delete(sessId);
+         }
++        this.pluginToSessions.delete(pluginId);
+       }
+       if (code === 0) {
+         // 正常退出：注销看门狗监控
+@@ -660,21 +674,19 @@ export class PluginLauncher {
+             const mappedPluginId = this.sessionToPluginMap.get(sessionId);
+             this.activeAgentSessions.delete(sessionId);
+             this.sessionToPluginMap.delete(sessionId);
+-            console.log(`[PluginLauncher] AI Session finished: ${sessionId} (status: ${status})`);
+-
+-            if (mappedPluginId && !this.isPluginBusy(mappedPluginId)) {
+-              try {
+-                const { PluginManager } = require('./plugin-manager.js');
+-                PluginManager.getInstance().processPendingReload(mappedPluginId).catch((err: any) => {
+-                  console.error(`[PluginLauncher] Failed to process pending reload for "${mappedPluginId}":`, err);
+-                });
+-              } catch (err) {
+-                console.error(`[PluginLauncher] Failed to require PluginManager:`, err);
+-              }
++            // 同步更新反向索引
++            if (mappedPluginId) {
++              const sessions = this.pluginToSessions.get(mappedPluginId);
++              sessions?.delete(sessionId);
+             }
++            console.log(`[PluginLauncher] AI Session finished: ${sessionId} (status: ${status})`);
+           } else {
+             this.activeAgentSessions.add(sessionId);
+             this.sessionToPluginMap.set(sessionId, pluginId);
++            // 同步更新反向索引
++            let sessions = this.pluginToSessions.get(pluginId);
++            if (!sessions) { sessions = new Set(); this.pluginToSessions.set(pluginId, sessions); }
++            sessions.add(sessionId);
+           }
+         }
+       }
+@@ -706,10 +718,14 @@ export class PluginLauncher {
+     console.log(`[PluginLauncher] Stopping background plugin: ${pluginId}`);
+ 
+     this.busyPlugins.delete(pluginId);
+-    for (const [sessId, pId] of this.sessionToPluginMap.entries()) {
+-      if (pId === pluginId) {
++    // 同步清理反向索引并从 sessionToPluginMap 移除该插件的所有会话
++    const pluginSessions = this.pluginToSessions.get(pluginId);
++    if (pluginSessions) {
++      for (const sessId of pluginSessions) {
+         this.sessionToPluginMap.delete(sessId);
++        this.activeAgentSessions.delete(sessId);
+       }
++      this.pluginToSessions.delete(pluginId);
+     }
+ 
+     // 池化插件：通过 PluginPool 卸载（不终止 Host 进程）
+@@ -720,6 +736,7 @@ export class PluginLauncher {
+       PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+       ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+       ipcMain.removeAllListeners(`plugin:post-message:${pluginId}`);
++      this.stderrBuffers.delete(pluginId);
+       await PluginPool.getInstance().unloadPlugin(pluginId);
+       return;
+     }
+@@ -733,6 +750,7 @@ export class PluginLauncher {
+     PluginWatchdog.getInstance().unregisterPlugin(pluginId);
+     ipcMain.removeAllListeners(`plugin:emit:${pluginId}`);
+     ipcMain.removeAllListeners(`plugin:post-message:${pluginId}`);
++    this.stderrBuffers.delete(pluginId);
+   }
+ 
+   public async startMainPlugin(

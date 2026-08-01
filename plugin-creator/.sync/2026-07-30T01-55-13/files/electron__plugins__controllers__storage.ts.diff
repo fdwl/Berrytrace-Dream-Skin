@@ -1,0 +1,215 @@
+diff --git a/electron/plugins/controllers/storage.ts b/electron/plugins/controllers/storage.ts
+index dcc2753..7b507ef 100644
+--- a/electron/plugins/controllers/storage.ts
++++ b/electron/plugins/controllers/storage.ts
+@@ -5,7 +5,8 @@ import { promises as fs, createReadStream, existsSync, mkdirSync } from 'fs';
+ import { createHash } from 'crypto';
+ import AdmZip from 'adm-zip';
+ import { DatabaseSync } from 'node:sqlite';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { normalizePath } from '../../utils/path-utils';
+ import { pluginDataDir, getModelsRootDir, SKILLS_DIR } from '../../config/paths';
+ 
+@@ -18,16 +19,20 @@ export async function resolveStore(pluginId: string, context?: ApiContext): Prom
+   const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+ 
+   let wsPath: string | null = null;
+-  if (scope === 'workspace' && context?.sender) {
++  if (scope === 'workspace') {
+     const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+-    wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++    if (context?.sender) {
++      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++    } else {
++      wsPath = WorkspaceManager.getInstance().getPath(null);
++    }
+   }
+ 
+   const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+   const cacheKey = wsPath ? `${wsPath}::${pluginId}` : pluginId;
+ 
+   if (!storeInstances.has(cacheKey)) {
+-    let options: any = { name: `plugin_store_${cleanPluginId}` };
++    const options: Record<string, unknown> = { name: `plugin_store_${cleanPluginId}` };
+     if (wsPath) {
+       const dataDir = join(wsPath, '.berrytrace', 'plugins', 'data', cleanPluginId);
+       if (!existsSync(dataDir)) {
+@@ -60,9 +65,13 @@ class PluginDbManager {
+     const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+ 
+     let wsPath: string | null = null;
+-    if (scope === 'workspace' && context?.sender) {
++    if (scope === 'workspace') {
+       const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+-      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      if (context?.sender) {
++        wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      } else {
++        wsPath = WorkspaceManager.getInstance().getPath(null);
++      }
+     }
+ 
+     const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+@@ -86,9 +95,13 @@ class PluginDbManager {
+     const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+ 
+     let wsPath: string | null = null;
+-    if (scope === 'workspace' && context?.sender) {
++    if (scope === 'workspace') {
+       const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+-      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      if (context?.sender) {
++        wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      } else {
++        wsPath = WorkspaceManager.getInstance().getPath(null);
++      }
+     }
+ 
+     const cacheKey = wsPath ? `${wsPath}::${pluginId}` : pluginId;
+@@ -112,11 +125,11 @@ async function executePluginSql(pluginId: string, sql: string, params: unknown[]
+     if (isQuery) {
+       const db = await PluginDbManager.getDb(pluginId, context);
+       const stmt = db.prepare(sql);
+-      return stmt.all(...(params as any[]));
++      return stmt.all(...(params as (string | number | bigint | null | Uint8Array)[]));
+     } else {
+       const dbPath = await PluginDbManager.getDbPath(pluginId, context);
+       const { DatabaseWriter } = await import('../../services/db-writer.js');
+-      const result = await DatabaseWriter.getInstance().execute(dbPath, sql, params as any[]);
++      const result = await DatabaseWriter.getInstance().execute(dbPath, sql, params as (string | number | bigint | null | Uint8Array)[]);
+       return {
+         lastInsertRowid: Number(result.lastInsertRowid),
+         lastID: Number(result.lastInsertRowid),
+@@ -142,36 +155,52 @@ export class StorageController extends BaseApiController {
+     return store.get(key, defaultValue);
+   }
+ 
+-  /**
+-   * 写入键值对数据，会覆盖已有值。
+-   * @param key 键名
+-   * @param value 值（任意 JSON 可序列化类型）
+-   */
++  async storage_get(key: string, defaultValue: unknown, context: ApiContext): Promise<unknown> {
++    return this.storage_kv_get(key, defaultValue, context);
++  }
++
++  async storage_getItem(key: string, defaultValue: unknown, context: ApiContext): Promise<unknown> {
++    return this.storage_kv_get(key, defaultValue, context);
++  }
++
+   async storage_kv_set(key: string, value: unknown, context: ApiContext): Promise<null> {
+     const store = await resolveStore(context.pluginId, context);
+     store.set(key, value);
+     return null;
+   }
+ 
+-  /**
+-   * 删除指定键值对。
+-   * @param key 键名
+-   */
++  async storage_set(key: string, value: unknown, context: ApiContext): Promise<null> {
++    return this.storage_kv_set(key, value, context);
++  }
++
++  async storage_setItem(key: string, value: unknown, context: ApiContext): Promise<null> {
++    return this.storage_kv_set(key, value, context);
++  }
++
+   async storage_kv_delete(key: string, context: ApiContext): Promise<null> {
+     const store = await resolveStore(context.pluginId, context);
+     store.delete(key);
+     return null;
+   }
+ 
+-  /**
+-   * 清空当前插件所有键值对数据。
+-   */
++  async storage_delete(key: string, context: ApiContext): Promise<null> {
++    return this.storage_kv_delete(key, context);
++  }
++
++  async storage_removeItem(key: string, context: ApiContext): Promise<null> {
++    return this.storage_kv_delete(key, context);
++  }
++
+   async storage_kv_clear(context: ApiContext): Promise<null> {
+     const store = await resolveStore(context.pluginId, context);
+     store.clear();
+     return null;
+   }
+ 
++  async storage_clear(context: ApiContext): Promise<null> {
++    return this.storage_kv_clear(context);
++  }
++
+   // ── storage.db namespace ──
+ 
+   /**
+@@ -205,16 +234,18 @@ export class StorageController extends BaseApiController {
+     try {
+       const buffer = await fs.readFile(filePath);
+       return enc === 'base64' ? buffer.toString('base64') : buffer.toString('utf-8');
+-    } catch (err: any) {
+-      if (err.code === 'ENOENT') {
++    } catch (err: unknown) {
++      const errorObj = err as { code?: string };
++      if (errorObj.code === 'ENOENT') {
+         // 诊断：文件不存在时记录详细上下文，帮助定位是真正的文件不存在还是竞态条件
+         let parentExists = 'unknown';
+-        let fileStat = 'unknown';
++        let fileStat: string;
+         try {
+           const stat = await fs.stat(filePath);
+           fileStat = JSON.stringify({ isFile: stat.isFile(), isDirectory: stat.isDirectory(), size: stat.size });
+-        } catch (statErr: any) {
+-          fileStat = `stat failed: ${statErr.code || statErr.message}`;
++        } catch (statErr: unknown) {
++          const statErrObj = statErr as { code?: string; message?: string };
++          fileStat = `stat failed: ${statErrObj.code || statErrObj.message}`;
+           // 检查父目录
+             const parentDir = dirname(filePath);
+             try {
+@@ -315,7 +346,7 @@ export class StorageController extends BaseApiController {
+    * 获取系统安全路径。仅允许 userData / documents / desktop / temp。
+    * @param name 路径名：'userData' | 'documents' | 'desktop' | 'temp'
+    */
+-  async filesystem_getSafePath(name: string): Promise<string> {
++  async filesystem_getSafePath(name: string, context?: ApiContext): Promise<string> {
+     if (name === 'models') {
+       return getModelsRootDir();
+     }
+@@ -325,6 +356,12 @@ export class StorageController extends BaseApiController {
+     if (name === 'userData' || name === 'documents' || name === 'desktop' || name === 'temp') {
+       return app.getPath(name);
+     }
++    if (name === 'pluginData') {
++      const cleanId = (context?.pluginId || '').replace(/[^a-zA-Z0-9-]/g, '_');
++      const dir = pluginDataDir(cleanId);
++      await fs.mkdir(dir, { recursive: true });
++      return dir;
++    }
+     throw new Error(`Unauthorized filesystem path request: ${name}`);
+   }
+ 
+@@ -438,4 +475,19 @@ export class StorageController extends BaseApiController {
+       await fd.close();
+     }
+   }
++
++  /**
++   * 获取指定文件/程序的原生 OS 图标（Base64 PNG data URL）。
++   */
++  async filesystem_getFileIcon(filePath: string): Promise<string> {
++    try {
++      const fp = normalizePath(filePath);
++      if (!existsSync(fp)) return '';
++      const icon = await app.getFileIcon(fp, { size: 'normal' });
++      return icon ? icon.toDataURL() : '';
++    } catch {
++      return '';
++    }
++  }
+ }
++

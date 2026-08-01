@@ -1,0 +1,106 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07e-window.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07e-window.md
+index 8b09898..ca58100 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07e-window.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07e-window.md
+@@ -1,74 +1,54 @@
+ # window / dialog / log / commands — 窗口与交互
+ 
+-
+-> 此文件由 `scripts/generate-skill-docs.js` 自动生成。修改 controller 后运行 `node scripts/generate-skill-docs.js` 更新。
+ ## window
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `close` | `floatId?: string` | `null` | 关闭窗口。不传 floatId 关闭当前窗口，传 floatId 关闭指定浮动窗口。 |
+-| `create` | `opts: FloatWindowOptions` | `string` | 创建浮动窗口。支持 url / blob: / file: 协议，自动注入 winId 参数。 const winId … |
+-| `disableDefaultDrag` | `disabled: boolean` | `null` | 禁用/启用窗口默认拖拽行为。 |
+-| `getNativeHandle` | `opts: { winId: string }` | `Promise<{
+-    handle: number;
+-    platfo…` | 获取浮动窗口的原生操作系统句柄（HWND on Windows, NSWindow* on macOS）。 通用窗口管理… |
+-| `getState` | `winId: string` | `unknown` | 获取浮动窗口状态。 |
+-| `hide` | `winId: string` | `null` | 隐藏指定浮动窗口。 |
+-| `maximize` | `—` | `null` | 最大化/还原当前窗口。 |
+-| `minimize` | `—` | `null` | 最小化当前窗口。 |
+-| `move` | `deltaX: number, deltaY: number` | `null` | 相对移动当前窗口。 await callApi("window", "move", [{ deltaX: 100, de… |
+-| `show` | `winId: string` | `null` | 显示指定浮动窗口。 |
+-| `startDrag` | `—` | `null` | 开始窗口拖拽（macOS 专用）。 |
+-| `updateWindowOptions` | `targetWindowId: string, options: {
+-    width?: number;
+-    height?: number;
+-    x?: number;
+-    y?: number;
+-    alwaysOnTop?: boolean;
+-    resizable?: boolean;
+-  }` | `null` | 动态更新浮动窗口属性（尺寸、位置、置顶、可缩放）。 |
++| `close` | `id?: string` | `void` | 关闭窗口。不传 id 关闭当前窗口，传 id 关闭指定浮动窗口。 |
++| `minimize` | `—` | `void` | 最小化当前窗口。 |
++| `maximize` | `—` | `void` | 最大化/还原当前窗口。 |
++| `startDrag` | `—` | `void` | 开始窗口拖拽（macOS 专用）。 |
++| `move` | `dx: number, dy: number` | `void` | 相对移动当前窗口。 |
++| `disableDefaultDrag` | `disabled: boolean` | `void` | 禁用/启用窗口默认拖拽行为。 |
++| `setIgnoreMouseEvents` | `ignore: boolean, options?: { forward: boolean }` | `void` | 设置窗口鼠标事件穿透（用于桌面特效等场景）。 |
++| `create` | `options: unknown` | `string` | 创建浮动窗口，返回窗口 ID。 |
++| `show` | `id: string` | `void` | 显示指定浮动窗口。 |
++| `hide` | `id: string` | `void` | 隐藏指定浮动窗口。 |
++| `getState` | `id: string` | `WindowState` | 获取浮动窗口状态。 |
++| `updateWindowOptions` | `id: string, options: Record<string, unknown>` | `void` | 动态更新浮动窗口属性（尺寸、位置、置顶、可缩放）。 |
+ 
+ **调用示例**：
+ ```typescript
+-await callApi('window', 'close', [floatId]);
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++
++const winId = await sdk.window.create({ url: 'https://example.com', width: 800, height: 600 });
++await sdk.window.show(winId);
++await sdk.window.close(winId);
+ ```
+ 
+ ## dialog
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `showOpenDialog` | `options: OpenDialogOptions` | `unknown` | 打开原生文件/目录选择对话框。 await callApi("dialog", "showOpenDialog", [{… |
+-| `showSaveDialog` | `options: SaveDialogOptions` | `unknown` | 打开原生文件保存对话框。 await callApi("dialog", "showSaveDialog", [{ de… |
+-
+-**调用示例**：
+-```typescript
+-await callApi('dialog', 'showOpenDialog', [options]);
+-```
++| `showOpenDialog` | `options: OpenDialogOptions` | `DialogReturnValue` | 打开原生文件/目录选择对话框。 |
++| `showSaveDialog` | `options: SaveDialogOptions` | `DialogReturnValue` | 打开原生文件保存对话框。 |
+ 
+ ## log
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `debug` | `message: string` | `null` | 记录 debug 级别日志（仅开发模式可见）。 |
+-| `error` | `message: string` | `null` | 记录 error 级别日志。 |
+-| `info` | `message: string` | `null` | 记录 info 级别日志，输出到宿主应用统一日志系统。 await callApi("log", "info", ["插… |
+-| `warn` | `message: string` | `null` | 记录 warn 级别日志。 |
+-
+-**调用示例**：
+-```typescript
+-await callApi('log', 'debug', [message]);
+-```
++| `info` | `message: string` | `void` | 记录 info 级别日志。 |
++| `warn` | `message: string` | `void` | 记录 warn 级别日志。 |
++| `error` | `message: string` | `void` | 记录 error 级别日志。 |
++| `debug` | `message: string` | `void` | 记录 debug 级别日志。 |
+ 
+ ## commands
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `execute` | `id: string, args?: Record<string, unknown>` | `void` | 执行命令，广播到所有渲染进程和后台进程。 |
+-| `register` | `options: any` | `string` | 注册命令。 |
++| `register` | `options: { id, label, handler?, ... }` | `string` | 注册命令。handler 为回调函数，会自动注册到本地。 |
+ | `unregister` | `id: string` | `void` | 注销命令。 |
++| `execute` | `id: string, args?: unknown` | `unknown` | 执行命令，广播到所有渲染进程和后台进程。 |
+ 
+-**调用示例**：
+-```typescript
+-await callApi('commands', 'execute', [{ id, args }]);
+-```
+-
++> **注意**：controller 中还有 getNativeHandle 方法，但**未注册到 SDK**，插件无法直接调用。

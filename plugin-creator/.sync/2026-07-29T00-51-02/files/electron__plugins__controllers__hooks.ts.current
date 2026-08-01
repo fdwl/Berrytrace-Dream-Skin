@@ -1,0 +1,48 @@
+/**
+ * Hooks Controller — 处理 sdk.hooks.register / sdk.hooks.call
+ */
+import { HookRegistry } from '../hook-registry.js';
+import type { ApiContext } from './api-context.js';
+import { BaseApiController } from './api-context.js';
+
+export class HooksController extends BaseApiController {
+  /**
+   * 注册 Hook 处理器。
+   * @param args [hookName, pluginId, priority, handlerCode]
+   */
+  async register(args: unknown[], _context: ApiContext): Promise<void> {
+    const [name, pluginId, priority, handlerSrc] = args as [string, string, number, string];
+    HookRegistry.getInstance().register(pluginId, name, priority ?? 0, handlerSrc);
+  }
+
+  /**
+   * 注销 Hook。
+   * @param args [hookName, pluginId]
+   */
+  async unregister(args: unknown[]): Promise<void> {
+    const [name, pluginId] = args as [string, string];
+    HookRegistry.getInstance().unregister(pluginId, name);
+  }
+
+  /**
+   * 调用 Hook，返回所有注册处理器的合并结果。
+   * @param args [hookName, callArgs, merge, timeoutMs]
+   * @returns 合并后的结果
+   */
+  async call(args: unknown[], context: ApiContext): Promise<unknown> {
+    const [name, callArgs, merge, timeoutMs] = args as [string, unknown[], boolean, number];
+    return await HookRegistry.getInstance().call(
+      name,
+      callArgs ?? [],
+      context.sender,
+      merge ?? false,
+      timeoutMs ?? 5000,
+    );
+  }
+
+  /** 清理指定插件的所有 hooks */
+  async unregisterPlugin(args: unknown[]): Promise<void> {
+    const [pluginId] = args as [string];
+    HookRegistry.getInstance().unregisterPlugin(pluginId);
+  }
+}

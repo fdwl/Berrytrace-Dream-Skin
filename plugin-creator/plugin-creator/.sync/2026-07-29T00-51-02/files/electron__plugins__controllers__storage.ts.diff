@@ -1,0 +1,112 @@
+diff --git a/electron/plugins/controllers/storage.ts b/electron/plugins/controllers/storage.ts
+index dcc2753..4c28233 100644
+--- a/electron/plugins/controllers/storage.ts
++++ b/electron/plugins/controllers/storage.ts
+@@ -5,7 +5,8 @@ import { promises as fs, createReadStream, existsSync, mkdirSync } from 'fs';
+ import { createHash } from 'crypto';
+ import AdmZip from 'adm-zip';
+ import { DatabaseSync } from 'node:sqlite';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { normalizePath } from '../../utils/path-utils';
+ import { pluginDataDir, getModelsRootDir, SKILLS_DIR } from '../../config/paths';
+ 
+@@ -18,16 +19,20 @@ export async function resolveStore(pluginId: string, context?: ApiContext): Prom
+   const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+ 
+   let wsPath: string | null = null;
+-  if (scope === 'workspace' && context?.sender) {
++  if (scope === 'workspace') {
+     const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+-    wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++    if (context?.sender) {
++      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++    } else {
++      wsPath = WorkspaceManager.getInstance().getPath(null);
++    }
+   }
+ 
+   const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+   const cacheKey = wsPath ? `${wsPath}::${pluginId}` : pluginId;
+ 
+   if (!storeInstances.has(cacheKey)) {
+-    let options: any = { name: `plugin_store_${cleanPluginId}` };
++    const options: any = { name: `plugin_store_${cleanPluginId}` };
+     if (wsPath) {
+       const dataDir = join(wsPath, '.berrytrace', 'plugins', 'data', cleanPluginId);
+       if (!existsSync(dataDir)) {
+@@ -60,9 +65,13 @@ class PluginDbManager {
+     const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+ 
+     let wsPath: string | null = null;
+-    if (scope === 'workspace' && context?.sender) {
++    if (scope === 'workspace') {
+       const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+-      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      if (context?.sender) {
++        wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      } else {
++        wsPath = WorkspaceManager.getInstance().getPath(null);
++      }
+     }
+ 
+     const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+@@ -86,9 +95,13 @@ class PluginDbManager {
+     const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+ 
+     let wsPath: string | null = null;
+-    if (scope === 'workspace' && context?.sender) {
++    if (scope === 'workspace') {
+       const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+-      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      if (context?.sender) {
++        wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
++      } else {
++        wsPath = WorkspaceManager.getInstance().getPath(null);
++      }
+     }
+ 
+     const cacheKey = wsPath ? `${wsPath}::${pluginId}` : pluginId;
+@@ -315,7 +328,7 @@ export class StorageController extends BaseApiController {
+    * 获取系统安全路径。仅允许 userData / documents / desktop / temp。
+    * @param name 路径名：'userData' | 'documents' | 'desktop' | 'temp'
+    */
+-  async filesystem_getSafePath(name: string): Promise<string> {
++  async filesystem_getSafePath(name: string, context?: ApiContext): Promise<string> {
+     if (name === 'models') {
+       return getModelsRootDir();
+     }
+@@ -325,6 +338,12 @@ export class StorageController extends BaseApiController {
+     if (name === 'userData' || name === 'documents' || name === 'desktop' || name === 'temp') {
+       return app.getPath(name);
+     }
++    if (name === 'pluginData') {
++      const cleanId = (context?.pluginId || '').replace(/[^a-zA-Z0-9-]/g, '_');
++      const dir = pluginDataDir(cleanId);
++      await fs.mkdir(dir, { recursive: true });
++      return dir;
++    }
+     throw new Error(`Unauthorized filesystem path request: ${name}`);
+   }
+ 
+@@ -438,4 +457,19 @@ export class StorageController extends BaseApiController {
+       await fd.close();
+     }
+   }
++
++  /**
++   * 获取指定文件/程序的原生 OS 图标（Base64 PNG data URL）。
++   */
++  async filesystem_getFileIcon(filePath: string): Promise<string> {
++    try {
++      const fp = normalizePath(filePath);
++      if (!existsSync(fp)) return '';
++      const icon = await app.getFileIcon(fp, { size: 'normal' });
++      return icon ? icon.toDataURL() : '';
++    } catch {
++      return '';
++    }
++  }
+ }
++

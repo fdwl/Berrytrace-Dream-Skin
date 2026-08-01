@@ -1,0 +1,101 @@
+import { app, globalShortcut } from 'electron'
+import { ElectronMainWindow } from '../windows/main-window'
+import { KeybindingsManager } from './keybindings-manager'
+import { ShortcutActivationDispatcher } from './shortcut-activation-dispatcher'
+
+export class ElectronGlobalShortcuts {
+  private static instance: ElectronGlobalShortcuts
+  private showMainWindow?: () => void
+  private triggerScreenshot?: () => void
+  private toggleQuickPanelWindow?: () => void
+
+  private constructor() {}
+
+  public static getInstance(): ElectronGlobalShortcuts {
+    if (!ElectronGlobalShortcuts.instance) {
+      ElectronGlobalShortcuts.instance = new ElectronGlobalShortcuts()
+    }
+    return ElectronGlobalShortcuts.instance
+  }
+
+  public setDependencies(deps: {
+    showMainWindow: () => void
+    triggerScreenshot: () => void
+    toggleQuickPanelWindow: () => void
+  }): void {
+    this.showMainWindow = deps.showMainWindow
+    this.triggerScreenshot = deps.triggerScreenshot
+    this.toggleQuickPanelWindow = deps.toggleQuickPanelWindow
+  }
+
+  public registerGlobalShortcuts(): void {
+    if (!app.isReady()) {
+      console.warn('⚠️ [ElectronGlobalShortcuts] app is not ready yet, skipping registerGlobalShortcuts.')
+      return
+    }
+    globalShortcut.unregisterAll()
+
+    const keybindings = KeybindingsManager.getInstance().getEffectiveKeybindings()
+
+    for (const rule of keybindings) {
+      if (!rule.key || !rule.key.trim()) continue
+      // 仅属于 'global' 作用域的快捷键才允许注册为 OS 级别 globalShortcut
+      if (rule.scope && rule.scope !== 'global') continue
+
+      const accelerator = rule.key.trim()
+      const isRegistered = globalShortcut.register(accelerator, () => {
+        // 显示/隐藏主窗口快捷键不受进入 Dashboard 状态限制，确保时刻可唤醒/隐藏主窗口
+        if (rule.command !== 'system:show-main-window' && !ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+          console.log(`⚠️ 用户尚未进入主界面，忽略快捷键触发（${rule.title}）`)
+          return
+        }
+        console.log(`✅ 全局快捷键触发（${rule.title}）: ${accelerator}`)
+
+        switch (rule.command) {
+          case 'system:show-main-window':
+            this.showMainWindow?.()
+            break
+          case 'system:trigger-screenshot':
+            this.triggerScreenshot?.()
+            break
+          case 'system:toggle-quick-panel':
+            this.toggleQuickPanelWindow?.()
+            break
+          case 'system:lock-app': {
+            const win = ElectronMainWindow.getInstance().getWindow()
+            import('./desktop-lock').then(({ ElectronDesktopLock }) => {
+              ElectronDesktopLock.getInstance().triggerLock(win)
+            }).catch((err: unknown) => {
+              console.error('[GlobalShortcuts] Failed to trigger desktop lock:', err)
+            })
+            break
+          }
+          default:
+            // 插件 Command 交由 ShortcutActivationDispatcher / ActionRegistry 执行
+            ShortcutActivationDispatcher.getInstance().handleGesture(accelerator).catch((err: unknown) => {
+              console.error(`[GlobalShortcuts] Failed to dispatch accelerator "${accelerator}":`, err)
+            })
+            break
+        }
+      })
+
+      if (isRegistered) {
+        console.log(`✅ 全局快捷键注册成功（${rule.title}）: ${accelerator}`)
+      } else {
+        console.warn(`⚠️ 全局快捷键已被占用或注册失败（${rule.title}）: ${accelerator}`)
+      }
+    }
+  }
+
+  public getDefaultLockShortcut(): string {
+    return process.platform === 'darwin' ? 'Ctrl+Cmd+L' : 'Ctrl+Alt+L'
+  }
+
+  public unregisterAll(): void {
+    if (app.isReady()) {
+      globalShortcut.unregisterAll()
+    } else {
+      console.log('[ElectronGlobalShortcuts] app is not ready, skipping unregisterAll.')
+    }
+  }
+}

@@ -1,0 +1,9 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07z-callbacks.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07z-callbacks.md
+index 2e6c44b..84fade7 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07z-callbacks.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07z-callbacks.md
+@@ -22,4 +22,3 @@
+ | `selectionMenu` | `unregisterItem` | 注销划词菜单项。 |
+ | `hooks` | `register` | 注册 Hook 处理器。 |
+ | `hooks` | `unregister` | 注销 Hook。 |
+-| `hooks` | `unregisterPlugin` | 清理指定插件的所有 hooks |

@@ -1,0 +1,179 @@
+diff --git a/electron/services/workspace-manager.ts b/electron/services/workspace-manager.ts
+index f7f1d10..1fbb323 100644
+--- a/electron/services/workspace-manager.ts
++++ b/electron/services/workspace-manager.ts
+@@ -96,7 +96,6 @@ export class WorkspaceManager {
+       }
+     }
+     const path = this.getPathForWindow(win)
+-    console.log(`[WorkspaceManager] getPathForWebContents: win=${win?.id}, path=${path}`)
+     return path
+   }
+ 
+@@ -123,48 +122,68 @@ export class WorkspaceManager {
+     }
+   }
+ 
++  private saveLastWorkspacePath(pathStr: string): void {
++    try {
++      const file = join(app.getPath('userData'), 'last-workspace.json')
++      fs.writeFileSync(file, JSON.stringify({ path: pathStr, timestamp: Date.now() }), 'utf8')
++      console.log(`[WorkspaceManager:saveLastWorkspacePath] Saved last workspace path: "${pathStr}"`)
++    } catch (err) {
++      console.warn('[WorkspaceManager:saveLastWorkspacePath] Failed to save last workspace path:', err)
++    }
++  }
++
++  private getLastWorkspacePath(): string | null {
++    try {
++      const file = join(app.getPath('userData'), 'last-workspace.json')
++      if (fs.existsSync(file)) {
++        const content = fs.readFileSync(file, 'utf8')
++        const data = JSON.parse(content)
++        if (data && data.path && fs.existsSync(data.path)) {
++          return data.path
++        }
++      }
++    } catch (err) {
++      console.warn('[WorkspaceManager:getLastWorkspacePath] Failed to get last workspace path:', err)
++    }
++    return null
++  }
++
+   /**
+    * 获取初始工作区路径。
+-   * 始终确保默认工作区 ~/berrytrace_workspace/ 存在（不可删除的兜底）。
+-   * 如果历史中有其他有效工作区，优先返回历史中的；否则返回默认工作区。
+-   *
+-   * 优化：DB 未就绪时不阻塞启动，直接返回默认工作区。
+-   * "把默认工作区加入历史"等 DB 写入延后异步执行。
++   * 优先恢复用户上一次关闭前使用的有效工作区路径。
+    */
+   public getInitialWorkspacePath(): string | null {
+     try {
+-      // 1. 始终确保默认工作区存在（纯 fs 操作，不依赖 DB）
+-      const defaultWorkspace = getDefaultWorkspacePath();
+-      this.ensureDefaultWorkspace(defaultWorkspace);
+-
+-      // 2. DB 未就绪 → 直接返回默认工作区，历史操作延后异步执行
+-      const db = DatabaseManager.getInstance()
+-      if (!db.isReady()) {
+-        console.log('[WorkspaceManager] DB not ready yet, returning default workspace immediately. History sync deferred.')
+-        // DB 就绪后异步把默认工作区加入历史（不阻塞启动）
+-        db.whenReady().then(() => {
+-          this.ensureDefaultWorkspaceInHistory(defaultWorkspace)
+-        }).catch(() => { /* ignore */ })
+-        return defaultWorkspace
++      // 1. 始终确保默认工作区存在
++      const defaultWorkspace = getDefaultWorkspacePath()
++      this.ensureDefaultWorkspace(defaultWorkspace)
++
++      // 2. 优先返回用户最后一次打开/使用的工作区
++      const lastPath = this.getLastWorkspacePath()
++      if (lastPath && fs.existsSync(lastPath)) {
++        console.log(`[WorkspaceManager] Restored last active workspace: "${lastPath}"`)
++        return lastPath
+       }
+ 
+-      // 3. DB 就绪：走完整逻辑
+-      this.ensureDefaultWorkspaceInHistory(defaultWorkspace)
+-
+-      // 4. 查找历史中的有效工作区（优先返回非默认的）
+-      const history = this.getHistory();
+-      for (const entry of history) {
+-        if (entry.exists && entry.path) {
+-          return entry.path;
++      // 3. 若 DB 就绪，尝试从历史数组中查找有效工作区
++      const db = DatabaseManager.getInstance()
++      if (db.isReady()) {
++        const history = this.getHistory()
++        for (const entry of history) {
++          if (entry.exists && entry.path && fs.existsSync(entry.path)) {
++            console.log(`[WorkspaceManager] Found active workspace from history: "${entry.path}"`)
++            return entry.path
++          }
+         }
+       }
+ 
+-      // 5. 无历史 → 返回默认工作区
+-      return defaultWorkspace;
++      // 4. 无历史 → 返回默认工作区
++      console.log(`[WorkspaceManager] Falling back to default workspace: "${defaultWorkspace}"`)
++      return defaultWorkspace
+     } catch (err) {
+-      console.error('[WorkspaceManager] Failed to get initial workspace path:', err);
++      console.error('🚨 [WorkspaceManager:ERROR] Failed to get initial workspace path:', err)
+     }
+-    return null;
++    return getDefaultWorkspacePath()
+   }
+ 
+   /**
+@@ -360,11 +379,13 @@ export class WorkspaceManager {
+         try {
+           const content = fs.readFileSync(metaFile, 'utf8')
+           data = JSON.parse(content)
+-        } catch (_) {}
++        } catch (_) {
++          // ignore
++        }
+       }
+ 
+       let calendarUuid = Number(data.calendarUuid) || null
+-      let name = data.name || basename(p)
++      const name = data.name || basename(p)
+ 
+       if (!calendarUuid) {
+         calendarUuid = this.generateUuid()
+@@ -508,6 +529,7 @@ export class WorkspaceManager {
+ 
+     if (path) {
+       this.addToHistory(path)
++      this.saveLastWorkspacePath(path)
+ 
+       const dotFolder = join(path, WORKSPACE_DIR_NAME)
+       const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+@@ -933,7 +955,9 @@ export class WorkspaceManager {
+               return wsPath
+             }
+           }
+-        } catch {}
++        } catch {
++          // ignore
++        }
+         return null
+       }
+ 
+@@ -1052,8 +1076,8 @@ export class WorkspaceManager {
+                   const lowerLine = line.toLowerCase()
+                   const index = lowerLine.indexOf(cleanQuery)
+                   if (index !== -1) {
+-                    let start = Math.max(0, index - 20)
+-                    let end = Math.min(line.length, index + cleanQuery.length + 30)
++                    const start = Math.max(0, index - 20)
++                    const end = Math.min(line.length, index + cleanQuery.length + 30)
+                     let snippet = line.substring(start, end)
+                     if (start > 0) snippet = '...' + snippet
+                     if (end < line.length) snippet = snippet + '...'
+@@ -1102,7 +1126,9 @@ export class WorkspaceManager {
+         try {
+           const content = fs.readFileSync(metaFile, 'utf8')
+           data = JSON.parse(content)
+-        } catch (_) {}
++        } catch (_) {
++          // ignore
++        }
+       }
+       data.ribbonOrder = ribbonOrder
+       fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+@@ -1128,7 +1154,9 @@ export class WorkspaceManager {
+         try {
+           const content = fs.readFileSync(metaFile, 'utf8')
+           data = JSON.parse(content)
+-        } catch (_) {}
++        } catch (_) {
++          // ignore
++        }
+       }
+       data = { ...data, ...updates }
+       fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')

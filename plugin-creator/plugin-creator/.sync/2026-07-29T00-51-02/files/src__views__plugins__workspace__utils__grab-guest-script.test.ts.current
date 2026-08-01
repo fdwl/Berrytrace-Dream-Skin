@@ -1,0 +1,67 @@
+import { describe, it, expect } from 'vitest';
+import {
+  formatGrabPayloadAsMarkdown,
+  formatAnnotationAsMarkdown,
+  buildRenderPinsScript,
+  buildGuestOverlayScript,
+} from './grab-guest-script';
+
+describe('Grab & Annotate Guest Script Engine Tests', () => {
+  it('should format DOM grab payload to clean markdown', () => {
+    const payload = {
+      page: { sanitizedUrl: 'https://example.com/test', title: 'Test Page' },
+      target: {
+        tagName: 'button',
+        selector: 'button.submit-btn',
+        textSnippet: 'Submit Now',
+        htmlSnippet: '<button class="submit-btn">Submit Now</button>',
+        accessibility: { accessibleName: 'Submit Form' },
+        rectViewport: { width: 120, height: 40 },
+      },
+    };
+
+    const markdown = formatGrabPayloadAsMarkdown(payload);
+    expect(markdown).toContain('Attached browser element from https://example.com/test');
+    expect(markdown).toContain('**Target:** `<button>`');
+    expect(markdown).toContain('**Selector:** `button.submit-btn`');
+    expect(markdown).toContain('**Text:**');
+    expect(markdown).toContain('Submit Now');
+  });
+
+  it('should format page annotation to clean markdown with intent', () => {
+    const payload = {
+      page: { sanitizedUrl: 'https://example.com/test', title: 'Test Page' },
+      target: {
+        tagName: 'input',
+        selector: 'input#username',
+        textSnippet: '',
+      },
+    };
+
+    const markdown = formatAnnotationAsMarkdown(payload, 'Please fix font size', 'fix');
+    expect(markdown).toContain('## Design Feedback: Test Page');
+    expect(markdown).toContain('**Target:** `<input>`');
+    expect(markdown).toContain('**Selector:** `input#username`');
+    expect(markdown).toContain('**Feedback Comment:** Please fix font size');
+  });
+
+  it('should build render pins script with highest z-index & BERRYTRACE_PIN_CLICK console message', () => {
+    const annotations = [
+      { id: 'ann-1', selector: 'div.header', comment: 'Fix header height', intent: 'change' },
+      { id: 'ann-2', selector: 'button.cta', comment: 'Change button color', intent: 'fix' },
+    ];
+
+    const script = buildRenderPinsScript(annotations);
+    expect(script).toContain('__berrytrace-pins-host');
+    expect(script).toContain('BERRYTRACE_PIN_CLICK:');
+    expect(script).toContain('z-index:2147483647');
+    expect(script).toContain('ann-1');
+    expect(script).toContain('ann-2');
+  });
+
+  it('should include pin click bypass check in ARM script', () => {
+    const armScript = buildGuestOverlayScript('arm');
+    expect(armScript).toContain('__berrytrace-pins-host');
+    expect(armScript).toContain('closest');
+  });
+});

@@ -1,0 +1,141 @@
+diff --git a/electron/services/session-resource-manager.ts b/electron/services/session-resource-manager.ts
+new file mode 100644
+index 0000000..fb0906d
+--- /dev/null
++++ b/electron/services/session-resource-manager.ts
+@@ -0,0 +1,135 @@
++/**
++ * SessionResourceManager — 主进程统一会话资源生命周期管理器
++ *
++ * 职责：
++ * 1. 维护 V4 规范规范目录树 (.berrytrace/sessions/{sessionId}/)
++ * 2. 读写及增量更新 session.json Manifest
++ * 3. 级联清理会话物理文件（V4 主目录 + V3 存量旧路径）
++ * 4. 后台自动 GC 超过保留天数的旧会话孤儿资源
++ */
++
++import { promises as fs } from 'fs';
++import { join } from 'path';
++import * as os from 'os';
++
++export interface DeleteResult {
++  sessionId: string;
++  freedBytes: number;
++  freedFiles: number;
++}
++
++export interface SessionManifest {
++  sessionId: string;
++  version: number;
++  createdAt: string;
++  updatedAt: string;
++  stats: {
++    totalFileCount: number;
++    totalSizeBytes: number;
++    assetCount: number;
++    assetSizeBytes: number;
++  };
++  resources: {
++    assets: any[];
++    scripts: any[];
++    outputs: any[];
++    screenshots: any[];
++  };
++}
++
++export class SessionResourceManager {
++  /**
++   * 加载指定会话的 session.json Manifest
++   */
++  static async loadManifest(sessionId: string, workDir: string): Promise<SessionManifest | null> {
++    if (!workDir || !sessionId) return null;
++    const manifestPath = join(workDir, '.berrytrace', 'sessions', sessionId, 'session.json');
++    try {
++      const content = await fs.readFile(manifestPath, 'utf-8');
++      return JSON.parse(content) as SessionManifest;
++    } catch {
++      return null;
++    }
++  }
++
++  /**
++   * 彻底清理一个会话在磁盘上的所有关联文件（级联销毁）
++   */
++  static async deleteSession(sessionId: string, workDir: string): Promise<DeleteResult> {
++    if (!sessionId) {
++      return { sessionId, freedBytes: 0, freedFiles: 0 };
++    }
++
++    const manifest = workDir ? await this.loadManifest(sessionId, workDir) : null;
++    const freedBytes = manifest?.stats?.totalSizeBytes || 0;
++    const freedFiles = manifest?.stats?.totalFileCount || 0;
++
++    // 1. 销毁 V4 规范会话主目录
++    if (workDir) {
++      const sessionDir = join(workDir, '.berrytrace', 'sessions', sessionId);
++      try {
++        await fs.rm(sessionDir, { recursive: true, force: true });
++        console.log(`[SessionResourceManager] Deleted V4 session dir: ${sessionDir}`);
++      } catch (err) {
++        console.warn(`[SessionResourceManager] Failed to remove V4 session dir ${sessionDir}:`, err);
++      }
++    }
++
++    // 2. 清理 V3 存量旧路径（向下兼容）
++    if (workDir) {
++      const legacyPaths = [
++        join(workDir, '.berrytrace', 'tool-outputs', sessionId),
++        join(workDir, '.berrytrace', 'history', `${sessionId}.messages.json`),
++        join(workDir, '.berrytrace', 'tmp', 'backups', sessionId),
++        join(os.homedir(), '.berrytrace', 'plans', `${sessionId}.json`),
++      ];
++      for (const p of legacyPaths) {
++        try {
++          await fs.rm(p, { recursive: true, force: true });
++        } catch {
++          // 忽略已不存在的文件夹
++        }
++      }
++    }
++
++    return { sessionId, freedBytes, freedFiles };
++  }
++
++  /**
++   * GC 自动清理：删除超过 retentionDays 天的旧会话文件目录
++   */
++  static async gcExpiredSessions(workDir: string, retentionDays: number = 30): Promise<DeleteResult[]> {
++    if (!workDir) return [];
++
++    const sessionsParentDir = join(workDir, '.berrytrace', 'sessions');
++    const results: DeleteResult[] = [];
++
++    try {
++      const entries = await fs.readdir(sessionsParentDir, { withFileTypes: true });
++      const now = Date.now();
++      const maxAgeMs = retentionDays * 24 * 60 * 60 * 1000;
++
++      for (const entry of entries) {
++        if (!entry.isDirectory()) continue;
++        const sessionId = entry.name;
++        const sessionDir = join(sessionsParentDir, sessionId);
++
++        try {
++          const stat = await fs.stat(sessionDir);
++          const age = now - stat.mtimeMs;
++          if (age > maxAgeMs) {
++            const delRes = await this.deleteSession(sessionId, workDir);
++            results.push(delRes);
++            console.log(`[SessionResourceManager:GC] Cleaned expired session: ${sessionId} (Age: ${(age / (1000 * 3600 * 24)).toFixed(1)} days)`);
++          }
++        } catch {
++          // 跳过只读或删除失败项
++        }
++      }
++    } catch {
++      // .berrytrace/sessions 目录不存在时直接返回
++    }
++
++    return results;
++  }
++}

@@ -1,0 +1,410 @@
+diff --git a/plugins-sdk/cli.js b/plugins-sdk/cli.js
+index c52df96..842a798 100755
+--- a/plugins-sdk/cli.js
++++ b/plugins-sdk/cli.js
+@@ -475,6 +475,46 @@ async function performSdkBuild(pluginPath) {
+         },
+       };
+ 
++      // ─────────────────────────────────────────────────────────────────────────
++      // 全局 shim 插件组（Global Shim Plugins）
++      //
++      // 作用：将浏览器沙箱（view 层）无法通过 node_modules 解析的 bare specifier，
++      //       替换为从宿主已挂载的 window 全局变量读取，避免 ESM 解析失败。
++      //
++      // ⚠️  【维护协议 - SKILL.md 版本扫描热点】
++      //
++      // 宿主全局变量定义在：src/main.tsx
++      // 当 src/main.tsx 新增 window.Xxx 挂载时，必须同步更新以下两处：
++      //
++      //   1. 本文件（cli.js）globalReactPlugin / globalSdkPlugin 的 shim 内容
++      //      → 新增对应的 onResolve + onLoad 处理分支
++      //
++      //   2. npx-tools/skills/plugin-creator/references/08-build.md
++      //      → 更新"SDK 内置构建已自动处理的 shim"表格
++      //
++      // 当前已 shim 的全局变量一览（与 src/main.tsx 保持同步）：
++      //
++      //   window.React        ← react, react/jsx-runtime, react/jsx-dev-runtime
++      //   window.ReactDOM     ← react-dom, react-dom/client
++      //   window.Zustand      ← zustand
++      //   window.__lucide     ← lucide-react
++      //   window.berrytrace   ← berrytrace-plugin-sdk（SDK 实例）
++      //   window.useUserStore ← @/stores/user（通过 globalHostImportsPlugin 处理）
++      //   window.useAppStore  ← @/stores/app
++      //   window.httpService  ← @/services/http
++      //   window.event_bus    ← @/services/event_bus
++      //   window.publish_bridge ← @/services/publish_bridge
++      //   window.PluginRegistry ← @/plugins/PluginRegistry
++      //
++      // ⚠️  lucide-react 图标列表是静态枚举，不能自动枚举 window.__lucide 的 key。
++      //     原因：esbuild tree-shaking 依赖静态 named export 分析，动态 key 会
++      //     导致所有图标被强制打包（或全部 tree-shake 掉）。
++      //     解决方案：当 lucide-react 发布新图标且插件需要使用时，在下方
++      //     lucide-react shim 的 contents 中手动补充对应的 export 语句。
++      //     图标名参考：https://lucide.dev/icons/
++      //
++      // ─────────────────────────────────────────────────────────────────────────
++
+       const globalSdkPlugin = {
+         name: 'berrytrace-global-sdk-plugin',
+         setup(buildContext) {
+@@ -500,7 +540,7 @@ async function performSdkBuild(pluginPath) {
+         name: 'berrytrace-global-react-plugin',
+         setup(buildContext) {
+           buildContext.onResolve({ filter: /.*/ }, args => {
+-            const matches = ['react', 'react-dom', 'react-dom/client', 'zustand'];
++            const matches = ['react', 'react-dom', 'react-dom/client', 'zustand', 'lucide-react', 'xterm', 'xterm-addon-fit', 'react-tooltip'];
+             if (matches.includes(args.path) || args.path.startsWith('react/') || args.path.startsWith('react-dom/')) {
+               return { path: args.path, namespace: 'global-react-ns' };
+             }
+@@ -591,11 +631,197 @@ async function performSdkBuild(pluginPath) {
+                 loader: 'js'
+               };
+             }
++            // lucide-react → window.__lucide（宿主 main.tsx 已暴露）
++            if (args.path === 'lucide-react') {
++              return {
++                contents: `
++                  const _L = (typeof window !== 'undefined' ? window : globalThis).__lucide || {};
++                  export default _L;
++                  // Proxy getter：任意 named import 均从 window.__lucide 取，实现按需访问
++                  export const Loader2         = _L.Loader2;
++                  export const CheckCircle2    = _L.CheckCircle2;
++                  export const AlertCircle     = _L.AlertCircle;
++                  export const Circle          = _L.Circle;
++                  export const Wrench          = _L.Wrench;
++                  export const X               = _L.X;
++                  export const Terminal        = _L.Terminal;
++                  export const Database        = _L.Database;
++                  export const FileCode        = _L.FileCode;
++                  export const Sparkles        = _L.Sparkles;
++                  export const RefreshCw       = _L.RefreshCw;
++                  export const Upload          = _L.Upload;
++                  export const Server          = _L.Server;
++                  export const HardDrive       = _L.HardDrive;
++                  export const Globe           = _L.Globe;
++                  export const Plus            = _L.Plus;
++                  export const Trash2          = _L.Trash2;
++                  export const Lock            = _L.Lock;
++                  export const Settings2       = _L.Settings2;
++                  export const Zap             = _L.Zap;
++                  export const Eye             = _L.Eye;
++                  export const MoreVertical    = _L.MoreVertical;
++                  export const ArrowLeft       = _L.ArrowLeft;
++                  export const ArrowRight      = _L.ArrowRight;
++                  export const ArrowUp         = _L.ArrowUp;
++                  export const ArrowDown       = _L.ArrowDown;
++                  export const Link2           = _L.Link2;
++                  export const AlertTriangle   = _L.AlertTriangle;
++                  export const Save            = _L.Save;
++                  export const ChevronDown     = _L.ChevronDown;
++                  export const ChevronUp       = _L.ChevronUp;
++                  export const ChevronLeft     = _L.ChevronLeft;
++                  export const ChevronRight    = _L.ChevronRight;
++                  export const Info            = _L.Info;
++                  export const Search          = _L.Search;
++                  export const Copy            = _L.Copy;
++                  export const ExternalLink    = _L.ExternalLink;
++                  export const Check           = _L.Check;
++                  export const Edit            = _L.Edit;
++                  export const Edit2           = _L.Edit2;
++                  export const Edit3           = _L.Edit3;
++                  export const Pencil          = _L.Pencil;
++                  export const Folder          = _L.Folder;
++                  export const FolderOpen      = _L.FolderOpen;
++                  export const File            = _L.File;
++                  export const FileText        = _L.FileText;
++                  export const Network         = _L.Network;
++                  export const Shield          = _L.Shield;
++                  export const Key             = _L.Key;
++                  export const Clock           = _L.Clock;
++                  export const Activity        = _L.Activity;
++                  export const Table           = _L.Table;
++                  export const Code            = _L.Code;
++                  export const Filter          = _L.Filter;
++                  export const List            = _L.List;
++                  export const Grid            = _L.Grid;
++                  export const Settings        = _L.Settings;
++                  export const User            = _L.User;
++                  export const Users           = _L.Users;
++                  export const Home            = _L.Home;
++                  export const Bell            = _L.Bell;
++                  export const LogOut          = _L.LogOut;
++                  export const LogIn           = _L.LogIn;
++                  export const Power           = _L.Power;
++                  export const Download        = _L.Download;
++                  export const Share           = _L.Share;
++                  export const Share2          = _L.Share2;
++                  export const Star            = _L.Star;
++                  export const Heart           = _L.Heart;
++                  export const Tag             = _L.Tag;
++                  export const Tags            = _L.Tags;
++                  export const Bookmark        = _L.Bookmark;
++                  export const Link            = _L.Link;
++                  export const Image           = _L.Image;
++                  export const Video           = _L.Video;
++                  export const Music           = _L.Music;
++                  export const Package         = _L.Package;
++                  export const Layers          = _L.Layers;
++                  export const GitBranch       = _L.GitBranch;
++                  export const BarChart        = _L.BarChart;
++                  export const BarChart2       = _L.BarChart2;
++                  export const LineChart       = _L.LineChart;
++                  export const PieChart        = _L.PieChart;
++                  export const TrendingUp      = _L.TrendingUp;
++                  export const TrendingDown    = _L.TrendingDown;
++                  export const Map             = _L.Map;
++                  export const Menu            = _L.Menu;
++                  export const MoreHorizontal  = _L.MoreHorizontal;
++                  export const Clipboard       = _L.Clipboard;
++                  export const ClipboardCheck  = _L.ClipboardCheck;
++                  export const ThumbsUp        = _L.ThumbsUp;
++                  export const ThumbsDown      = _L.ThumbsDown;
++                  export const Flag            = _L.Flag;
++                  export const Paperclip       = _L.Paperclip;
++                  export const MinusCircle     = _L.MinusCircle;
++                  export const PlusCircle      = _L.PlusCircle;
++                  export const RefreshCcw      = _L.RefreshCcw;
++                  export const RotateCcw       = _L.RotateCcw;
++                  export const RotateCw        = _L.RotateCw;
++                  export const Cpu             = _L.Cpu;
++                  export const Wifi            = _L.Wifi;
++                  export const WifiOff         = _L.WifiOff;
++                  export const Bot             = _L.Bot;
++                  export const Wand            = _L.Wand;
++                  export const Wand2           = _L.Wand2;
++                  export const Microscope      = _L.Microscope;
++                  export const FlaskConical    = _L.FlaskConical;
++                  export const Play            = _L.Play;
++                  export const Pause           = _L.Pause;
++                  export const Stop            = _L.Stop;
++                  export const Volume2         = _L.Volume2;
++                  export const VolumeX         = _L.VolumeX;
++                  export const Maximize        = _L.Maximize;
++                  export const Minimize        = _L.Minimize;
++                  export const ChevronUpDown   = _L.ChevronUpDown;
++                  export const ChevronsUpDown  = _L.ChevronsUpDown;
++                  export const SortAsc         = _L.SortAsc;
++                  export const SortDesc        = _L.SortDesc;
++                  export const LayoutGrid      = _L.LayoutGrid;
++                  export const LayoutList      = _L.LayoutList;
++                  export const Sidebar         = _L.Sidebar;
++                  export const PanelLeft       = _L.PanelLeft;
++                  export const PanelRight      = _L.PanelRight;
++                  export const MessageSquare   = _L.MessageSquare;
++                  export const MessageCircle   = _L.MessageCircle;
++                  export const Send            = _L.Send;
++                  export const AtSign          = _L.AtSign;
++                  export const Hash            = _L.Hash;
++                  export const AlertOctagon    = _L.AlertOctagon;
++                  export const XCircle         = _L.XCircle;
++                  export const CheckCircle     = _L.CheckCircle;
++                  export const HelpCircle      = _L.HelpCircle;
++                  export const Lightbulb       = _L.Lightbulb;
++                  export const Zap2            = _L.Zap2;
++                  export const Gauge           = _L.Gauge;
++                  export const Sliders         = _L.Sliders;
++                  export const SlidersHorizontal = _L.SlidersHorizontal;
++                  export const Mic             = _L.Mic;
++                  export const PackageCheck    = _L.PackageCheck;
++                  export const Square          = _L.Square;
++                  export const Monitor         = _L.Monitor;
++                  export const Cloud           = _L.Cloud;
++                  export const Cat             = _L.Cat;
++                  export const Swords          = _L.Swords;
++                  export const Ghost           = _L.Ghost;
++                  export const Moon            = _L.Moon;
++                `,
++                loader: 'js'
++              };
++            }
++            if (args.path === 'xterm') {
++              return {
++                contents: `
++                  const XTerm = (typeof window !== 'undefined' ? window : globalThis).XTerm || {};
++                  export const Terminal = XTerm.Terminal;
++                `,
++                loader: 'js'
++              };
++            }
++            if (args.path === 'xterm-addon-fit') {
++              return {
++                contents: `
++                  const XTerm = (typeof window !== 'undefined' ? window : globalThis).XTerm || {};
++                  export const FitAddon = XTerm.FitAddon;
++                `,
++                loader: 'js'
++              };
++            }
++            if (args.path === 'react-tooltip') {
++              return {
++                contents: `
++                  const ReactTooltip = (typeof window !== 'undefined' ? window : globalThis).ReactTooltip;
++                  export default ReactTooltip;
++                  export const Tooltip = ReactTooltip;
++                `,
++                loader: 'js'
++              };
++            }
+             return null;
+           });
+         }
+       };
+ 
++
+       // 共享宿主核心单例状态，防止在插件内部多次打包生成副本导致状态脱节
+       const globalHostImportsPlugin = {
+         name: 'berrytrace-global-host-imports-plugin',
+@@ -697,7 +923,7 @@ async function performSdkBuild(pluginPath) {
+         platform: 'browser',
+         target: ['es2022'],
+         format: 'esm',
+-        minify: false,
++        minify: true,
+         jsxFactory: 'React.createElement',
+         jsxFragment: 'React.Fragment',
+         plugins: [globalHostImportsPlugin, aliasPlugin, cssPlugin, globalSdkPlugin, globalReactPlugin],
+@@ -868,10 +1094,51 @@ function packPlugin(pluginPath = process.cwd()) {
+       const parts = normalizedPath.split('/');
+       const firstPart = parts[0];
+       const part0Lower = firstPart.toLowerCase();
++      const fileNameLower = parts[parts.length - 1].toLowerCase();
+ 
+-      // 1. 生产依赖 node_modules 打包过滤
++      // 1. 无论在哪个路径（包括 node_modules），都排除开发/临时/机密/无用源码及文档文件
++      if (
++        part0Lower === '.git' ||
++        part0Lower === 'private_key.pem' ||
++        part0Lower === 'public_key.pem' ||
++        part0Lower === '.ds_store' ||
++        fileNameLower === '.ds_store' ||
++        normalizedPath.endsWith('.btp') ||
++        part0Lower === '.gitignore' ||
++        part0Lower === 'package-lock.json' ||
++        part0Lower === 'pnpm-lock.yaml' ||
++        part0Lower === 'yarn.lock' ||
++        part0Lower === 'src' ||
++        part0Lower === 'scripts' ||
++        part0Lower === '.github' ||
++        part0Lower === '.idea' ||
++        part0Lower === '.vscode' ||
++        part0Lower === '.cursor' ||
++        fileNameLower.endsWith('.map') ||
++        parts.includes('test') ||
++        parts.includes('tests') ||
++        parts.includes('__tests__') ||
++        parts.includes('docs') ||
++        fileNameLower.endsWith('.cpp') ||
++        fileNameLower.endsWith('.hpp') ||
++        fileNameLower.endsWith('.c') ||
++        fileNameLower.endsWith('.h') ||
++        fileNameLower.endsWith('.o') ||
++        fileNameLower.endsWith('.obj')
++      ) {
++        return false;
++      }
++
++      // 排除非声明文件的 TypeScript 源码
++      if (fileNameLower.endsWith('.ts') || fileNameLower.endsWith('.tsx')) {
++        if (!fileNameLower.endsWith('.d.ts')) {
++          return false;
++        }
++      }
++
++      // 2. 生产依赖 node_modules 打包过滤
+       if (part0Lower === 'node_modules') {
+-        // 如果是处于 .berrytrace/tmp/pack- 的临时构建沙箱中，放行整个 node_modules (已被 npm install --omit=dev 精准裁剪)
++        // 如果是处于 .berrytrace/tmp/pack- 的临时构建沙箱中，放行通过上述通用过滤规则的 node_modules
+         if (pluginPath.includes('.berrytrace') && pluginPath.includes('pack-')) {
+           return true;
+         }
+@@ -901,29 +1168,8 @@ function packPlugin(pluginPath = process.cwd()) {
+         return false; // 默认排除未声明在 dependencies 中的开发依赖
+       }
+ 
+-      // 无论如何都要排除的开发/临时/机密文件夹和文件 (不区分大小写)
+-      if (
+-        part0Lower === '.git' ||
+-        part0Lower === 'private_key.pem' ||
+-        part0Lower === 'public_key.pem' ||
+-        part0Lower === '.ds_store' ||
+-        normalizedPath.endsWith('.btp') ||
+-        part0Lower === '.gitignore' ||
+-        part0Lower === 'package-lock.json' ||
+-        part0Lower === 'pnpm-lock.yaml' ||
+-        part0Lower === 'yarn.lock' ||
+-        part0Lower === 'src' ||
+-        part0Lower === 'scripts' ||
+-        part0Lower === '.github' ||
+-        part0Lower === '.idea' ||
+-        part0Lower === '.vscode' ||
+-        part0Lower === '.cursor'
+-      ) {
+-        return false;
+-      }
+-
+       if (hasDist) {
+-        // 如果有 dist 目录，允许打包 dist、skills(Skills)、.skills、node_modules 目录，以及根目录下的特定元数据文件
++        // 如果有 dist 目录，允许打包 dist、skills(Skills)、.skills 目录，以及根目录下的特定元数据文件
+         const isMetaFile = parts.length === 1 && (
+           firstPart === 'plugin.json' ||
+           firstPart === 'package.json' ||
+@@ -935,13 +1181,11 @@ function packPlugin(pluginPath = process.cwd()) {
+         const isInAllowedDir = (
+           part0Lower === 'dist' ||
+           part0Lower === 'skills' ||
+-          part0Lower === '.skills' ||
+-          part0Lower === 'node_modules'
++          part0Lower === '.skills'
+         );
+         return isInAllowedDir || isMetaFile;
+       } else {
+-        // 如果没有 dist 目录，排除常见的开发配置文件和扩展名
+-        const fileNameLower = parts[parts.length - 1].toLowerCase();
++        // 如果没有 dist 目录，排除常见的开发配置文件
+         if (
+           fileNameLower === 'tsconfig.json' ||
+           fileNameLower.startsWith('tsconfig.') ||
+@@ -955,20 +1199,6 @@ function packPlugin(pluginPath = process.cwd()) {
+         ) {
+           return false;
+         }
+-
+-        // 排除非编译输出的源码文件格式
+-        if (
+-          fileNameLower.endsWith('.ts') ||
+-          fileNameLower.endsWith('.tsx') ||
+-          fileNameLower.endsWith('.vue') ||
+-          fileNameLower.endsWith('.scss') ||
+-          fileNameLower.endsWith('.sass') ||
+-          fileNameLower.endsWith('.less')
+-        ) {
+-          if (!fileNameLower.endsWith('.d.ts')) {
+-            return false;
+-          }
+-        }
+         return true;
+       }
+     });
+@@ -1014,7 +1244,19 @@ function packPlugin(pluginPath = process.cwd()) {
+ 
+   const outputFilename = `${id}-${version}.btp`;
+   const outputPath = path.join(pluginPath, outputFilename);
+-  zip.writeZip(outputPath);
++  if (fs.existsSync(outputPath)) {
++    try {
++      fs.unlinkSync(outputPath);
++    } catch (e) {
++      // 忽略前置清理发生的未找到错误
++    }
++  }
++  try {
++    zip.writeZip(outputPath);
++  } catch (err) {
++    console.error(`🚨 [Packager:ERROR] 写入插件包 ${outputPath} 失败: ${err.message}`);
++    throw err;
++  }
+ 
+   console.log(`\n✓ 插件打包和签名成功！`);
+   console.log(`安装包已保存至: ${outputPath}`);

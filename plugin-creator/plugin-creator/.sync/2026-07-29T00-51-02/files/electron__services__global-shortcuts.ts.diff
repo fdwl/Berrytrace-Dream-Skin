@@ -1,0 +1,34 @@
+diff --git a/electron/services/global-shortcuts.ts b/electron/services/global-shortcuts.ts
+index b5dbfa0..7b70360 100644
+--- a/electron/services/global-shortcuts.ts
++++ b/electron/services/global-shortcuts.ts
+@@ -1,4 +1,4 @@
+-import { globalShortcut, BrowserWindow } from 'electron'
++import { app, globalShortcut, BrowserWindow } from 'electron'
+ import { cache, CacheAttribute } from '../config/index'
+ import { ElectronMainWindow } from '../windows/main-window'
+ 
+@@ -72,6 +72,10 @@ export class ElectronGlobalShortcuts {
+   }
+ 
+   public registerGlobalShortcuts(): void {
++    if (!app.isReady()) {
++      console.warn('⚠️ [ElectronGlobalShortcuts] app is not ready yet, skipping registerGlobalShortcuts.')
++      return
++    }
+     globalShortcut.unregisterAll()
+ 
+     const bufferShortcut: string | null = null
+@@ -169,6 +173,10 @@ export class ElectronGlobalShortcuts {
+   }
+ 
+   public unregisterAll(): void {
+-    globalShortcut.unregisterAll()
++    if (app.isReady()) {
++      globalShortcut.unregisterAll()
++    } else {
++      console.log('[ElectronGlobalShortcuts] app is not ready, skipping unregisterAll.')
++    }
+   }
+ }
+\ No newline at end of file

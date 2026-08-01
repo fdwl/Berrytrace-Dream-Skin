@@ -1,0 +1,1155 @@
+import { ipcMain, BrowserWindow, nativeTheme, IpcMainEvent, powerMonitor, app } from 'electron';
+import { join, dirname } from 'path';
+import { promises as fs } from 'fs';
+import * as fsSync from 'fs';
+import { createRequire } from 'module';
+import { McpHost } from './mcp-host';
+import { cache } from '../config/index';
+import { CacheAttribute } from '../../src/config/CacheAttribute';
+import { PLUGINS_DIR, BERRYTRACE_HOME } from '../config/paths';
+import { ElectronFloatBall } from '../windows/float-ball';
+import { ElectronSelection } from '../services/selection';
+import { PluginUpdater } from './plugin-update';
+import { PluginManifest } from './plugin-verifier';
+import { PluginScanner, ScannedPlugin } from './plugin-scanner';
+import { PluginLauncher } from './plugin-launcher';
+import { EventSubscriptionRegistry } from './event-subscription-registry';
+import eventBus from '../../src/services/event_bus';
+import { registerIpcHandlers } from './plugin-ipc';
+import { createMainSDKInstance } from './main-sdk-creator';
+import { isVersionNewer } from './plugin-utils';
+import {
+  getPluginsByExtension,
+  getResolvedUrl,
+  openPluginWindow
+} from './plugin-url-helper';
+import {
+  getAgentKernelPluginId,
+  ensureAgentKernelRunning,
+  listAgentKernelPluginIds
+} from './plugin-agent-kernel';
+import { PluginWatchdog } from './plugin-watchdog';
+
+export type PluginLifecycleAction =
+  | 'initial-load'
+  | 'enable'
+  | 'disable'
+  | 'uninstall'
+  | 'reload'
+  | 'install'
+  | 'unload'
+  | 'normal';
+
+export type PluginLoadMode = 'setup' | 'normal';
+
+export interface PluginLifecycleContext {
+  action: PluginLifecycleAction;
+  loadMode: PluginLoadMode;
+  updatedAt: string;
+  trigger?: {
+    eventName: string;
+    payload: any;
+  };
+}
+
+/**
+ * 获取插件根目录。
+ * @returns ~/.berrytrace/plugins/
+ */
+export function getPluginRootDir(): string {
+  return PLUGINS_DIR;
+}
+
+export class PluginManager {
+  private static instance: PluginManager;
+  private plugins = new Map<string, ScannedPlugin>();
+  private ipcHandlersRegistered = false;
+  private pluginLifecycleContext = new Map<string, PluginLifecycleContext>();
+  private initPromise: Promise<void> | null = null;
+  private systemIdleTrackerInterval: NodeJS.Timeout | null = null;
+  private isUserIdleState = false;
+  private loadedPluginsSet = new Set<string>();
+  private loadingPromises = new Map<string, Promise<void>>();
+  private earlyInitComplete = false;
+  private deferredInitComplete = false;
+  private idleTrackerStarted = false;
+
+  private pendingReloads = new Set<string>();
+
+  // 插件空闲回收：常驻状态通过 plugin.json 的 "resident": true 声明，不再硬编码 ID
+  private pluginLastActiveTime = new Map<string, number>();
+  private pluginIdleCheckInterval: NodeJS.Timeout | null = null;
+  private readonly PLUGINS_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟无活动自动释放
+
+  private constructor() {
+    this.registerIpcHandlers();
+    this.startWatchdog();
+
+    // 注册 EventBus 跨进程广播桥接：eventBus.emit(事件, payload, { broadcast: true }) → 转发到所有插件
+    import('../../src/services/event_bus').then(({ default: eventBus }) => {
+      eventBus.setBroadcastHandler((event, payload) => this.broadcastSystemEvent(event, payload));
+    });
+  }
+
+  /**
+   * 延后启动系统空闲跟踪器，避免启动早期 1 秒间隔轮询抢占资源。
+   */
+  public startIdleTrackerIfNeeded(): void {
+    if (this.idleTrackerStarted) return;
+    this.idleTrackerStarted = true;
+    this.startSystemIdleTracker();
+    this.startPluginsIdleTracker();
+  }
+
+  public recordPluginActivity(pluginId: string): void {
+    this.pluginLastActiveTime.set(pluginId, Date.now());
+  }
+
+  public destroy(): void {
+    console.log('[PluginManager] Shutting down plugin manager and terminating all plugin processes...');
+
+    // 1. Stop the idle tracker interval
+    if (this.pluginIdleCheckInterval) {
+      clearInterval(this.pluginIdleCheckInterval);
+      this.pluginIdleCheckInterval = null;
+    }
+    if (this.systemIdleTrackerInterval) {
+      clearInterval(this.systemIdleTrackerInterval);
+      this.systemIdleTrackerInterval = null;
+    }
+
+    // 2. Stop watchdog
+    try {
+      PluginWatchdog.getInstance().stop();
+    } catch (err) {
+      console.error('[PluginManager] Error stopping watchdog on shutdown:', err);
+    }
+
+    // 3. Force kill all child processes in the launcher
+    try {
+      const { PluginLauncher } = require('./plugin-launcher');
+      const backgroundProcesses = PluginLauncher.getInstance().getBackgroundProcesses();
+      for (const [id, proc] of backgroundProcesses.entries()) {
+        console.log(`[PluginManager] Force killing background process for plugin: ${id}`);
+        try {
+          proc.kill();
+        } catch (err) {
+          console.error(`[PluginManager] Failed to kill background process for ${id}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error('[PluginManager] Error killing background processes on shutdown:', err);
+    }
+
+    // 4. Force kill PoolHost if it is still running
+    try {
+      const { PluginPool } = require('./plugin-pool');
+      PluginPool.getInstance().killHost();
+    } catch (err) {
+      console.error('[PluginManager] Error killing PoolHost on shutdown:', err);
+    }
+  }
+
+  private startPluginsIdleTracker(): void {
+    if (this.pluginIdleCheckInterval) return;
+
+    this.pluginIdleCheckInterval = setInterval(async () => {
+      const now = Date.now();
+      const { ElectronFloatBall } = require('../windows/float-ball');
+
+      for (const pluginId of Array.from(this.loadedPluginsSet)) {
+        // 1. 跳过常驻插件（plugin.json 声明 resident: true）
+        const plugin = this.plugins.get(pluginId);
+        if (plugin?.manifest.resident) continue;
+
+        // 2. 如果当前插件有正在开启的悬浮球或悬浮网页窗口，跳过释放
+        if (ElectronFloatBall.getInstance().hasPluginWindows(pluginId)) continue;
+
+        // 3. 如果当前插件被标记为忙碌，跳过释放并重置活跃时间
+        if (PluginLauncher.getInstance().isPluginBusy(pluginId)) {
+          this.recordPluginActivity(pluginId);
+          continue;
+        }
+
+        // 4. 计算空闲时间
+        const lastActive = this.pluginLastActiveTime.get(pluginId) || 0;
+        const timeout = plugin?.manifest.idleTimeout ?? this.PLUGINS_IDLE_TIMEOUT_MS;
+        if (now - lastActive > timeout) {
+          // 仅自动卸载有后台/混合进程且空闲超时的插件，前端 panel 渲染层在 UI 销毁时会随路由按需清理
+          if (plugin && (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid')) {
+            console.log(`[PluginManager] Plugin "${pluginId}" has been idle for ${Math.round((now - lastActive) / 1000)}s (> ${timeout / 1000}s). Automatically unloading background process to free memory...`);
+            try {
+              await this.deactivatePlugin(pluginId);
+            } catch (err) {
+              console.error(`[PluginManager] Failed to idle-unload plugin "${pluginId}":`, err);
+            }
+          }
+        }
+      }
+    }, 30000); // 每 30 秒检查一次
+  }
+
+
+  public static getInstance(): PluginManager {
+    if (!PluginManager.instance) {
+      PluginManager.instance = new PluginManager();
+    }
+    return PluginManager.instance;
+  }
+
+  /**
+   * 启动看门狗，把 restart/kill 回调绑定到 PluginLauncher
+   */
+  private startWatchdog(): void {
+    const launcher = PluginLauncher.getInstance();
+    PluginWatchdog.getInstance().start(
+      async (pluginId) => {
+        // 重启回调：先彻底停用并清理旧状态（卸载池化或杀死独立进程，重置 loadedPluginsSet），再重新启动
+        await this.deactivatePlugin(pluginId);
+        const plugin = this.plugins.get(pluginId);
+        if (plugin) {
+          const context = this.pluginLifecycleContext.get(pluginId);
+          await launcher.startBackgroundPlugin(pluginId, plugin.path, plugin.manifest, context);
+        } else {
+          console.warn(`[PluginManager:startWatchdog] Cannot restart "${pluginId}": plugin not found in registry`);
+        }
+      },
+      (pluginId) => {
+        // kill 回调：轻量 kill，不删除 watchdog 记录（watchdog 负责记录）
+        launcher.killBackgroundPlugin(pluginId);
+      }
+    );
+    // 注入 busy 查询函数：忙碌插件（如下载模型期间）豁免心跳超时 kill
+    PluginWatchdog.getInstance().setIsPluginBusyFn((id) => launcher.isPluginBusy(id));
+    console.log('[PluginManager] PluginWatchdog started');
+  }
+
+  private startSystemIdleTracker(): void {
+    if (this.systemIdleTrackerInterval) return;
+
+    const IDLE_THRESHOLD_SEC = 60; // 60 seconds
+
+    this.systemIdleTrackerInterval = setInterval(() => {
+      try {
+        const idleTime = powerMonitor.getSystemIdleTime();
+        if (idleTime >= IDLE_THRESHOLD_SEC) {
+          if (!this.isUserIdleState) {
+            this.isUserIdleState = true;
+            console.log(`[PluginManager] System detected user is IDLE (idleTime: ${idleTime}s)`);
+            this.broadcastSystemEvent('system:user-idle', null);
+          }
+        } else {
+          if (this.isUserIdleState) {
+            this.isUserIdleState = false;
+            console.log(`[PluginManager] System detected user is ACTIVE (idleTime: ${idleTime}s)`);
+            this.broadcastSystemEvent('system:user-active', null);
+          }
+        }
+      } catch (err) {
+        console.error('[PluginManager] Failed to get system idle time via powerMonitor:', err);
+        if (this.systemIdleTrackerInterval) {
+          clearInterval(this.systemIdleTrackerInterval);
+          this.systemIdleTrackerInterval = null;
+        }
+      }
+    }, 1000);
+  }
+
+  public broadcastSystemEvent(eventName: string, data: unknown): void {
+    // 系统事件（来自 plugin-manager 内部，非插件发射）遵循路由策略
+    // 导入是同步调用，event-catalog 无外部依赖，不会有循环引用问题
+    let broadcastToBackground = true;
+    let broadcastToRenderer = true;
+
+    try {
+      // 动态解析路由策略（避免顶层循环 import）
+      const { getEventRoutingPolicy } = require('../../plugins-sdk/event-catalog.js') as typeof import('../../plugins-sdk/event-catalog');
+      const policy = getEventRoutingPolicy(eventName);
+      broadcastToBackground = policy.broadcastToBackground ?? true;
+      broadcastToRenderer = policy.broadcastToRenderer ?? true;
+    } catch {
+      // 如果 event-catalog 未构建（开发模式），使用默认值（全广播）
+    }
+
+    // 1. Notify background plugins (only those that declared interest)
+    if (broadcastToBackground) {
+      const subscribers = EventSubscriptionRegistry.getInstance().getSubscribers(eventName);
+      const backgroundProcesses = PluginLauncher.getInstance().getBackgroundProcesses();
+
+      // Send to currently running processes
+      for (const [id, proc] of backgroundProcesses.entries()) {
+        if (subscribers.has(id)) {
+          proc.sendMessage({ type: 'sdk:events:on', eventName, payload: data });
+          this.recordPluginActivity(id);
+        }
+      }
+
+      // Wake up non-running subscribed plugins on-demand
+      for (const subscriberId of subscribers) {
+        if (!backgroundProcesses.has(subscriberId)) {
+          // 仅在插件启用时才唤醒
+          if (!this.isPluginEnabled(subscriberId)) {
+            continue;
+          }
+          console.log(`[PluginManager] Waking up background plugin "${subscriberId}" due to system event "${eventName}"`);
+          const ctx: PluginLifecycleContext = {
+            action: 'normal',
+            loadMode: 'normal',
+            updatedAt: new Date().toISOString(),
+            trigger: {
+              eventName,
+              payload: data
+            }
+          };
+          this.ensurePluginLoaded(subscriberId, ctx).then(() => {
+            const proc = PluginLauncher.getInstance().getBackgroundProcesses().get(subscriberId);
+            if (proc) {
+              console.log(`[PluginManager] Replaying system trigger event "${eventName}" to newly started background plugin "${subscriberId}"`);
+              proc.sendMessage({ type: 'sdk:events:on', eventName, payload: data });
+            }
+          }).catch(err => {
+            console.error(`[PluginManager] Failed to wake up plugin "${subscriberId}" for system event "${eventName}":`, err);
+          });
+        }
+      }
+    }
+
+    // 2. Notify all renderer windows
+    // 使用统一的 'plugin:event:${eventName}' 前缀格式，与 plugin-launcher.ts 中插件事件转发保持一致
+    if (broadcastToRenderer) {
+      // 预序列化数据：Electron IPC 使用结构化克隆，如果 data 包含不可克隆的值
+      // （如 Proxy、Symbol、函数），webContents.send 会抛 "An object could not be cloned"。
+      // 预先 JSON 序列化/反序列化可以剥离不可克隆的值，并让错误提前暴露。
+      let safeData: unknown = data;
+      try {
+        safeData = JSON.parse(JSON.stringify(data));
+      } catch (cloneErr) {
+        console.error(`[PluginManager] broadcastSystemEvent: data not serializable for "${eventName}", falling back to minimal payload:`, cloneErr);
+        // 降级：只发送最基本的标识信息
+        if (data && typeof data === 'object' && 'id' in data) {
+          safeData = { id: (data as { id: string }).id };
+        }
+      }
+
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) {
+          // plugins: 前缀的事件（如 plugins:on-demand-loaded）直接用原名发送，
+          // 因为渲染进程通过 window.electronAPI.ipc.on('plugins:on-demand-loaded') 监听。
+          // 其他事件用 plugin:event: 前缀格式。
+          const channel = eventName.startsWith('plugins:') ? eventName : `plugin:event:${eventName}`;
+          try {
+            win.webContents.send(channel, safeData);
+            console.log(`[PluginManager] Event sent: channel="${channel}" → window ${win.id}`);
+          } catch (sendErr) {
+            console.error(`[PluginManager] Failed to send event "${eventName}" to window ${win.id}:`, sendErr);
+          }
+        }
+      });
+    }
+  }
+
+  public getDeclaredSubAgents(): Array<any> {
+    const subagents: Array<any> = [];
+    for (const [id, plugin] of this.plugins.entries()) {
+      if (this.isPluginEnabled(id)) {
+        const list = plugin.manifest.contributes?.subagents;
+        if (list && Array.isArray(list)) {
+          for (const item of list) {
+            subagents.push({
+              ...item,
+              pluginId: id,
+            });
+          }
+        }
+      }
+    }
+    return subagents;
+  }
+
+  public getPluginsList(): ScannedPlugin[] {
+    return Array.from(this.plugins.values());
+  }
+
+  public init(force = false): Promise<void> {
+    if (force) {
+      this.initPromise = null;
+      this.earlyInitComplete = false;
+      this.deferredInitComplete = false;
+      this.loadedPluginsSet.clear();
+      this.loadingPromises.clear();
+    }
+    if (!this.initPromise) {
+      this.initPromise = this.performInit();
+    }
+    return this.initPromise;
+  }
+
+  private registerMcpForPlugin(id: string, mcpConfig: Record<string, unknown>): void {
+    const plugin = this.plugins.get(id);
+    const isBackground = plugin?.manifest?.type === 'background' || plugin?.manifest?.type === 'hybrid';
+
+    McpHost.getInstance().registerPluginMcp(
+      id,
+      mcpConfig,
+      isBackground
+        ? async (channel: string, data: Record<string, unknown>) => {
+            // Lazy load the plugin before calling the tool in the utilityProcess
+            await this.ensurePluginLoaded(id);
+            const bgProc = PluginLauncher.getInstance().getBackgroundProcesses().get(id);
+            if (bgProc) {
+              bgProc.sendMessage({ type: channel, ...data });
+            } else {
+              console.error(`[PluginManager] Background process not running for plugin "${id}", cannot route MCP call`);
+            }
+          }
+        : async (channel: string, data: Record<string, unknown>) => {
+            // Lazy load the plugin before calling the tool in the renderer
+            await this.ensurePluginLoaded(id);
+            const win = ElectronMainWindow.getInstance().getWindow();
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('plugins:mcp-call-tool', {
+                pluginId: id,
+                ...data
+              });
+            } else {
+              console.error(`[PluginManager] Main window not available to route MCP tool call for plugin "${id}"`);
+            }
+          },
+    );
+  }
+
+  private shouldLoadEagerly(manifest: PluginManifest): boolean {
+    // 常驻插件（manifest.resident）或高优先级插件在启动时预加载
+    if (manifest.resident) {
+      return true;
+    }
+    if (manifest.startupPriority === 'high') {
+      return true;
+    }
+    return false;
+  }
+
+  private registerStaticContributions(plugin: ScannedPlugin): void {
+    const id = plugin.manifest.id;
+    // 1. Register selectionMenuItems
+    let selectionMenuItems = plugin.manifest.contributes?.selectionMenuItems as Array<Record<string, unknown>> | undefined;
+    if (!selectionMenuItems) {
+      selectionMenuItems = (plugin.manifest as unknown as Record<string, unknown>).selectionMenuItems as Array<Record<string, unknown>> | undefined;
+    }
+
+    if (selectionMenuItems && Array.isArray(selectionMenuItems)) {
+      for (const item of selectionMenuItems) {
+        ElectronSelection.getInstance().registerSelectionMenuItem({
+          ...item,
+          pluginId: id,
+        } as import('../../src/plugins/SelectionMenuRegistry').SelectionMenuItem);
+      }
+    }
+
+    // 2. Register shortcutActions statically
+    const shortcutActions = plugin.manifest.contributes?.shortcutActions as Array<{ id: string; label: string; icon?: string }> | undefined;
+    if (shortcutActions && Array.isArray(shortcutActions)) {
+      const { getShortcutActionRegistry } = require('../services/shortcut-action-registry');
+      const registry = getShortcutActionRegistry();
+      const { ApiDispatcher } = require('./api-dispatcher');
+      for (const action of shortcutActions) {
+        registry.register({
+          id: action.id,
+          label: action.label,
+          icon: action.icon || '⚡',
+          pluginId: id,
+          handler: () => {
+            PluginManager.getInstance().ensurePluginLoaded(id).then(() => {
+              ApiDispatcher.getInstance().dispatch(id, 'commands', 'execute', [action.id]).catch((err: unknown) => {
+                console.error('[ShortcutAction] Failed to execute command:', action.id, err);
+              });
+            }).catch(err => {
+              console.error('[ShortcutAction] Failed to load plugin for command execution:', id, err);
+            });
+          }
+        });
+      }
+    }
+
+    // 3. Register commands statically
+    const commands = plugin.manifest.contributes?.commands as Array<{ command: string; title: string; category?: string }> | undefined;
+    if (commands && Array.isArray(commands)) {
+      for (const cmd of commands) {
+        const commandId = cmd.command;
+        const { ApiDispatcher } = require('./api-dispatcher');
+        const { HookRegistry } = require('./hook-registry');
+
+        // Register command handler that lazy-loads plugin and executes
+        const handlerCode = `(...args) => { /* declared command */ }`;
+        HookRegistry.getInstance().register(id, `command:${commandId}`, 100, handlerCode);
+
+        console.log(`[PluginManager] Registered declared command "${commandId}" for plugin "${id}"`);
+      }
+    }
+
+    // 4. Register folderContextMenuItems statically
+    const folderContextMenuItems = plugin.manifest.contributes?.folderContextMenuItems as Array<{ id: string; label: string; command: string }> | undefined;
+    if (folderContextMenuItems && Array.isArray(folderContextMenuItems)) {
+      // Store declarations for renderer to pick up
+      // The actual registration happens in renderer-side PluginRegistry
+      console.log(`[PluginManager] Plugin "${id}" declares ${folderContextMenuItems.length} folder context menu items`);
+    }
+
+    // 5. Register MCP Spec statically
+    const hasMcp = !!plugin.manifest.mcp;
+    if (hasMcp && plugin.manifest.type !== 'main') {
+      this.registerMcpForPlugin(id, plugin.manifest.mcp!);
+    }
+  }
+
+  private ensureSdkInPluginsHome(): void {
+    try {
+      const r = createRequire(import.meta.url);
+      const sdkEntry = r.resolve('berrytrace-plugin-sdk');
+      const sdkSrcDir = join(dirname(sdkEntry), '..');
+      const targetDir = join(BERRYTRACE_HOME, 'node_modules', 'berrytrace-plugin-sdk');
+
+      // 检查是否已是正确的 symlink
+      if (fsSync.existsSync(targetDir)) {
+        try {
+          const stat = fsSync.lstatSync(targetDir);
+          if (stat.isSymbolicLink()) {
+            const linkTarget = fsSync.readlinkSync(targetDir);
+            if (linkTarget === sdkSrcDir) {
+              return; // symlink 已正确指向源目录
+            }
+          }
+        } catch { /* 继续创建 symlink */ }
+        // 非 symlink 或指向错误，删除后重建
+        fsSync.rmSync(targetDir, { recursive: true, force: true });
+      }
+
+      fsSync.mkdirSync(dirname(targetDir), { recursive: true });
+      fsSync.symlinkSync(sdkSrcDir, targetDir, 'junction');
+      console.log(`[PluginManager] SDK symlinked: ${targetDir} → ${sdkSrcDir}`);
+    } catch (err) {
+      console.warn('[PluginManager] Failed to symlink SDK to plugins home:', err);
+    }
+  }
+
+  private async performInit(): Promise<void> {
+    const t0 = performance.now();
+    console.log(`[PluginManager] [Perf] Early initializing plugin system starts at +${t0.toFixed(2)}ms`);
+
+    // Ensure SDK is copied/available in BERRYTRACE_HOME/node_modules/berrytrace-plugin-sdk
+    this.ensureSdkInPluginsHome();
+
+    // 1. Scan all plugins (prod directory only) using PluginScanner
+    const t_scan_start = performance.now();
+    this.plugins = await PluginScanner.scanAll();
+    await this.loadPersistedDevPlugins();
+    console.log(`[PluginManager] [Perf] Scanned all plugins and dev plugins in ${(performance.now() - t_scan_start).toFixed(2)}ms`);
+
+    // 1.5 Build event subscription index from plugin.json declarations
+    const registry = EventSubscriptionRegistry.getInstance();
+    for (const [id, plugin] of this.plugins.entries()) {
+      registry.registerFromManifest(id, plugin.manifest);
+    }
+    registry.debugPrint();
+
+    // Dynamically register IPC forwarders for all subscribed events
+    PluginLauncher.getInstance().registerInteractionForwarders(registry.getAllSubscribedEvents());
+
+    // 2. Setup lifecycle context and register static contributions for ALL enabled plugins
+    const t_setup_start = performance.now();
+    for (const [id, plugin] of this.plugins.entries()) {
+      if (!this.pluginLifecycleContext.has(id)) {
+        this.markPluginLifecycle(id, 'initial-load', 'normal');
+      }
+
+      const updateInfo = PluginUpdater.getInstance().getUpdate?.(id);
+      if (updateInfo && !isVersionNewer(updateInfo.version, plugin.manifest.version)) {
+        console.log(`[PluginManager] Version ${plugin.manifest.version} matches/newer than update. Clearing update cache.`);
+        PluginUpdater.getInstance().removeUpdate?.(id);
+      }
+
+      if (this.isPluginEnabled(id)) {
+        this.registerStaticContributions(plugin);
+      }
+    }
+    console.log(`[PluginManager] [Perf] Early setup lifecycle and static registration in ${(performance.now() - t_setup_start).toFixed(2)}ms`);
+
+    this.notifyPluginsChanged();
+
+    // 3. Launch enabled HIGH-priority plugins CONCURRENTLY (if not lazy)
+    const t_launch_start = performance.now();
+    const launchPromises: Promise<void>[] = [];
+    for (const [id, plugin] of this.plugins.entries()) {
+      if (this.isPluginEnabled(id) && plugin.manifest.startupPriority === 'high') {
+        if ((plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') && plugin.manifest.agentKernel) {
+          console.log(`[PluginManager] Skipping background launch for agent kernel plugin "${id}" at startup (will load lazily)`);
+          continue;
+        }
+        if (!this.shouldLoadEagerly(plugin.manifest)) {
+          console.log(`[PluginManager] Skipping eager launch for lazy plugin "${id}" at startup`);
+          continue;
+        }
+        this.loadedPluginsSet.add(id);
+        if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
+          const t_bg_start = performance.now();
+          launchPromises.push(
+            this.startBackgroundPlugin(id).then(() => {
+              console.log(`[PluginManager] [Perf] startBackgroundPlugin for "${id}" took ${(performance.now() - t_bg_start).toFixed(2)}ms`);
+            }).catch((err: unknown) => {
+              console.error(`[PluginManager] Failed to start background plugin "${id}":`, err);
+            })
+          );
+        } else if (plugin.manifest.type === 'main') {
+          const t_main_start = performance.now();
+          launchPromises.push(
+            this.startMainPlugin(id).then(() => {
+              console.log(`[PluginManager] [Perf] startMainPlugin for "${id}" took ${(performance.now() - t_main_start).toFixed(2)}ms`);
+            }).catch((err: unknown) => {
+              console.error(`[PluginManager] Failed to start main plugin "${id}":`, err);
+            })
+          );
+        }
+      }
+    }
+
+    await Promise.all(launchPromises);
+    this.earlyInitComplete = true;
+    console.log(`[PluginManager] [Perf] Early plugins startup completed in ${(performance.now() - t_launch_start).toFixed(2)}ms. Total early init took ${(performance.now() - t0).toFixed(2)}ms.`);
+  }
+
+  public async initDeferred(): Promise<void> {
+    await this.initPromise;
+    if (this.deferredInitComplete) return;
+
+    const t0 = performance.now();
+    console.log(`[PluginManager] [Perf] Deferred initializing plugin system starts at +${t0.toFixed(2)}ms`);
+
+    // 1. Launch enabled NORMAL-priority plugins CONCURRENTLY (if not lazy)
+    const launchPromises: Promise<void>[] = [];
+    for (const [id, plugin] of this.plugins.entries()) {
+      if (this.isPluginEnabled(id) && plugin.manifest.startupPriority !== 'high') {
+        if (this.loadedPluginsSet.has(id)) continue;
+
+        if ((plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') && plugin.manifest.agentKernel) {
+          console.log(`[PluginManager] Skipping background launch for agent kernel plugin "${id}" at deferred startup (will load lazily)`);
+          continue;
+        }
+        if (!this.shouldLoadEagerly(plugin.manifest)) {
+          console.log(`[PluginManager] Skipping eager launch for lazy plugin "${id}" at deferred startup`);
+          continue;
+        }
+        this.loadedPluginsSet.add(id);
+
+        if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
+          const t_bg_start = performance.now();
+          launchPromises.push(
+            this.startBackgroundPlugin(id).then(() => {
+              console.log(`[PluginManager] [Perf] startBackgroundPlugin for "${id}" took ${(performance.now() - t_bg_start).toFixed(2)}ms`);
+            }).catch((err: unknown) => {
+              console.error(`[PluginManager] Failed to start background plugin "${id}":`, err);
+            })
+          );
+        } else if (plugin.manifest.type === 'main') {
+          const t_main_start = performance.now();
+          launchPromises.push(
+            this.startMainPlugin(id).then(() => {
+              console.log(`[PluginManager] [Perf] startMainPlugin for "${id}" took ${(performance.now() - t_main_start).toFixed(2)}ms`);
+            }).catch((err: unknown) => {
+              console.error(`[PluginManager] Failed to start main plugin "${id}":`, err);
+            })
+          );
+        }
+      }
+    }
+
+    await Promise.all(launchPromises);
+    this.deferredInitComplete = true;
+    // 延后启动空闲跟踪器，避免启动早期 1 秒间隔轮询抢占资源
+    this.startIdleTrackerIfNeeded();
+    console.log(`[PluginManager] [Perf] Deferred plugins startup completed in ${(performance.now() - t0).toFixed(2)}ms.`);
+  }
+
+  public async ensurePluginLoaded(pluginId: string, customContext?: PluginLifecycleContext): Promise<PluginManifest | null> {
+    const t0 = Date.now();
+    await this.initPromise;
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      console.warn(`[PluginManager] 🔍 ensurePluginLoaded: ${pluginId} NOT FOUND in scan results (plugins.size=${this.plugins.size}). Returning null.`);
+      return null;
+    }
+
+    if (this.loadedPluginsSet.has(pluginId)) {
+      console.log(`[PluginManager] 🔍 ensurePluginLoaded: ${pluginId} already loaded (cached), returning manifest.`);
+      this.recordPluginActivity(pluginId);
+      return plugin.manifest;
+    }
+
+    let promise = this.loadingPromises.get(pluginId);
+    if (!promise) {
+      console.log(`[PluginManager] 🔍 ensurePluginLoaded: ${pluginId} starting loadSinglePlugin... (type=${plugin.manifest.type})`);
+      promise = this.loadSinglePlugin(pluginId, customContext);
+      this.loadingPromises.set(pluginId, promise);
+    } else {
+      console.log(`[PluginManager] 🔍 ensurePluginLoaded: ${pluginId} has existing load promise, awaiting...`);
+    }
+    try {
+      await promise;
+    } catch (err) {
+      this.loadingPromises.delete(pluginId);
+      throw err;
+    }
+    console.log(`[PluginManager] 🔍 ensurePluginLoaded: ${pluginId} loadSinglePlugin completed in ${Date.now() - t0}ms`);
+    this.recordPluginActivity(pluginId);
+    return plugin.manifest;
+  }
+
+  private async loadSinglePlugin(pluginId: string, customContext?: PluginLifecycleContext): Promise<void> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) {
+      console.warn(`[PluginManager] Plugin ${pluginId} not found in scan results. Cannot load.`);
+      return;
+    }
+
+    if (!this.isPluginEnabled(pluginId)) {
+      console.warn(`[PluginManager] Plugin ${pluginId} is not enabled. Skipping loading.`);
+      return;
+    }
+
+    console.log(`[PluginManager] On-demand activating plugin: ${pluginId}`);
+
+    // Launch background/main processes
+    if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
+      await this.startBackgroundPlugin(pluginId, customContext);
+    } else if (plugin.manifest.type === 'main') {
+      await this.startMainPlugin(pluginId, customContext);
+    }
+
+    // Broadcast system event to renderer
+    // 注意：只发送可序列化的基本字段，避免 mcp/contributes 等复杂对象导致 IPC 克隆失败
+    console.log(`[PluginManager] Broadcasting "plugins:on-demand-loaded" for ${pluginId} (type=${plugin.manifest.type})`);
+    this.broadcastSystemEvent('plugins:on-demand-loaded', {
+      id: plugin.manifest.id,
+      manifest: {
+        id: plugin.manifest.id,
+        name: plugin.manifest.name,
+        version: plugin.manifest.version,
+        description: plugin.manifest.description,
+        main: plugin.manifest.main,
+        view: plugin.manifest.view,
+        startupPriority: plugin.manifest.startupPriority || 'normal',
+        type: plugin.manifest.type,
+        activationEvents: plugin.manifest.activationEvents,
+      }
+    });
+
+    this.loadedPluginsSet.add(pluginId);
+    this.loadingPromises.delete(pluginId);
+    console.log(`[PluginManager] Plugin ${pluginId} activated successfully on-demand.`);
+  }
+
+  public isPluginEnabled(pluginId: string): boolean {
+    try {
+      const { oemManager } = require('../services/oem-manager');
+      const config = oemManager.getConfig();
+      const allowedBuiltins = config?.builtinPlugins || [];
+      if (allowedBuiltins.includes(pluginId)) {
+        return true;
+      }
+    } catch (e) {
+      console.warn('[PluginManager] Failed to check allowedBuiltins:', e);
+    }
+
+    const enabledList = cache.get(CacheAttribute.prefEnabledPlugins) as string[] | undefined;
+    if (enabledList === undefined) {
+      return this.plugins.has(pluginId);
+    }
+    return enabledList.includes(pluginId);
+  }
+
+  public notifyPluginsChanged(): void {
+    this.broadcastSystemEvent('plugins:changed', null);
+  }
+
+  public getLifecycleContext(pluginId: string): PluginLifecycleContext {
+    return this.pluginLifecycleContext.get(pluginId) || {
+      action: 'normal',
+      loadMode: 'normal',
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  public markPluginLifecycle(pluginId: string, action: PluginLifecycleAction, loadMode: PluginLoadMode = 'normal'): void {
+    const ctx = {
+      action,
+      loadMode,
+      updatedAt: new Date().toISOString(),
+    };
+    this.pluginLifecycleContext.set(pluginId, ctx);
+    this.broadcastSystemEvent('plugins:lifecycle', { pluginId, context: ctx });
+  }
+
+  public async togglePlugin(id: string, enable: boolean): Promise<boolean> {
+    await this.initPromise;
+    const plugin = this.plugins.get(id);
+    if (!plugin) return false;
+
+    let enabledList = cache.get(CacheAttribute.prefEnabledPlugins) as string[] | undefined;
+    if (enabledList === undefined) {
+      enabledList = Array.from(this.plugins.keys());
+    }
+
+    if (enable) {
+      const allowUntrusted = cache.get(CacheAttribute.prefAllowUntrustedPlugins) === true;
+
+      if ((plugin.status === 'UNVERIFIED' || plugin.status === 'VERIFIED') && !allowUntrusted) {
+        throw new Error('无法启动未签名/第三方签名插件，请先启用“允许未签名插件”设置');
+      }
+
+      if (!enabledList.includes(id)) {
+        enabledList.push(id);
+      }
+      cache.set(CacheAttribute.prefEnabledPlugins, enabledList);
+
+      // Register static contributions on enable
+      this.registerStaticContributions(plugin);
+
+      if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
+        await this.startBackgroundPlugin(id);
+      } else if (plugin.manifest.type === 'main') {
+        await this.startMainPlugin(id);
+      } else if (plugin.manifest.view) {
+        // 不再由宿主强制开窗。插件在 onload 中通过 context.loadMode 自行决定是否弹窗。
+        await this.ensurePluginLoaded(id);
+      }
+    } else {
+      this.markPluginLifecycle(id, 'disable', 'normal');
+      enabledList = enabledList.filter(x => x !== id);
+      cache.set(CacheAttribute.prefEnabledPlugins, enabledList);
+      await this.deactivatePlugin(id);
+    }
+    eventBus.emit('plugin:changed', { action: enable ? 'enable' : 'disable', pluginId: id });
+    this.notifyPluginsChanged();
+    return true;
+  }
+
+  public async handlePluginSelfUnloaded(pluginId: string): Promise<void> {
+    console.log(`[PluginManager] Handling self-unload event for plugin: ${pluginId}`);
+    this.markPluginLifecycle(pluginId, 'unload');
+
+    const plugin = this.plugins.get(pluginId);
+
+    // Unregister selectionMenuItems for this plugin
+    const items = ElectronSelection.getInstance().getSelectionMenuItems();
+    for (const item of items) {
+      if (item.pluginId === pluginId) {
+        ElectronSelection.getInstance().unregisterSelectionMenuItem(item.id);
+      }
+    }
+
+    // Unregister shortcutActions for this plugin
+    const shortcutActions = plugin?.manifest.contributes?.shortcutActions as Array<{ id: string }> | undefined;
+    if (shortcutActions && Array.isArray(shortcutActions)) {
+      const { getShortcutActionRegistry } = require('../services/shortcut-action-registry');
+      const registry = getShortcutActionRegistry();
+      for (const action of shortcutActions) {
+        registry.unregister(action.id);
+      }
+    }
+
+    await this.stopMainPlugin(pluginId);
+    McpHost.getInstance().unregisterPluginMcp(pluginId);
+    EventSubscriptionRegistry.getInstance().unregisterPlugin(pluginId);
+    ElectronFloatBall.getInstance().closePluginWindows(pluginId);
+    this.loadedPluginsSet.delete(pluginId);
+
+    eventBus.emit('plugin:changed', { action: 'unload', pluginId }, { broadcast: true });
+  }
+
+  public async deactivatePlugin(pluginId: string): Promise<void> {
+    console.log(`[PluginManager] Deactivating plugin: ${pluginId}`);
+    this.markPluginLifecycle(pluginId, 'unload');
+
+    const plugin = this.plugins.get(pluginId);
+
+    // Unregister selectionMenuItems for this plugin
+    const items = ElectronSelection.getInstance().getSelectionMenuItems();
+    for (const item of items) {
+      if (item.pluginId === pluginId) {
+        ElectronSelection.getInstance().unregisterSelectionMenuItem(item.id);
+      }
+    }
+
+    // Unregister shortcutActions for this plugin
+    const shortcutActions = plugin?.manifest.contributes?.shortcutActions as Array<{ id: string }> | undefined;
+    if (shortcutActions && Array.isArray(shortcutActions)) {
+      const { getShortcutActionRegistry } = require('../services/shortcut-action-registry');
+      const registry = getShortcutActionRegistry();
+      for (const action of shortcutActions) {
+        registry.unregister(action.id);
+      }
+    }
+
+    await this.stopBackgroundPlugin(pluginId);
+    await this.stopMainPlugin(pluginId);
+    McpHost.getInstance().unregisterPluginMcp(pluginId);
+    EventSubscriptionRegistry.getInstance().unregisterPlugin(pluginId);
+    ElectronFloatBall.getInstance().closePluginWindows(pluginId);
+    this.loadedPluginsSet.delete(pluginId);
+
+    eventBus.emit('plugin:changed', { action: 'unload', pluginId }, { broadcast: true });
+  }
+
+  public async uninstallPlugin(pluginId: string): Promise<boolean> {
+    await this.deactivatePlugin(pluginId);
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) return false;
+
+    this.markPluginLifecycle(pluginId, 'uninstall', 'normal');
+    this.plugins.delete(pluginId);
+    this.pluginLifecycleContext.delete(pluginId);
+
+    try {
+      await fs.rm(plugin.path, { recursive: true, force: true });
+    } catch (err) {
+      console.error(`[PluginManager] Failed to delete plugin folder at ${plugin.path}:`, err);
+    }
+
+    this.notifyPluginsChanged();
+    eventBus.emit('plugin:changed', { action: 'uninstall', pluginId }, { broadcast: true });
+    return true;
+  }
+
+  private getDevPluginsFile(): string {
+    return join(app.getPath('userData'), 'dev-plugins.json');
+  }
+
+  public async loadPersistedDevPlugins(): Promise<void> {
+    const file = this.getDevPluginsFile();
+    if (!fsSync.existsSync(file)) return;
+    try {
+      const data = JSON.parse(fsSync.readFileSync(file, 'utf8')) as { paths: string[] };
+      if (Array.isArray(data?.paths)) {
+        for (const dir of data.paths) {
+          if (fsSync.existsSync(dir)) {
+            try {
+              console.log(`[PluginManager] Restoring persisted dev plugin from: ${dir}`);
+              const scanned = await PluginScanner.scanPluginFolder(dir, true);
+              if (scanned) {
+                scanned.isDevFolder = true;
+                this.plugins.set(scanned.manifest.id, scanned);
+                console.log(`[PluginManager] Restored dev plugin: "${scanned.manifest.id}"`);
+              }
+            } catch (err) {
+              console.error(`[PluginManager] Failed to load persisted dev plugin at ${dir}:`, err);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[PluginManager] Failed to read dev-plugins.json:`, err);
+    }
+  }
+
+  private async persistDevPluginPath(pluginId: string, dir: string): Promise<void> {
+    const file = this.getDevPluginsFile();
+    let paths: string[] = [];
+    if (fsSync.existsSync(file)) {
+      try {
+        const data = JSON.parse(fsSync.readFileSync(file, 'utf8')) as { paths: string[] };
+        if (Array.isArray(data?.paths)) paths = data.paths;
+      } catch {}
+    }
+    if (!paths.includes(dir)) {
+      paths.push(dir);
+      try {
+        fsSync.writeFileSync(file, JSON.stringify({ paths }), 'utf8');
+      } catch (err) {
+        console.error(`[PluginManager] Failed to write dev-plugins.json:`, err);
+      }
+    }
+  }
+
+  public async loadUnpackedPlugin(pluginPath: string): Promise<ScannedPlugin> {
+    console.log(`[PluginManager] Loading unpacked development plugin from: ${pluginPath}`);
+    const scanned = await PluginScanner.scanPluginFolder(pluginPath, true);
+    if (!scanned) {
+      throw new Error(`目录中未找到有效的 plugin.json: ${pluginPath}`);
+    }
+
+    scanned.isDevFolder = true;
+    this.plugins.set(scanned.manifest.id, scanned);
+
+    await this.persistDevPluginPath(scanned.manifest.id, pluginPath);
+
+    if (this.isPluginEnabled(scanned.manifest.id)) {
+      McpHost.getInstance().unregisterPluginMcp(scanned.manifest.id);
+      this.registerStaticContributions(scanned);
+      if (scanned.manifest.type === 'background' || scanned.manifest.type === 'hybrid') {
+        await this.startBackgroundPlugin(scanned.manifest.id);
+      } else if (scanned.manifest.type === 'main') {
+        await this.startMainPlugin(scanned.manifest.id);
+      }
+    }
+
+    try {
+      const { FullTextIndexManager } = require('../services/fulltext-index-manager');
+      FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
+    } catch (_e) { /* empty */ }
+
+    this.notifyPluginsChanged();
+    return scanned;
+  }
+
+  public async reloadPlugin(pluginId: string): Promise<boolean> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) return false;
+
+    // 若插件正在执行 Agent 任务，暂缓卸载与重载，记录到 pendingReloads 待任务完成后自动套用
+    try {
+      const { PluginLauncher } = require('./plugin-launcher');
+      if (PluginLauncher.getInstance().isPluginBusy(pluginId)) {
+        console.log(`[PluginManager] Plugin "${pluginId}" is currently busy with an active Agent session. Deferring reload.`);
+        this.pendingReloads.add(pluginId);
+        return true;
+      }
+    } catch (err) {
+      console.warn('[PluginManager] Failed to check plugin busy status:', err);
+    }
+
+    this.pendingReloads.delete(pluginId);
+    console.log(`[PluginManager] Reloading plugin: ${pluginId}`);
+    this.markPluginLifecycle(pluginId, 'reload', 'normal');
+
+    await this.deactivatePlugin(pluginId);
+
+    const rescanned = await PluginScanner.scanPluginFolder(plugin.path, false);
+    const targetPlugin = rescanned || plugin;
+    this.plugins.set(pluginId, targetPlugin);
+
+    if (this.isPluginEnabled(pluginId)) {
+      this.registerStaticContributions(targetPlugin);
+      if (targetPlugin.manifest.type === 'background' || targetPlugin.manifest.type === 'hybrid') {
+        await this.startBackgroundPlugin(pluginId);
+      } else if (targetPlugin.manifest.type === 'main') {
+        await this.startMainPlugin(pluginId);
+      }
+    }
+
+    try {
+      const { FullTextIndexManager } = require('../services/fulltext-index-manager');
+      FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
+    } catch (_e) { /* empty */ }
+
+    this.notifyPluginsChanged();
+    return true;
+  }
+
+  public async processPendingReload(pluginId: string): Promise<void> {
+    if (this.pendingReloads.has(pluginId)) {
+      console.log(`[PluginManager] Processing deferred reload for plugin: ${pluginId}`);
+      this.pendingReloads.delete(pluginId);
+      await this.reloadPlugin(pluginId);
+    }
+  }
+
+  public getPluginPath(pluginId: string): string | undefined {
+    const p = this.plugins.get(pluginId);
+    return p ? p.path : undefined;
+  }
+
+  public getPlugin(pluginId: string): ScannedPlugin | undefined {
+    return this.plugins.get(pluginId);
+  }
+
+  public async startBackgroundPlugin(pluginId: string, customContext?: PluginLifecycleContext): Promise<void> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) return;
+
+    const context = customContext || this.getLifecycleContext(pluginId);
+    await PluginLauncher.getInstance().startBackgroundPlugin(pluginId, plugin.path, plugin.manifest, context);
+  }
+
+  public async stopBackgroundPlugin(pluginId: string): Promise<void> {
+    await PluginLauncher.getInstance().stopBackgroundPlugin(pluginId);
+  }
+
+  public emitToBackgroundPlugin(pluginId: string, eventName: string, payload: unknown): void {
+    PluginLauncher.getInstance().emitToBackgroundPlugin(pluginId, eventName, payload);
+  }
+
+  public isBackgroundPluginRunning(pluginId: string): boolean {
+    return PluginLauncher.getInstance().isBackgroundPluginRunning(pluginId);
+  }
+
+  public listAgentKernelPluginIds(onlyEnabled: boolean): string[] {
+    return listAgentKernelPluginIds(this, onlyEnabled);
+  }
+
+  public getAgentKernelPluginId(): string | null {
+    return getAgentKernelPluginId(this);
+  }
+
+  public async ensureAgentKernelRunning(preferredPluginId?: string): Promise<string | null> {
+    return ensureAgentKernelRunning(this, preferredPluginId);
+  }
+
+  // ─── Main-Process Plugin Lifecycle (delegates to Launcher) ──────────────────
+
+  public async startMainPlugin(pluginId: string, customContext?: PluginLifecycleContext): Promise<void> {
+    const plugin = this.plugins.get(pluginId);
+    if (!plugin) return;
+
+    const context = customContext || this.getLifecycleContext(pluginId);
+    await PluginLauncher.getInstance().startMainPlugin(pluginId, plugin.path, plugin.manifest, (id) => createMainSDKInstance(id, this), context);
+  }
+
+  public async stopMainPlugin(pluginId: string): Promise<void> {
+    await PluginLauncher.getInstance().stopMainPlugin(pluginId, (id) => createMainSDKInstance(id, this));
+  }
+
+  public getPluginsByExtension(ext: string): ScannedPlugin[] {
+    return getPluginsByExtension(this, ext);
+  }
+
+  public async getResolvedUrl(pluginId: string, queryParams?: string): Promise<string> {
+    return getResolvedUrl(this, pluginId, queryParams);
+  }
+
+  public async openPluginWindow(pluginId: string, queryParams?: string): Promise<boolean> {
+    return openPluginWindow(this, pluginId, queryParams);
+  }
+
+  public isPluginActive(pluginId: string): boolean {
+    return this.loadedPluginsSet.has(pluginId);
+  }
+
+  private registerIpcHandlers(): void {
+    if (this.ipcHandlersRegistered) return;
+    this.ipcHandlersRegistered = true;
+    registerIpcHandlers(this);
+  }
+
+  public hasActiveAgentSessions(): boolean {
+    return PluginLauncher.getInstance().hasActiveAgentSessions();
+  }
+
+  public cancelAllAgentSessions(): void {
+    PluginLauncher.getInstance().cancelAllAgentSessions();
+  }
+
+}
+
+class ElectronMainWindow {
+  public static getInstance() {
+    return {
+      getWindow: () => {
+        const wins = BrowserWindow.getAllWindows();
+        return wins.find(w => {
+          const url = w.webContents.getURL();
+          return !url.includes('window=');
+        }) || wins[0] || null;
+      }
+    };
+  }
+}
+

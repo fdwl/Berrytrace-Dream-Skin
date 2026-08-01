@@ -1,0 +1,279 @@
+import { ipcMain } from 'electron'
+import { DatabaseManager, type SQLInputValue } from './db-manager.js'
+import { WorkspaceManager } from './workspace-manager.js'
+import { DocumentLinkService } from './document-link-service.js'
+import { DatabaseWriter } from './db-writer.js'
+import { setupDocumentCenterIPC } from './document-center.js'
+
+const WORKSPACE_TABLES = [
+  'dbagentsession',
+  'dbchatsession',
+  'dbchatlogs',
+  'ftsfileindex',
+  'ftsvectorindex',
+  'ftsagentindex',
+  'doc_links',
+  'semantic_pairs',
+  'graph_cache'
+]
+
+/**
+ * 等待 DB 就绪，超时后放行（调用方自行处理未就绪情况）。
+ * 防止渲染进程在 DB 初始化完成前发送 IPC 查询导致 getGlobalDB() throw。
+ */
+function awaitDbReady(): Promise<void> {
+  const db = DatabaseManager.getInstance()
+  if (db.isReady()) return Promise.resolve()
+  // 最多等 10 秒，超时放行（handler 内部会 catch）
+  return Promise.race([
+    db.whenReady(),
+    new Promise<void>((resolve) => setTimeout(resolve, 10000))
+  ])
+}
+
+function getTargetDatabase(event: Electron.IpcMainInvokeEvent, sql: string, workspacePath?: string) {
+  const lowercaseSql = sql.toLowerCase()
+  const hasWorkspaceTable = WORKSPACE_TABLES.some(table => lowercaseSql.includes(table))
+ 
+  if (hasWorkspaceTable) {
+    const path = workspacePath || WorkspaceManager.getInstance().getPathForWebContents(event.sender)
+    if (path) {
+      return DatabaseManager.getInstance().getWorkspaceDB(path)
+    }
+  }
+ 
+  return DatabaseManager.getInstance().getGlobalDB()
+}
+ 
+function getTargetDatabasePath(event: Electron.IpcMainInvokeEvent, sql: string, workspacePath?: string): string {
+  const lowercaseSql = sql.toLowerCase()
+  const hasWorkspaceTable = WORKSPACE_TABLES.some(table => lowercaseSql.includes(table))
+ 
+  if (hasWorkspaceTable) {
+    const path = workspacePath || WorkspaceManager.getInstance().getPathForWebContents(event.sender)
+    if (path) {
+      return DatabaseManager.getInstance().getWorkspaceDBPath(path)
+    }
+  }
+ 
+  return DatabaseManager.getInstance().getGlobalDBPath()
+}
+
+export function registerDatabaseIpcHandlers() {
+  setupDocumentCenterIPC()
+  ipcMain.handle('document:listAll', async (event) => {
+    await awaitDbReady()
+    const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(event.sender)
+    console.log('[db-ipc] document:listAll - workspacePath resolved:', workspacePath)
+    if (!workspacePath) {
+      console.warn('[db-ipc] document:listAll - no workspacePath found for sender!')
+      return []
+    }
+    const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+    
+    try {
+      // 查询 FtsFileIndex 获取全量文件（DB 本身已是工作区专属，无需再过滤 workspace_path）
+      const rows = wsDb.prepare(
+        "SELECT file_path as path, file_name as title, modified_at as mtime FROM FtsFileIndex WHERE file_type = 'md'"
+      ).all() as Array<{ path: string; title: string; mtime: string }>
+
+      // 查询是否有 outline 向量以确定 hasEmbedding 标记
+      const embeddedFiles = new Set(
+        (wsDb.prepare("SELECT entity_id FROM FtsVectorIndex WHERE entity_type = 'note_outline'").all() as any[])
+          .map(r => r.entity_id)
+      )
+
+      return rows.map(r => ({
+        path: r.path,
+        title: r.title.replace(/\.md$/, ''),
+        mtime: new Date(r.mtime).getTime(),
+        size: 0,
+        hasEmbedding: embeddedFiles.has(r.path)
+      }))
+    } catch (err) {
+      console.error('[db-ipc] document:listAll failed:', err)
+      return []
+    }
+  })
+
+  ipcMain.handle('document:getLinks', async (event, filePath: string) => {
+    const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(event.sender)
+    if (!workspacePath) return []
+    const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+    
+    try {
+      return wsDb.prepare(
+        'SELECT target_text as targetText FROM doc_links WHERE source_path = ?'
+      ).all(filePath)
+    } catch (err) {
+      console.error('[db-ipc] document:getLinks failed:', err)
+      return []
+    }
+  })
+
+  ipcMain.handle('vector:getAll', async (event, options: { entityType: string }) => {
+    const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(event.sender)
+    if (!workspacePath) return []
+    const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+    
+    try {
+      const rows = wsDb.prepare(
+        "SELECT entity_id, embedding FROM FtsVectorIndex WHERE entity_type = ?"
+      ).all(options.entityType) as Array<{ entity_id: string; embedding: Buffer }>
+
+      return rows.map(r => {
+        const floatArray = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, r.embedding.byteLength / 4)
+        return {
+          entity_id: r.entity_id,
+          embedding: Array.from(floatArray)
+        }
+      })
+    } catch (err) {
+      console.error('[db-ipc] vector:getAll failed:', err)
+      return []
+    }
+  })
+
+  ipcMain.handle('db:query', async (event, sql: string, params?: SQLInputValue[], workspacePath?: string) => {
+    await awaitDbReady()
+    const db = getTargetDatabase(event, sql, workspacePath)
+    const stmt = db.prepare(sql)
+    return stmt.all(...(params || []))
+  })
+ 
+  ipcMain.handle('db:execute', async (event, sql: string, params?: SQLInputValue[], workspacePath?: string) => {
+    await awaitDbReady()
+    const dbPath = getTargetDatabasePath(event, sql, workspacePath)
+    try {
+      return await DatabaseWriter.getInstance().execute(dbPath, sql, params || [])
+    } catch (err: any) {
+      if (err?.message?.includes('shutting down') || err?.message?.includes('not initialized')) {
+        console.warn('[db:execute] Skipped DB execution during app shutdown.');
+        return { changes: 0, lastInsertRowid: 0 };
+      }
+      throw err;
+    }
+  })
+
+  ipcMain.handle('db:upgradeDatabase', async (_event, url: string) => {
+    console.log(`[ipc] db:upgradeDatabase called with url: ${url}`)
+    try {
+      const lastIdMap = await DatabaseManager.getInstance().upgradeDatabase(url)
+      return lastIdMap
+    } catch (err) {
+      console.error('[ipc] db:upgradeDatabase failed:', err)
+      throw err
+    }
+  })
+
+  // FTS Handlers
+  ipcMain.handle('fts:searchNotes', async () => {
+    return []
+  })
+
+  ipcMain.handle('fts:searchFiles', async (_event, query: string, workspacePath?: string) => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    return FullTextIndexManager.getInstance().searchFiles(query, workspacePath)
+  })
+
+  ipcMain.handle('fts:getStatus', async () => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    const status = await FullTextIndexManager.getInstance().getStatus()
+    console.log('[Main] fts:getStatus returning:', status)
+    return status
+  })
+
+  ipcMain.handle('fts:rebuildNotes', async () => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    FullTextIndexManager.getInstance().rebuildAllIndices().catch(err => {
+      console.error('[Main] Failed to run rebuildAllIndices (rebuildNotes) in background:', err)
+    })
+    return true
+  })
+
+  ipcMain.handle('fts:rebuildAllNotes', async () => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    FullTextIndexManager.getInstance().rebuildAllIndices().catch(err => {
+      console.error('[Main] Failed to run rebuildAllIndices (rebuildAllNotes) in background:', err)
+    })
+    return true
+  })
+
+  ipcMain.handle('fts:rebuildFiles', async (_event, workspacePath: string) => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    FullTextIndexManager.getInstance().rebuildFilesIndex(workspacePath).catch(err => {
+      console.log('[Main] Failed to run rebuildFiles in background:', err)
+    })
+    return true
+  })
+
+  ipcMain.handle('fts:clearAll', async () => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    return FullTextIndexManager.getInstance().clearAllIndices()
+  })
+
+  // 已安装应用搜索（从 InstalledAppsCache DB 表查询，仅在闲置时由主进程预填充）
+  ipcMain.handle('fts:searchInstalledApps', async (_event, query: string) => {
+    await awaitDbReady()
+    const db = DatabaseManager.getInstance()
+    if (!query) return []
+    const q = `%${query.toLowerCase()}%`
+    try {
+      const rows = db.query(
+        `SELECT app_name, app_path, app_identifier, app_version
+         FROM InstalledAppsCache
+         WHERE LOWER(app_name) LIKE ? OR LOWER(app_identifier) LIKE ?
+         LIMIT 8`,
+        [q, q]
+      ) as { app_name: string; app_path: string; app_identifier: string; app_version: string }[]
+      return rows
+    } catch (err) {
+      console.error('[Main] fts:searchInstalledApps failed:', err)
+      return []
+    }
+  })
+
+  // 手动触发已安装应用缓存重建（由全量索引时自动调用，也可手动触发）
+  ipcMain.handle('fts:rebuildInstalledApps', async () => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    FullTextIndexManager.getInstance().rebuildInstalledAppsCache().catch(err => {
+      console.error('[Main] fts:rebuildInstalledApps failed:', err)
+    })
+    return true
+  })
+
+  // 搜索 Agent 能力 (skills/tools) - 混合搜索 (Vector + FTS)
+  ipcMain.handle('fts:searchAgentCapabilities', async (event, query: string) => {
+    const { FtsHybridSearcher } = await import('./fts-hybrid-searcher.js')
+    const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(event.sender)
+    return FtsHybridSearcher.searchAgentCapabilities(query, workspacePath)
+  })
+
+  // 重新对所有 skills 建立索引
+  ipcMain.handle('fts:indexAllSkills', async () => {
+    const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+    await FullTextIndexManager.getInstance().indexAllSkills()
+    return true
+  })
+
+  // 彻底级联删除会话关联的所有文件资源
+  ipcMain.handle('session:deleteResources', async (event, opts: { sessionId: string; workDir?: string }) => {
+    const { SessionResourceManager } = await import('./session-resource-manager.js')
+    const workspacePath = opts.workDir || WorkspaceManager.getInstance().getPathForWebContents(event.sender) || ''
+    return SessionResourceManager.deleteSession(opts.sessionId, workspacePath)
+  })
+
+  // 获取单个会话的资源清单 Manifest
+  ipcMain.handle('session:getManifest', async (event, opts: { sessionId: string; workDir?: string }) => {
+    const { SessionResourceManager } = await import('./session-resource-manager.js')
+    const workspacePath = opts.workDir || WorkspaceManager.getInstance().getPathForWebContents(event.sender) || ''
+    return SessionResourceManager.loadManifest(opts.sessionId, workspacePath)
+  })
+
+  // 触发过期会话 GC 清理
+  ipcMain.handle('session:gcExpired', async (event, opts?: { retentionDays?: number; workDir?: string }) => {
+    const { SessionResourceManager } = await import('./session-resource-manager.js')
+    const workspacePath = opts?.workDir || WorkspaceManager.getInstance().getPathForWebContents(event.sender) || ''
+    return SessionResourceManager.gcExpiredSessions(workspacePath, opts?.retentionDays || 30)
+  })
+}

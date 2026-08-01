@@ -1,0 +1,149 @@
+diff --git a/electron/services/local-server.ts b/electron/services/local-server.ts
+index 77d61ac..38bf54a 100644
+--- a/electron/services/local-server.ts
++++ b/electron/services/local-server.ts
+@@ -1,8 +1,8 @@
+-import { createServer, IncomingMessage, ServerResponse, Server } from 'http'
+-import { app } from 'electron'
++import type { IncomingMessage, ServerResponse, Server } from 'http';
++import { createServer } from 'http'
++import { app, BrowserWindow } from 'electron'
+ import { ElectronMainWindow } from '../windows/main-window'
+ import { PluginManager } from '../plugins/plugin-manager'
+-import { ElectronBufferWindow } from '../windows/buffer-window'
+ import { downloadAndInstallPlugin } from '../plugins/plugin-install'
+ import { randomUUID } from 'crypto'
+ import { writeFileSync, mkdirSync, unlinkSync } from 'fs'
+@@ -76,6 +76,22 @@ export class ElectronLocalServer {
+         return
+       }
+ 
++      // Route /mcp/* requests directly to McpGateway (handles token & SSE)
++      if (pathname.startsWith('/mcp')) {
++        const { McpGateway } = require('../plugins/mcp-gateway')
++        McpGateway.getInstance().handleHttpRequest(req, res, url).then((handled: boolean) => {
++          if (!handled) {
++            res.writeHead(404, { 'Content-Type': 'application/json' })
++            res.end(JSON.stringify({ error: 'MCP route not found' }))
++          }
++        }).catch((err: any) => {
++          console.error('[LocalServer] Error in McpGateway:', err)
++          res.writeHead(500, { 'Content-Type': 'application/json' })
++          res.end(JSON.stringify({ error: err.message }))
++        })
++        return
++      }
++
+       // Security check for all other routes
+       const authHeader = req.headers['authorization'] || req.headers['Authorization']
+       const expectedAuth = `Bearer ${this.token}`
+@@ -118,6 +134,36 @@ export class ElectronLocalServer {
+         return
+       }
+ 
++      if (pathname === '/reload-plugin') {
++        const pluginId = url.searchParams.get('id')
++        if (pluginId) {
++          console.log(`[LocalServer] Reloading plugin: ${pluginId}`)
++          const pm = PluginManager.getInstance()
++          pm.reloadPlugin(pluginId).then((reloaded) => {
++            if (reloaded) {
++              BrowserWindow.getAllWindows().forEach(win => {
++                if (!win.isDestroyed()) {
++                  win.webContents.send('plugin:hot-reloaded', { pluginId, timestamp: Date.now() })
++                }
++              })
++              res.writeHead(200, { 'Content-Type': 'application/json' })
++              res.end(JSON.stringify({ success: true }))
++            } else {
++              res.writeHead(500, { 'Content-Type': 'application/json' })
++              res.end(JSON.stringify({ error: 'Plugin reload returned false (busy or skipped)' }))
++            }
++          }).catch((err) => {
++            console.error('[LocalServer] Failed to reload plugin:', err)
++            res.writeHead(500, { 'Content-Type': 'application/json' })
++            res.end(JSON.stringify({ error: String(err) }))
++          })
++        } else {
++          res.writeHead(400, { 'Content-Type': 'application/json' })
++          res.end(JSON.stringify({ error: 'Missing plugin id' }))
++        }
++        return
++      }
++
+       if (pathname === '/install-plugin') {
+         const pluginUrl = url.searchParams.get('url')
+         if (pluginUrl) {
+@@ -143,6 +189,46 @@ export class ElectronLocalServer {
+         return
+       }
+ 
++      if (pathname === '/load-unpacked-plugin') {
++        const pluginPath = url.searchParams.get('path')
++        if (pluginPath) {
++          console.log(`[LocalServer] Loading unpacked plugin from: ${pluginPath}`)
++          const pm = PluginManager.getInstance()
++          pm.loadUnpackedPlugin(pluginPath).then((plugin) => {
++            if (plugin) {
++              BrowserWindow.getAllWindows().forEach(win => {
++                if (!win.isDestroyed()) {
++                  win.webContents.send('plugin:loaded', { pluginId: plugin.manifest.id, timestamp: Date.now() })
++                }
++              })
++              res.writeHead(200, { 'Content-Type': 'application/json' })
++              res.end(JSON.stringify({ success: true, pluginId: plugin.manifest.id }))
++            } else {
++              res.writeHead(500, { 'Content-Type': 'application/json' })
++              res.end(JSON.stringify({ error: 'Failed to load unpacked plugin' }))
++            }
++          }).catch((err) => {
++            console.error('[LocalServer] Failed to load unpacked plugin:', err)
++            res.writeHead(500, { 'Content-Type': 'application/json' })
++            res.end(JSON.stringify({ error: String(err) }))
++          })
++        } else {
++          res.writeHead(400, { 'Content-Type': 'application/json' })
++          res.end(JSON.stringify({ error: 'Missing path parameter' }))
++        }
++        return
++      }
++
++      if (pathname === '/get-logs') {
++        const pluginId = url.searchParams.get('id') || url.searchParams.get('pluginId') || undefined
++        const limit = parseInt(url.searchParams.get('limit') || '50', 10)
++        const { getInMemoryLogs } = require('./logger')
++        const logs = getInMemoryLogs(pluginId, limit)
++        res.writeHead(200, { 'Content-Type': 'application/json' })
++        res.end(JSON.stringify({ success: true, logs }))
++        return
++      }
++
+       if (pathname === '/buffer/add' && req.method === 'POST') {
+         let body = ''
+         req.on('data', (chunk) => {
+@@ -155,14 +241,6 @@ export class ElectronLocalServer {
+               const spaceId = data.spaceId || 'global'
+               const tempId = `temp_note_${Date.now()}`
+               
+-              ElectronBufferWindow.getInstance().addBufferItem({
+-                uuid: tempId,
+-                content: JSON.stringify({ say: data.content, spaceId }),
+-                event_date: new Date().toISOString(),
+-                keywords: ['临时笔记'],
+-                spaceId,
+-              })
+-
+               res.writeHead(200, { 'Content-Type': 'application/json' })
+               res.end(JSON.stringify({ success: true, uuid: tempId }))
+             } else {
+@@ -335,7 +413,9 @@ export class ElectronLocalServer {
+       try {
+         const tokenFilePath = join(app.getPath('home'), '.berrytrace', 'local_server.json')
+         unlinkSync(tokenFilePath)
+-      } catch {}
++      } catch {
++        // ignore
++      }
+     }
+   }
+ }

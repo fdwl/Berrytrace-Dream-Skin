@@ -1,0 +1,79 @@
+diff --git a/plugins-sdk/types.ts b/plugins-sdk/types.ts
+index d808919..14e1c36 100644
+--- a/plugins-sdk/types.ts
++++ b/plugins-sdk/types.ts
+@@ -316,6 +316,41 @@ export interface ContextAPI extends Omit<GeneratedContextAPI, 'getActiveApp' | '
+    * }
+    */
+   getSelection(): Promise<SelectionInfo | null>;
++
++  /**
++   * 写入共享上下文数据
++   */
++  set(key: string, value: unknown, options?: { ttlMs?: number; scope?: 'session' | 'workspace' | 'global' }): Promise<null>;
++
++  /**
++   * 读取共享上下文数据
++   */
++  get(key: string, options?: { scope?: 'session' | 'workspace' | 'global' }): Promise<unknown>;
++
++  /**
++   * 列出指定 scope 下的所有 key
++   */
++  list(options?: { scope?: 'session' | 'workspace' | 'global' }): Promise<string[]>;
++
++  /**
++   * 清除指定 scope 下的数据
++   */
++  clear(options?: { scope?: 'session' | 'workspace' | 'global' }): Promise<null>;
++}
++
++export interface WorkflowAPI {
++  register(def: Record<string, unknown>): Promise<null>;
++  execute(workflowId: string, input?: Record<string, unknown>, triggerType?: string): Promise<unknown>;
++  list(): Promise<unknown[]>;
++  get(workflowId: string): Promise<unknown>;
++  unregister(workflowId: string): Promise<boolean>;
++  cancel(runId: string): Promise<boolean>;
++  pause(runId: string): Promise<boolean>;
++  resume(runId: string): Promise<boolean>;
++  executeFrom(workflowId: string, fromStepId: string, previousInput?: Record<string, unknown>): Promise<unknown>;
++  getActiveRun(workflowId: string): Promise<unknown>;
++  matchIntent(userQuery: string): Promise<{ matched: boolean; workflowId?: string; workflowName?: string; confidence: number; matchedTrigger?: string }>;
++  getHistory(workflowId: string): Promise<unknown[]>;
+ }
+ 
+ export interface McpContent {
+@@ -1708,6 +1743,9 @@ export interface BerryTraceSDK {
+   /** 上下文 API - 获取用户当前选中的内容或活动应用 */
+   context: ContextAPI;
+ 
++  /** Workflow 编排 API - 注册与硬执行工作流 */
++  workflow: WorkflowAPI;
++
+   /** MCP (Model Context Protocol) API - 注册和管理 MCP 工具 */
+   mcp: McpAPI;
+ 
+@@ -2520,7 +2558,7 @@ export interface GeneratedSystemAPI {
+   /**
+      * 获取宿主应用的 OEM 基础信息（如软件名称）
+      */
+-  getAppInfo(): Promise<{ appName: string; oemId: string; apiGateway: string; logoPath?: string }>;
++  getAppInfo(): Promise<{ appName: string; oemId: string; apiGateway: string; logoPath?: string; browserPolicy?: Record<string, unknown> }>;
+ 
+   /**
+      * 获取可用于屏幕捕获的源列表（屏幕/窗口）。
+@@ -2904,6 +2942,13 @@ export interface GeneratedWorkspaceAPI {
+     headingText?: string;
+   }): Promise<null>;
+ 
++  /**
++     * 在工作区中打开浏览器标签页（主窗口）。自动显示并聚焦主窗口。
++     * @param url 目标网址
++     * @param title 标签标题（可选）
++     */
++  openBrowserTab(url: string, title?: string): Promise<null>;
++
+   /**
+      * 在主窗口打开工作区标签页。自动显示并聚焦主窗口。
+      * @param filePath 文件路径

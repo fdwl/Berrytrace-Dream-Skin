@@ -1,0 +1,120 @@
+/**
+ * worktree-sandbox.ts — Git Worktree Task Sandbox Manager
+ *
+ * Creates lightweight ephemeral Git Worktree branch sandboxes for Agent coding tasks.
+ * Prevents Agent from dirtying the user's primary git branch or workspace.
+ */
+
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const execFileAsync = promisify(execFile);
+
+export interface SandboxSession {
+  sessionId: string;
+  repoPath: string;
+  worktreePath: string;
+  branchName: string;
+  createdAt: number;
+}
+
+export class GitWorktreeSandboxManager {
+  private static activeSandboxes = new Map<string, SandboxSession>();
+
+  /**
+   * Create an isolated Git Worktree sandbox for an agent session.
+   */
+  public static async createSandbox(repoPath: string, sessionId: string): Promise<SandboxSession | null> {
+    try {
+      // 1. Verify if repoPath is a valid git repository
+      const { stdout: isRepo } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: repoPath });
+      if (isRepo.trim() !== 'true') {
+        console.log(`[GitWorktreeSandbox] ${repoPath} is not a git repo. Skipping worktree creation.`);
+        return null;
+      }
+
+      // Cleanup any legacy prunables first
+      await this.pruneOrphanSandboxes(repoPath);
+
+      const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const branchName = `berrytrace-task-${sanitizedSessionId}`;
+      const worktreeDir = path.join(repoPath, '.berrytrace', 'worktrees', sanitizedSessionId);
+
+      if (!fs.existsSync(path.dirname(worktreeDir))) {
+        fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
+      }
+
+      // 2. Create git worktree safely
+      console.log(`[GitWorktreeSandbox] Creating worktree sandbox at ${worktreeDir} on branch ${branchName}...`);
+      await execFileAsync('git', ['worktree', 'add', '-b', branchName, worktreeDir, 'HEAD'], { cwd: repoPath });
+
+      const session: SandboxSession = {
+        sessionId: sanitizedSessionId,
+        repoPath,
+        worktreePath: worktreeDir,
+        branchName,
+        createdAt: Date.now(),
+      };
+
+      this.activeSandboxes.set(sanitizedSessionId, session);
+      return session;
+    } catch (err) {
+      console.warn(`[GitWorktreeSandbox] Failed to create worktree sandbox for ${sessionId}:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Safely merge and clean up a sandbox after user approval.
+   */
+  public static async mergeAndCleanup(sessionId: string): Promise<boolean> {
+    const session = this.activeSandboxes.get(sessionId);
+    if (!session) return false;
+
+    try {
+      console.log(`[GitWorktreeSandbox] Merging sandbox branch ${session.branchName} into main repo...`);
+      // Merge changes from sandbox branch
+      await execFileAsync('git', ['merge', '--no-ff', session.branchName, '-m', `Merge Agent task ${sessionId}`], { cwd: session.repoPath });
+      return await this.removeSandbox(sessionId);
+    } catch (err) {
+      console.error(`[GitWorktreeSandbox] Failed to merge sandbox for ${sessionId}:`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Remove and discard a sandbox (e.g. task cancelled or rejected).
+   */
+  public static async removeSandbox(sessionId: string): Promise<boolean> {
+    const session = this.activeSandboxes.get(sessionId);
+    if (!session) return false;
+
+    try {
+      console.log(`[GitWorktreeSandbox] Removing worktree sandbox at ${session.worktreePath}...`);
+      await execFileAsync('git', ['worktree', 'remove', '--force', session.worktreePath], { cwd: session.repoPath });
+      await execFileAsync('git', ['branch', '-D', session.branchName], { cwd: session.repoPath }).catch(() => {});
+      this.activeSandboxes.delete(sessionId);
+      return true;
+    } catch (err) {
+      console.warn(`[GitWorktreeSandbox] Failed to remove sandbox for ${sessionId}:`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Prune dangling worktrees that were abandoned or interrupted.
+   */
+  public static async pruneOrphanSandboxes(repoPath: string): Promise<void> {
+    try {
+      await execFileAsync('git', ['worktree', 'prune'], { cwd: repoPath });
+    } catch {
+      // ignore git worktree prune failure
+    }
+  }
+
+  public static getSandbox(sessionId: string): SandboxSession | undefined {
+    return this.activeSandboxes.get(sessionId);
+  }
+}

@@ -1,0 +1,45 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+index add475c..38cfdfe 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+@@ -1,6 +1,7 @@
+ ---
+ name: plugin-creator
+ description: BerryTrace 插件开发指南。创建、修改、调试 BerryTrace 插件，或将现有的 GitHub 代码库、NPM 命令行工具包包装/封装为可供 AI 调用的本地插件与 MCP 工具。
++last_synced_git: e324be429097babf8c36ce8fc6f7073e16bb36cb
+ ---
+ 
+ # BerryTrace 插件开发指南
+@@ -97,6 +98,9 @@ UI 注册、命令、菜单、激活条件全部在 `plugin.json` 声明，不
+ 7. panel 类型不需要 `activate()` / `deactivate()`
+ 8. 事件驱动加载 — `contributes.events.listens` 声明的事件会自动唤醒未运行的插件，注意控制声明范围
+ 9. 事件声明规范 — `listens` 声明监听的事件，`emits` 声明发射的事件，未声明的事件不会推送给该插件
++10. OEM 内置插件 — 在 `oem.config.json` 的 `builtinPlugins` 白名单中的插件始终启用，用户无法禁用
++11. view 构建使用全局 shim — `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand` 从 `window` 全局变量读取，无需 external
++12. 进程隔离 — `required`/`recommended` 独立进程，`optional` 共享池，不做运行时动态切换
+ 
+ ---
+ 
+@@ -136,14 +140,15 @@ skill 自带 `scripts/` 目录，包含以下工具：
+ <!-- API_INDEX_START -->
+ | 模块 | 文件 | 方法数 |
+ |------|------|--------|
+-| system | [07a-system.md](./references/07a-system.md) | 26 |
++| system | [07a-system.md](./references/07a-system.md) | 14 |
+ | filesystem | [07b-filesystem.md](./references/07b-filesystem.md) | 14 |
+-| storage | [07c-storage.md](./references/07c-storage.md) | 6 |
+-| ai / mcp | [07d-ai-mcp.md](./references/07d-ai-mcp.md) | 12 |
++| storage | [07c-storage.md](./references/07c-storage.md) | 5 |
++| ai / mcp | [07d-ai-mcp.md](./references/07d-ai-mcp.md) | 13 |
+ | window / dialog / log / commands | [07e-window.md](./references/07e-window.md) | 21 |
+-| workspace / scheduler / plugin / context | [07f-workspace.md](./references/07f-workspace.md) | 20 |
+-| local-ai / search | [07g-local-ai-search.md](./references/07g-local-ai-search.md) | 10 |
+-| publish / user | [07h-publish-user.md](./references/07h-publish-user.md) | 8 |
+-| hooks | [07i-hooks.md](./references/07i-hooks.md) | 4 |
++| workspace / scheduler / plugin / context / selectionMenu | [07f-workspace.md](./references/07f-workspace.md) | 31 |
++| local-ai / search | [07g-local-ai-search.md](./references/07g-local-ai-search.md) | 2 |
++| user | [07h-publish-user.md](./references/07h-publish-user.md) | 5 |
++| hooks | [07i-hooks.md](./references/07i-hooks.md) | 3 |
++| 系统事件 | [07y-events.md](./references/07y-events.md) | — |
+ | 回调注册 | [07z-callbacks.md](./references/07z-callbacks.md) | 17 |
+ <!-- API_INDEX_END -->

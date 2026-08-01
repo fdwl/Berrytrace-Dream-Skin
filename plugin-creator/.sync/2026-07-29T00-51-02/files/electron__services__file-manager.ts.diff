@@ -1,0 +1,370 @@
+diff --git a/electron/services/file-manager.ts b/electron/services/file-manager.ts
+index 51d992e..6f55d29 100644
+--- a/electron/services/file-manager.ts
++++ b/electron/services/file-manager.ts
+@@ -1,8 +1,88 @@
+-import { app, shell, net, clipboard, nativeImage, ipcMain, dialog, BrowserWindow, OpenDialogOptions } from 'electron'
++import type { OpenDialogOptions } from 'electron';
++import { app, shell, net, clipboard, nativeImage, ipcMain, dialog, BrowserWindow } from 'electron'
+ import fs, { promises as fsPromises } from 'fs'
+ import { join, basename } from 'path'
+ import { normalizePath } from '../utils/path-utils'
+ import { RipgrepService } from './ripgrep-service'
++import { BERRYTRACE_HOME } from '../config/paths'
++
++const RECENT_SESSIONS_FILE = join(BERRYTRACE_HOME, 'recent_sessions.json');
++
++interface RecentSessionItem {
++  sessionId: string;
++  title?: string;
++  task?: string;
++  workDir: string;
++  status?: string;
++  startedAt?: number;
++  updatedAt?: number;
++  finalMessage?: string;
++  [key: string]: unknown;
++}
++
++async function getRecentSessionsList(): Promise<RecentSessionItem[]> {
++  try {
++    if (fs.existsSync(RECENT_SESSIONS_FILE)) {
++      const content = await fsPromises.readFile(RECENT_SESSIONS_FILE, 'utf-8');
++      const list = JSON.parse(content);
++      if (Array.isArray(list)) return list;
++    }
++  } catch (err) {
++    console.warn('[FileManager:getRecentSessionsList] Warning:', err);
++  }
++  return [];
++}
++
++async function updateRecentSessions(session: Record<string, unknown>): Promise<RecentSessionItem[]> {
++  try {
++    if (!session || !session.sessionId) return [];
++    if (!fs.existsSync(BERRYTRACE_HOME)) {
++      await fsPromises.mkdir(BERRYTRACE_HOME, { recursive: true });
++    }
++    const currentList = await getRecentSessionsList();
++    const sessionId = String(session.sessionId);
++    
++    const metaItem: RecentSessionItem = {
++      sessionId,
++      title: (session.title as string) || (session.task as string)?.slice(0, 28) || 'AI 会话',
++      task: (session.task as string) || '',
++      workDir: (session.workDir as string) || '',
++      status: (session.status as string) || 'completed',
++      startedAt: Number(session.startedAt) || Date.now(),
++      updatedAt: Number(session.updatedAt) || Date.now(),
++      finalMessage: session.finalMessage as string | undefined,
++    };
++
++    let filtered = currentList.filter((item) => item.sessionId !== sessionId);
++    filtered.unshift(metaItem);
++    filtered.sort((a, b) => (Number(b.startedAt || b.updatedAt) || 0) - (Number(a.startedAt || a.updatedAt) || 0));
++
++    if (filtered.length > 20) {
++      filtered = filtered.slice(0, 20);
++    }
++
++    await fsPromises.writeFile(RECENT_SESSIONS_FILE, JSON.stringify(filtered, null, 2), 'utf-8');
++    return filtered;
++  } catch (err) {
++    console.error('[FileManager:updateRecentSessions] Error updating recent sessions:', err);
++    return [];
++  }
++}
++
++async function removeRecentSession(sessionId: string): Promise<RecentSessionItem[]> {
++  try {
++    if (!sessionId) return [];
++    const currentList = await getRecentSessionsList();
++    const filtered = currentList.filter((item) => item.sessionId !== sessionId);
++    if (filtered.length !== currentList.length) {
++      await fsPromises.writeFile(RECENT_SESSIONS_FILE, JSON.stringify(filtered, null, 2), 'utf-8');
++    }
++    return filtered;
++  } catch (err) {
++    console.error('[FileManager:removeRecentSession] Error removing recent session:', err);
++    return [];
++  }
++}
+ 
+ /** 精准浅层扫描项目目录下的 .workflow 文件 (最多 2 层：根目录及 1 级常用子目录) */
+ async function scanShallowWorkflowFiles(projectDir: string): Promise<string[]> {
+@@ -132,12 +212,231 @@ export function registerFileIpcHandlers(handleOpenFile: (filePath: string, line?
+       const content = await fsPromises.readFile(normalized, 'utf-8');
+       console.log(`[WorkspaceManager:readWorkflowContent] 成功读取 "${filePath}" (${content.length} 字节)`);
+       return content;
+-    } catch (err) {
+-      console.error('[WorkspaceManager:readWorkflowContent] 失败:', err);
++    } catch (err: unknown) {
++      const e = err as { code?: string };
++      if (e?.code === 'ENOENT') {
++        console.log(`[WorkspaceManager:readWorkflowContent] 文件未找到 (ENOENT): "${filePath}"`);
++      } else {
++        console.error('[WorkspaceManager:readWorkflowContent] 失败:', err);
++      }
+       return '';
+     }
+   })
+ 
++  ipcMain.handle('agent:list-file-sessions', async (_event, workDir: string, limit?: number) => {
++    if (!workDir) return [];
++    try {
++      const sessionsDir = join(workDir, '.berrytrace', 'sessions');
++      const sessionMap = new Map<string, Record<string, unknown>>();
++
++      const extractMsgText = (msg: { content?: unknown; text?: unknown } | null | undefined): string => {
++        if (!msg) return '';
++        if (typeof msg.content === 'string') return msg.content;
++        if (Array.isArray(msg.content)) {
++          const texts = msg.content
++            .filter((p: unknown): p is { type?: string; text?: string } => Boolean(p && typeof p === 'object'))
++            .map((p) => p.text || '');
++          if (texts.length > 0) return texts.join('\n');
++        }
++        if (typeof msg.text === 'string') return msg.text;
++        return '';
++      };
++
++      // 唯一的统一会话存储位置：.berrytrace/sessions/${sessionId}/
++      if (fs.existsSync(sessionsDir)) {
++        const entries = await fsPromises.readdir(sessionsDir, { withFileTypes: true });
++        for (const entry of entries) {
++          try {
++            let sessionId = '';
++            let sessionJsonPath = '';
++            let messagesJsonPath = '';
++
++            if (entry.isDirectory()) {
++              sessionId = entry.name;
++              const subSessionJson = join(sessionsDir, sessionId, 'session.json');
++              const subMessagesJsonl = join(sessionsDir, sessionId, 'messages.jsonl');
++              const subMessagesJson = join(sessionsDir, sessionId, 'messages.json');
++
++              if (fs.existsSync(subSessionJson)) sessionJsonPath = subSessionJson;
++              if (fs.existsSync(subMessagesJsonl)) {
++                messagesJsonPath = subMessagesJsonl;
++              } else if (fs.existsSync(subMessagesJson)) {
++                messagesJsonPath = subMessagesJson;
++              }
++            } else if (entry.isFile() && entry.name.endsWith('.json')) {
++              sessionId = entry.name.replace('.json', '');
++              sessionJsonPath = join(sessionsDir, entry.name);
++            }
++
++            if (!sessionId) continue;
++
++            let metaData: Record<string, unknown> = {};
++            let statMs = Date.now();
++
++            if (sessionJsonPath) {
++              const stat = await fsPromises.stat(sessionJsonPath);
++              statMs = stat.mtimeMs;
++              const raw = await fsPromises.readFile(sessionJsonPath, 'utf-8');
++              metaData = (JSON.parse(raw) || {}) as Record<string, unknown>;
++            }
++
++            let turnsData = (metaData.turns as unknown[]) || [];
++            if (messagesJsonPath) {
++              const rawMsgs = await fsPromises.readFile(messagesJsonPath, 'utf-8');
++              if (messagesJsonPath.endsWith('.jsonl')) {
++                const msgs = rawMsgs
++                  .split('\n')
++                  .map(line => line.trim())
++                  .filter(line => line.length > 0)
++                  .map(line => {
++                    try { return JSON.parse(line); } catch { return null; }
++                  })
++                  .filter(Boolean);
++                if (msgs.length > 0) turnsData = msgs;
++              } else {
++                const msgs = JSON.parse(rawMsgs);
++                if (Array.isArray(msgs) && msgs.length > 0) {
++                  turnsData = msgs;
++                }
++              }
++            }
++
++            let firstTask = (metaData.task as string) || '';
++            if (!firstTask && Array.isArray(turnsData)) {
++              const firstUserMsg = (turnsData as Array<{ role?: string; type?: string; content?: unknown; text?: unknown }>).find(
++                (m) => m && (m.role === 'user' || m.type === 'user')
++              );
++              if (firstUserMsg) {
++                firstTask = extractMsgText(firstUserMsg);
++              }
++            }
++
++            const cleanFirstTask = firstTask || 'AI 会话';
++            const defaultTitle = cleanFirstTask.length > 28 ? cleanFirstTask.slice(0, 28) + '...' : cleanFirstTask;
++            const lastMsg = Array.isArray(turnsData) ? (turnsData[turnsData.length - 1] as { content?: unknown; text?: unknown }) : undefined;
++            const finalMsg = (metaData.finalMessage as string) || (lastMsg ? extractMsgText(lastMsg) : undefined);
++
++            sessionMap.set(sessionId, {
++              sessionId,
++              title: (metaData.title as string) || defaultTitle,
++              task: cleanFirstTask,
++              workDir: (metaData.workDir as string) || workDir,
++              status: metaData.status || 'completed',
++              steps: metaData.steps || [],
++              finalMessage: finalMsg,
++              turns: turnsData,
++              startedAt: metaData.startedAt || statMs,
++              updatedAt: metaData.updatedAt || statMs,
++            });
++          } catch {
++            // ignore invalid session
++          }
++        }
++      }
++
++      const list = Array.from(sessionMap.values());
++      list.sort((a, b) => ((b.updatedAt as number) || 0) - ((a.updatedAt as number) || 0));
++      return limit && limit > 0 ? list.slice(0, limit) : list;
++    } catch (err) {
++      console.error('[FileManager:listFileSessions] Error listing file sessions:', err);
++      return [];
++    }
++  });
++
++  ipcMain.handle('agent:get-recent-sessions', async () => {
++    let list = await getRecentSessionsList();
++    if (list.length === 0) {
++      try {
++        const { WorkspaceManager } = await import('./workspace-manager');
++        const history = WorkspaceManager.getInstance().getHistory();
++        const allScanned: RecentSessionItem[] = [];
++
++        for (const ws of history) {
++          if (!ws.path || !fs.existsSync(ws.path)) continue;
++          const sessionsDir = join(ws.path, '.berrytrace', 'sessions');
++          if (!fs.existsSync(sessionsDir)) continue;
++
++          const entries = await fsPromises.readdir(sessionsDir, { withFileTypes: true });
++          for (const entry of entries) {
++            if (!entry.isDirectory()) continue;
++            const sId = entry.name;
++            const sessionJson = join(sessionsDir, sId, 'session.json');
++            if (fs.existsSync(sessionJson)) {
++              try {
++                const raw = await fsPromises.readFile(sessionJson, 'utf-8');
++                const data = JSON.parse(raw);
++                if (data && data.sessionId) {
++                  allScanned.push({
++                    sessionId: String(data.sessionId),
++                    title: (data.title as string) || (data.task as string)?.slice(0, 28) || 'AI 会话',
++                    task: (data.task as string) || '',
++                    workDir: (data.workDir as string) || ws.path,
++                    status: (data.status as string) || 'completed',
++                    startedAt: Number(data.startedAt) || Date.now(),
++                    updatedAt: Number(data.updatedAt) || Date.now(),
++                    finalMessage: data.finalMessage as string | undefined,
++                  });
++                }
++              } catch { /* ignore */ }
++            }
++          }
++        }
++
++        allScanned.sort((a, b) => (Number(b.startedAt || b.updatedAt) || 0) - (Number(a.startedAt || a.updatedAt) || 0));
++        list = allScanned.slice(0, 20);
++        if (list.length > 0) {
++          if (!fs.existsSync(BERRYTRACE_HOME)) {
++            await fsPromises.mkdir(BERRYTRACE_HOME, { recursive: true });
++          }
++          await fsPromises.writeFile(RECENT_SESSIONS_FILE, JSON.stringify(list, null, 2), 'utf-8');
++        }
++      } catch (err) {
++        console.error('[FileManager:get-recent-sessions] Auto-seed failed:', err);
++      }
++    }
++    return list.slice(0, 20);
++  });
++
++  ipcMain.handle('agent:save-file-session', async (_event, session: { sessionId?: string; workDir?: string; [key: string]: unknown }) => {
++    if (!session || !session.sessionId || !session.workDir) return false;
++    try {
++      const sessionSubDir = join(session.workDir, '.berrytrace', 'sessions', session.sessionId);
++      if (!fs.existsSync(sessionSubDir)) {
++        await fsPromises.mkdir(sessionSubDir, { recursive: true });
++      }
++      const filePath = join(sessionSubDir, 'session.json');
++      const payload = {
++        ...session,
++        updatedAt: Date.now(),
++      };
++      await fsPromises.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf-8');
++      await updateRecentSessions(payload);
++      return true;
++    } catch (err) {
++      console.error('[FileManager:saveFileSession] Failed to save session JSON:', err);
++      return false;
++    }
++  });
++
++  ipcMain.handle('agent:delete-file-session', async (_event, workDir: string, sessionId: string) => {
++    if (!workDir || !sessionId) return false;
++    try {
++      const sessionSubDir = join(workDir, '.berrytrace', 'sessions', `${sessionId}`);
++      const sessionFile = join(workDir, '.berrytrace', 'sessions', `${sessionId}.json`);
++      if (fs.existsSync(sessionSubDir)) {
++        await fsPromises.rm(sessionSubDir, { recursive: true, force: true }).catch(() => {});
++      }
++      if (fs.existsSync(sessionFile)) {
++        await fsPromises.unlink(sessionFile).catch(() => {});
++      }
++      await removeRecentSession(sessionId);
++      return true;
++    } catch (err) {
++      console.error('[FileManager:deleteFileSession] Failed to delete session files:', err);
++      return false;
++    }
++  });
++
+   ipcMain.handle('file:read', async (_event, filePath: string) => {
+     try {
+       const normalizedPath = normalizePath(filePath)
+@@ -207,17 +506,35 @@ export function registerFileIpcHandlers(handleOpenFile: (filePath: string, line?
+   })
+ 
+   ipcMain.handle('file:show-in-folder', async (_event, filePath: string) => {
+-    shell.showItemInFolder(normalizePath(filePath))
+-    return true
++    try {
++      const normalized = normalizePath(filePath)
++      shell.showItemInFolder(normalized)
++      return true
++    } catch (err) {
++      console.error('[file:show-in-folder] Failed showItemInFolder, trying openPath fallback:', err)
++      try {
++        await shell.openPath(normalizePath(filePath))
++        return true
++      } catch (fallbackErr) {
++        console.error('[file:show-in-folder] Fallback failed:', fallbackErr)
++        return false
++      }
++    }
+   })
+ 
+   ipcMain.handle('file:open-path', async (_event, filePath: string) => {
+-    const err = await shell.openPath(normalizePath(filePath))
+-    if (err) {
+-      console.error('Failed to open path:', err)
++    try {
++      const normalized = normalizePath(filePath)
++      const err = await shell.openPath(normalized)
++      if (err) {
++        console.warn('[file:open-path] openPath returned error, attempting showItemInFolder:', err)
++        shell.showItemInFolder(normalized)
++      }
++      return true
++    } catch (e) {
++      console.error('Failed to open path:', e)
+       return false
+     }
+-    return true
+   })
+ 
+   ipcMain.handle('clipboard:write-image-data-url', async (_event, dataUrl: string) => {

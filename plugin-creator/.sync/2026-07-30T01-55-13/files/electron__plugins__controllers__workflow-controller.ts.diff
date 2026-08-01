@@ -1,0 +1,15 @@
+diff --git a/electron/plugins/controllers/workflow-controller.ts b/electron/plugins/controllers/workflow-controller.ts
+index be92e18..ee77b13 100644
+--- a/electron/plugins/controllers/workflow-controller.ts
++++ b/electron/plugins/controllers/workflow-controller.ts
+@@ -1,7 +1,8 @@
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { WorkflowEngine } from '../workflow-engine';
+ import { SharedContextStore } from '../shared-context-store';
+-import { WorkflowDefinition, ContextOptions, WorkflowExecutionContext } from '../workflow-types';
++import type { WorkflowDefinition, ContextOptions, WorkflowExecutionContext } from '../workflow-types';
+ import { WorkspaceController } from './workspace';
+ import { WorkflowHistoryManager } from '../workflow-history-manager';
+ import { WorkflowIntentRouter } from '../workflow-intent-router';

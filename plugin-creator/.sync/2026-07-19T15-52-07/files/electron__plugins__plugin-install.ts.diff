@@ -1,0 +1,253 @@
+diff --git a/electron/plugins/plugin-install.ts b/electron/plugins/plugin-install.ts
+index d49cbe5..0008d25 100644
+--- a/electron/plugins/plugin-install.ts
++++ b/electron/plugins/plugin-install.ts
+@@ -1,6 +1,8 @@
+ import { app, net } from 'electron';
++import { Worker } from 'worker_threads';
+ import * as path from 'path';
+ import * as fs from 'fs';
++import { fileURLToPath } from 'url';
+ import AdmZip from 'adm-zip';
+ import { verifyPackageSignature, PluginManifest, SignatureJson } from './signature-verifier';
+ import { PluginManager, getPluginRootDir } from './plugin-manager';
+@@ -9,6 +11,9 @@ import { ElectronFloatBall } from '../windows/float-ball';
+ import { SKILLS_DIR } from '../config/paths';
+ import eventBus from '../../src/services/event_bus';
+ 
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = path.dirname(__filename);
++
+ export interface PackageInfo {
+   success: boolean;
+   error?: string;
+@@ -26,108 +31,96 @@ export interface PackageInfo {
+   };
+ }
+ 
+-/**
+- * Verifies a plugin package's integrity and signature.
+- * Extracts the contents to a temporary directory for analysis.
+- */
+-export async function verifyPackage(packagePath: string): Promise<PackageInfo> {
+-  const tempDir = path.join(app.getPath('temp'), `berrytrace-install-${Date.now()}`);
+-
+-  try {
+-    console.log(`[PluginInstall] Verifying plugin package: ${packagePath}`);
+-    if (!fs.existsSync(packagePath)) {
+-      return { success: false, error: `文件不存在: ${packagePath}` };
+-    }
+-
+-    // 1. Extract ZIP to a temporary directory
+-    fs.mkdirSync(tempDir, { recursive: true });
+-    const zip = new AdmZip(packagePath);
+-
+-    // Safety check: before extracting, verify that no zip entries escape the destination
+-    for (const entry of zip.getEntries()) {
+-      const entryPath = entry.entryName;
+-      const targetPath = path.resolve(tempDir, entryPath);
+-      const relative = path.relative(tempDir, targetPath);
+-      if (relative.startsWith('..') || path.isAbsolute(relative)) {
+-        throw new Error(`检测到非法的压缩包路径 (Zip Slip): ${entryPath}`);
++class PluginInstallerWorkerManager {
++  private static worker: Worker | null = null;
++  private static pendingRequests = new Map<string, { resolve: Function; reject: Function }>();
++  private static nextTaskId = 0;
++
++  private static getWorker(): Worker {
++    if (this.worker) return this.worker;
++
++    // Resolve worker path
++    let workerPath = path.join(__dirname, 'workers/plugin-installer.worker.js');
++    if (!fs.existsSync(workerPath)) {
++      const appPath = app.isPackaged ? process.resourcesPath : process.cwd();
++      const altPath = path.join(appPath, 'dist-electron/workers/plugin-installer.worker.js');
++      if (fs.existsSync(altPath)) {
++        workerPath = altPath;
++      } else {
++        const legacyPath = path.join(__dirname, '../workers/plugin-installer.worker.js');
++        if (fs.existsSync(legacyPath)) {
++          workerPath = legacyPath;
++        } else {
++          // Dev fallback
++          const devPath = path.join(process.cwd(), 'dist-electron/workers/plugin-installer.worker.js');
++          if (fs.existsSync(devPath)) {
++            workerPath = devPath;
++          }
++        }
+       }
+     }
+ 
+-    zip.extractAllTo(tempDir, true);
+-
+-    // 2. Read signature.json and plugin.json
+-    const signatureJsonPath = path.join(tempDir, 'signature.json');
+-    const pluginJsonPath = path.join(tempDir, 'plugin.json');
+-
+-    if (!fs.existsSync(pluginJsonPath)) {
+-      cleanupTempDir(tempDir);
+-      return { success: false, error: '未找到 plugin.json，不是有效的插件安装包。' };
+-    }
+-
+-    let pluginJson: PluginManifest;
+-    try {
+-      pluginJson = JSON.parse(fs.readFileSync(pluginJsonPath, 'utf8'));
+-    } catch (e: unknown) {
+-      cleanupTempDir(tempDir);
+-      const msg = e instanceof Error ? e.message : String(e);
+-      return { success: false, error: `无法解析 plugin.json: ${msg}` };
+-    }
+-
+-    let signatureJson: SignatureJson | undefined = undefined;
+-    if (fs.existsSync(signatureJsonPath)) {
+-      try {
+-        signatureJson = JSON.parse(fs.readFileSync(signatureJsonPath, 'utf8'));
+-      } catch (e) {
+-        console.warn('[PluginInstall] Warning: Failed to parse signature.json', e);
++    console.log(`[PluginInstallerWorker] Initializing Worker Thread at path: ${workerPath}`);
++    this.worker = new Worker(workerPath);
++
++    this.worker.on('message', (response) => {
++      const { taskId, success, result, error } = response;
++      const req = this.pendingRequests.get(taskId);
++      if (req) {
++        if (success) {
++          req.resolve(result);
++        } else {
++          req.reject(new Error(error));
++        }
++        this.pendingRequests.delete(taskId);
+       }
+-    }
++    });
+ 
+-    // 3. Verify signature and integrity
+-    let verification: PackageInfo['verification'] = undefined;
++    this.worker.on('error', (err) => {
++      console.error('[PluginInstallerWorker] Worker error:', err);
++      this.worker = null;
++    });
+ 
+-    if (signatureJson) {
+-      // Validate signature
+-      const verifResult = verifyPackageSignature(tempDir, signatureJson);
+-      if (!verifResult.isValid) {
+-        cleanupTempDir(tempDir);
+-        return { success: false, error: `签名验证失败: ${verifResult.error}` };
++    this.worker.on('exit', (code) => {
++      if (code !== 0) {
++        console.error(`[PluginInstallerWorker] Worker stopped with exit code ${code}`);
+       }
++      this.worker = null;
++    });
+ 
+-      // Ensure the metadata matches signature
+-      if (pluginJson.id !== verifResult.pluginId || pluginJson.version !== verifResult.version) {
+-        cleanupTempDir(tempDir);
+-        return { success: false, error: '安全验证错误: 插件描述与数字签名中的标识不匹配。' };
++    return this.worker;
++  }
++
++  public static runTask(action: 'verify' | 'copy-files', payload: Record<string, any>): Promise<any> {
++    return new Promise((resolve, reject) => {
++      try {
++        const worker = this.getWorker();
++        const taskId = `${Date.now()}-${this.nextTaskId++}`;
++        this.pendingRequests.set(taskId, { resolve, reject });
++        worker.postMessage({ action, taskId, ...payload });
++      } catch (err) {
++        reject(err);
+       }
++    });
++  }
++}
+ 
+-      verification = {
+-        isValid: true,
+-        isOfficial: verifResult.isOfficial,
+-        publicKey: verifResult.publicKey,
+-        pluginId: verifResult.pluginId,
+-        version: verifResult.version
+-      };
+-    } else {
+-      verification = {
+-        isValid: false,
+-        isOfficial: false,
+-        publicKey: '',
+-        pluginId: pluginJson.id,
+-        version: pluginJson.version,
+-        error: '无签名'
+-      };
+-    }
++/**
++ * Verifies a plugin package's integrity and signature.
++ * Extracts the contents to a temporary directory for analysis in background worker.
++ */
++export async function verifyPackage(packagePath: string): Promise<PackageInfo> {
++  const tempDir = path.join(app.getPath('temp'), `berrytrace-install-${Date.now()}`);
+ 
++  try {
++    console.log(`[PluginInstall] Verifying plugin package in background worker: ${packagePath}`);
++    const result = await PluginInstallerWorkerManager.runTask('verify', { packagePath, tempDir });
+     return {
+       success: true,
+-      tempDir,
+-      packagePath,
+-      manifest: pluginJson,
+-      signature: signatureJson,
+-      verification
++      ...result
+     };
+-
+   } catch (err: unknown) {
+-    console.error('[PluginInstall] Verification failed:', err);
++    console.error('[PluginInstall] Verification failed in worker:', err);
+     cleanupTempDir(tempDir);
+     const msg = err instanceof Error ? err.message : String(err);
+     return { success: false, error: `校验插件时发生错误: ${msg}` };
+@@ -155,33 +148,10 @@ export async function confirmInstallPackage(
+     }
+     fs.mkdirSync(tempDestDir, { recursive: true });
+ 
+-    // Determine files to copy:
+-    // If signed, copy ONLY files listed in files map to avoid unverified extra files.
+-    // If unsigned, copy everything in tempDir.
+-    const filesToCopy = signatureJson ? Object.keys(signatureJson.files) : fs.readdirSync(tempDir).filter(f => f !== 'signature.json');
+-
+-    for (const relPath of filesToCopy) {
+-      const srcFile = path.join(tempDir, relPath);
+-      const destFile = path.join(tempDestDir, relPath);
+-
+-      // Safety check: ensure file copy destinations do not escape tempDestDir
+-      const relativeDest = path.relative(tempDestDir, destFile);
+-      if (relativeDest.startsWith('..') || path.isAbsolute(relativeDest)) {
+-        throw new Error(`检测到非法目标拷贝路径: ${relPath}`);
+-      }
+-
+-      fs.mkdirSync(path.dirname(destFile), { recursive: true });
+-      fs.copyFileSync(srcFile, destFile);
+-    }
+-
+-    // Also copy signature.json if it exists
+-    if (signatureJson) {
+-      const signatureJsonPath = path.join(tempDir, 'signature.json');
+-      if (fs.existsSync(signatureJsonPath)) {
+-        fs.copyFileSync(signatureJsonPath, path.join(tempDestDir, 'signature.json'));
+-      }
+-    }
++    // 1. Offload heavy file copying to the background worker thread
++    await PluginInstallerWorkerManager.runTask('copy-files', { tempDir, tempDestDir, signatureJson });
+ 
++    // 2. Perform fast deactivation & rename operations synchronously
+     // Deactivate first before atomic replacement
+     await PluginManager.getInstance().deactivatePlugin(pluginId);
+ 
+@@ -216,7 +186,7 @@ export async function confirmInstallPackage(
+ 
+     console.log(`[PluginInstall] Successfully installed plugin to: ${destDir}`);
+ 
+-    // ── Skills 同步：将插件内的 skills/ 目录复制到公共 Skills 目录 ───────────────
++    // ── Skills 同步：将插件内的 skills/ 目录复制 to 公共 Skills 目录 ───────────────
+     // 公共 Skills 目录：BERRYTRACE_HOME/skills/<pluginId>/
+     // AI 内核（mastra-kernel）从此固定路径读取，不再依赖插件目录
+     await syncPluginSkills(destDir, pluginId);

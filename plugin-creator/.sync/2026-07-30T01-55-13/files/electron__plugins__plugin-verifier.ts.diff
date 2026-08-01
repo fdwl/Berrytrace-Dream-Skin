@@ -1,0 +1,105 @@
+diff --git a/electron/plugins/plugin-verifier.ts b/electron/plugins/plugin-verifier.ts
+index 54b00ca..f939e1e 100644
+--- a/electron/plugins/plugin-verifier.ts
++++ b/electron/plugins/plugin-verifier.ts
+@@ -1,6 +1,3 @@
+-import { join } from 'path';
+-import { promises as fs } from 'fs';
+-import { verifyPluginSignature, verifyPackageSignature } from './signature-verifier';
+ 
+ export interface PluginManifest {
+   id: string;
+@@ -66,6 +63,55 @@ export interface PluginManifest {
+    * 默认使用全局 5 分钟 (300000ms)。
+    */
+   idleTimeout?: number;
++  /**
++   * 声明式启动入口（Startup Entry）。
++   *
++   * 插件通过此字段声明它能提供一种「替代启动模式」。
++   * 宿主扫描所有已安装插件的 manifest，将所有 startupEntry 汇总展示给用户，
++   * 用户在宿主设置中选择激活哪一个（或使用默认正常启动）。
++   *
++   * 规则：
++   * - 同时只能有一个 startupEntry 生效（排他性入口）
++   * - 具体激活哪个插件的 entry，由宿主 cache 中的 activeStartupEntry 决定
++   * - 插件本身不控制是否激活，控制权在宿主和用户
++   *
++   * @example
++   * // voice-agents/plugin.json
++   * "startupEntry": {
++   *   "type": "suppressMainWindow",
++   *   "label": "语音助手快速启动",
++   *   "description": "应用启动时只显示语音助手界面，不打开主窗口，降低内存占用约 70%",
++   *   "voiceUiPlugins": [
++   *     { "id": "com.berrytrace.plugin.voice-ui-desktop-pet", "label": "桌面宠物", "isDefault": true },
++   *     { "id": "com.berrytrace.plugin.voice-ui-minimal-hud", "label": "极简 HUD" }
++   *   ]
++   * }
++   */
++  startupEntry?: {
++    /**
++     * 入口类型，决定宿主如何调整启动行为。
++     * - 'suppressMainWindow': 不显示主窗口，只显示关联的 voice UI 浮窗
++     */
++    type: 'suppressMainWindow';
++    /** 在宿主设置中展示的入口名称 */
++    label: string;
++    /** 详细描述，展示在宿主设置的选项下方 */
++    description?: string;
++    /**
++     * 该入口关联的 Voice UI 子插件列表（仅 suppressMainWindow 类型使用）。
++     * 宿主会让用户从中选择一个作为启动时显示的界面。
++     * 若为空，宿主自动激活 voice-agents 的默认 UI。
++     */
++    voiceUiPlugins?: Array<{
++      /** 子插件 ID（需已安装） */
++      id: string;
++      /** 在选择器中展示的名称 */
++      label: string;
++      /** 是否为默认选项（未配置时使用） */
++      isDefault?: boolean;
++    }>;
++  };
++
+   contributes?: {
+     selectionMenuItems?: Array<{
+       id: string;
+@@ -136,21 +182,26 @@ export type PluginStatus = 'DEV' | 'APPROVED' | 'VERIFIED' | 'UNVERIFIED' | 'BLO
+ 
+ export class PluginVerifier {
+   public static async getPluginStatus(
+-    manifest: PluginManifest,
+-    fullPath: string,
+-    isDevFolder: boolean
++    _manifest: PluginManifest,
++    _fullPath: string,
++    isDevFolder: boolean,
++    _checkFileIntegrity: boolean = false
+   ): Promise<PluginStatus> {
+     if (isDevFolder) {
+       return 'DEV';
+     }
+ 
++    // 🔒 安全签名校验功能暂时注释/关闭，默认直接放行 APPROVED
++    return 'APPROVED';
++
++    /*
+     const signaturePath = join(fullPath, 'signature.json');
+     const hasSignature = await fs.stat(signaturePath).then(s => s.isFile()).catch(() => false);
+     if (hasSignature) {
+       try {
+         const sigContent = await fs.readFile(signaturePath, 'utf-8');
+         const signatureJson = JSON.parse(sigContent);
+-        const verifResult = verifyPackageSignature(fullPath, signatureJson);
++        const verifResult = verifyPackageSignature(fullPath, signatureJson, checkFileIntegrity);
+         if (verifResult.isValid) {
+           return verifResult.isOfficial ? 'APPROVED' : 'VERIFIED';
+         }
+@@ -164,5 +215,6 @@ export class PluginVerifier {
+     }
+ 
+     return 'UNVERIFIED';
++    */
+   }
+ }

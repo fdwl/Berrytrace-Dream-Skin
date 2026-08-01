@@ -1,0 +1,1182 @@
+import React, { useEffect, useMemo, useState, useRef, useCallback } from 'react';
+import { useAppStore } from '../../../stores/app';
+import { isBinaryFile } from '../../../utils/fileTypeDetector';
+import { showToast } from '../../../utils/ui';
+import { PluginRegistry } from '../../../plugins/PluginRegistry';
+import { useWorkspaceStore, type LayoutNode } from '../../../stores/workspace';
+import SidebarPanel from './SidebarPanel';
+import { WorkspaceVirtualList } from '../../../components/WorkspaceVirtualList';
+import TerminalTabPanel from './TerminalTabPanel';
+import BrowserTabPanel from './BrowserTabPanel';
+import { WorkflowInspectorView } from '../../workflow/WorkflowInspectorView';
+
+interface PluginMetadata {
+  id: string;
+  name: string;
+  version: string;
+  isActive: boolean;
+  ui?: string;
+  view?: string;
+  disableDefaultDrag?: boolean;
+}
+
+interface WorkspaceTabPanelProps {
+  tabId: string;
+  pluginId: string;
+  filePath?: string;
+  articleId?: string;
+  extension?: string;
+  visible: boolean;
+  sessionId?: string;
+  customParams?: Record<string, string>;
+}
+
+interface AssociatedPlugin {
+  id: string;
+  isActive: boolean;
+  fileAssociations?: string[];
+}
+
+const findTabNameInLayout = (node: LayoutNode, targetId: string): string | null => {
+  if (!node) return null;
+  if (node.id === targetId) return node.name || null;
+  if (node.children) {
+    for (const child of node.children) {
+      const found = findTabNameInLayout(child, targetId);
+      if (found) return found;
+    }
+  }
+  return null;
+};
+
+export default function WorkspaceTabPanel({
+  tabId,
+  pluginId,
+  filePath,
+  articleId,
+  extension,
+  visible,
+  sessionId: propSessionId,
+  customParams
+}: WorkspaceTabPanelProps) {
+  // Try to find the plugin synchronously from the PluginRegistry first to avoid flashing a loading spinner
+  const initialPlugin = useMemo(() => {
+    if (typeof window === 'undefined') return null;
+    const instance = PluginRegistry.getInstance().getPluginInstance(pluginId);
+    if (instance) {
+      const manifest = ((instance as unknown as Record<string, unknown>).manifest as Record<string, unknown>) || {};
+      return {
+        id: pluginId,
+        name: manifest.name || '',
+        version: manifest.version || '',
+        isActive: true,
+        disableDefaultDrag: !!manifest.disableDefaultDrag,
+        ui: manifest.ui,
+        view: manifest.view,
+      } as PluginMetadata;
+    }
+    return null;
+  }, [pluginId]);
+
+  const [plugin, setPlugin] = useState<PluginMetadata | null>(initialPlugin);
+  const [loading, setLoading] = useState(!initialPlugin);
+  const [errorMsg, setErrorMsg] = useState('');
+  const [viewRegistered, setViewRegistered] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const activeViewRef = useRef<{ onOpen: (params: Record<string, string>) => void; onClose: () => Promise<void> } | null>(null);
+
+  const theme = useAppStore(state => state.theme);
+  const setDisableDefaultDrag = useAppStore(state => state.setDisableDefaultDrag);
+  const zenMode = useAppStore(state => state.zenMode);
+  const sessionId = propSessionId || filePath || articleId || 'main';
+
+  // Toolbar & Dropdown state
+  const [optionsMenuOpen, setOptionsMenuOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [showOutlineFloat, setShowOutlineFloat] = useState(false);
+  const [showPropertiesFloat, setShowPropertiesFloat] = useState(false);
+  const outlineRef = useRef<HTMLDivElement>(null);
+  const propertiesRef = useRef<HTMLDivElement>(null);
+
+  const [showFileTree, setShowFileTree] = useState(pluginId === 'system.workspace-blank' || pluginId === 'system.unsupported-file');
+  const [filterQuery, setFilterQuery] = useState('');
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+
+  const scannedFiles = useWorkspaceStore(s => s.scannedFiles || []);
+  const isScanning = useWorkspaceStore(s => s.isScanning || false);
+  const scannedCount = useWorkspaceStore(s => s.scannedCount || 0);
+
+  // Auto-expand parent folders of the active file when filePath changes
+  useEffect(() => {
+    if (filePath) {
+      const separator = filePath.includes('\\') ? '\\' : '/';
+      const parts = filePath.split(separator);
+      if (parts.length > 1) {
+        const startsWithSlash = filePath.startsWith('/');
+        const pathsToExpand = new Set<string>();
+        let acc = '';
+        parts.forEach((part, index) => {
+          if (index === parts.length - 1) return; // Skip filename
+          if (index === 0 && startsWithSlash) {
+            acc = '';
+          } else {
+            acc = acc ? `${acc}${separator}${part}` : part;
+          }
+          if (startsWithSlash && index === 0) {
+            // Keep first slash
+          } else {
+            const fullAcc = startsWithSlash ? `/${acc}` : acc;
+            pathsToExpand.add(fullAcc);
+          }
+        });
+
+        requestAnimationFrame(() => {
+          setExpandedFolders(prev => {
+            const next = new Set(prev);
+            pathsToExpand.forEach(p => next.add(p));
+            return next;
+          });
+        });
+      }
+    }
+  }, [filePath]);
+
+  const lazyLoadFolder = useCallback((folderPath: string) => {
+    const win = window as unknown as Record<string, unknown>;
+    const startScan = win.__startWorkspaceScan as ((folder: string, opts: Record<string, unknown>) => void) | undefined;
+    if (startScan) {
+      console.log('[WorkspaceTabPanel] Triggering lazy load for folder:', folderPath);
+      const folderEntry = scannedFiles.find(f => f.path === folderPath);
+      const startDepth = folderEntry ? folderEntry.depth + 1 : 1;
+      startScan(folderPath, { maxDepth: 1, batchSize: 1000, incremental: true, startDepth });
+    }
+  }, [scannedFiles]);
+
+  const handleFolderToggle = useCallback((folderPath: string) => {
+    const isCurrentlyExpanded = expandedFolders.has(folderPath);
+    setExpandedFolders(prev => {
+      const next = new Set(prev);
+      if (isCurrentlyExpanded) {
+        next.delete(folderPath);
+      } else {
+        next.add(folderPath);
+      }
+      return next;
+    });
+
+    if (!isCurrentlyExpanded) {
+      lazyLoadFolder(folderPath);
+    }
+  }, [expandedFolders, lazyLoadFolder]);
+
+  const tabHistories = useWorkspaceStore(state => state.tabHistories);
+  const workspaceActions = useWorkspaceStore(state => state.workspaceActions);
+  const layoutJson = useWorkspaceStore(state => state.layoutJson);
+  const outlines = useWorkspaceStore(state => state.outlines);
+  const registeredPanels = useWorkspaceStore(state => state.registeredPanels);
+
+  const filteredFiles = useMemo(() => {
+    if (!filterQuery) return scannedFiles;
+
+    const query = filterQuery.toLowerCase();
+    const matchedPaths = new Set<string>();
+
+    // 1. First pass: find all entries that match the search query
+    const matches = scannedFiles.filter(file => file.name.toLowerCase().includes(query));
+
+    // 2. Second pass: for every match, collect it and all its ancestors
+    matches.forEach(file => {
+      matchedPaths.add(file.path);
+
+      let currentPath = file.path;
+      while (true) {
+        const separator = currentPath.includes('\\') ? '\\' : '/';
+        const lastIdx = currentPath.lastIndexOf(separator);
+        if (lastIdx <= 0) break;
+
+        currentPath = currentPath.substring(0, lastIdx);
+        matchedPaths.add(currentPath);
+      }
+    });
+
+    // 3. Third pass: Filter scannedFiles to include only those whose paths are in matchedPaths
+    return scannedFiles.filter(file => matchedPaths.has(file.path));
+  }, [scannedFiles, filterQuery]);
+
+  const searchExpandedFolders = useMemo(() => {
+    if (!filterQuery) return expandedFolders;
+    const set = new Set(expandedFolders);
+    filteredFiles.forEach(file => {
+      if (file.isFolder) {
+        set.add(file.path);
+      }
+    });
+    return set;
+  }, [filteredFiles, filterQuery, expandedFolders]);
+
+  // Compute active history navigation states
+  const history = tabHistories[tabId];
+  const canGoBack = history ? history.index > 0 : false;
+  const canGoForward = history ? history.index < history.stack.length - 1 : false;
+
+  const tabName = layoutJson?.layout ? findTabNameInLayout(layoutJson.layout, tabId) : null;
+
+  // Synchronously derived relPath for non-filePath cases
+  const derivedRelPath = useMemo(() => {
+    const name = tabName || (filePath ? filePath.split(/[/\\]/).pop() || '' : '未命名');
+    if (filePath) return null; // handled by async effect below
+    if (sessionId?.startsWith('draft_')) return `草稿 / ${name}`;
+    if (articleId) return `双子星 / ${name}`;
+    return name;
+  }, [filePath, sessionId, articleId, tabName]);
+
+  // Async relPath resolution for filePath (resolve relative to workspace root)
+  const [asyncRelPath, setAsyncRelPath] = useState('');
+
+  useEffect(() => {
+    if (!filePath) return;
+    window.electronAPI?.workspace?.getPath().then((wsRoot: string) => {
+      if (wsRoot && filePath.startsWith(wsRoot)) {
+        const rel = filePath.slice(wsRoot.length).replace(/^[/\\]+/, '');
+        setAsyncRelPath(rel);
+      } else {
+        setAsyncRelPath(filePath.split(/[/\\]/).pop() || filePath);
+      }
+    }).catch(() => {
+      setAsyncRelPath(filePath.split(/[/\\]/).pop() || filePath);
+    });
+  }, [filePath]);
+
+  const relPath = filePath ? asyncRelPath : derivedRelPath;
+
+  useEffect(() => {
+    const handleGlobalClick = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setOptionsMenuOpen(false);
+      }
+      if (outlineRef.current && !outlineRef.current.contains(e.target as Node)) {
+        setShowOutlineFloat(false);
+      }
+      if (propertiesRef.current && !propertiesRef.current.contains(e.target as Node)) {
+        setShowPropertiesFloat(false);
+      }
+    };
+    window.addEventListener('click', handleGlobalClick);
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, []);
+
+  // Compute applicable plugin actions
+  const viewType = PluginRegistry.getInstance().resolveWorkspaceViewType(pluginId);
+  const activeExtension = extension || (filePath ? filePath.split('.').pop() || '' : '');
+
+  const applicableActions = workspaceActions.filter(action => {
+    if (action.viewTypes && action.viewTypes.length > 0) {
+      if (!viewType || !action.viewTypes.includes(viewType)) {
+        return false;
+      }
+    }
+    if (action.extensions && action.extensions.length > 0) {
+      if (!activeExtension || !action.extensions.map(e => e.toLowerCase().replace(/^\./, '')).includes(activeExtension.toLowerCase())) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // Listen for view registration to handle asynchronously loaded plugins
+  useEffect(() => {
+    requestAnimationFrame(() => {
+      setViewRegistered(false);
+    });
+    const handleRegistered = (e: Event) => {
+      const detail = (e as CustomEvent<{ viewType: string }>).detail;
+      const targetViewType = PluginRegistry.getInstance().resolveWorkspaceViewType(pluginId);
+      if (detail && detail.viewType === targetViewType) {
+        setViewRegistered(true);
+      }
+    };
+    window.addEventListener('berrytrace:view-registered', handleRegistered);
+    return () => {
+      window.removeEventListener('berrytrace:view-registered', handleRegistered);
+    };
+  }, [plugin, pluginId]);
+
+  // 1. Fetch plugin metadata on mount/pluginId change
+  useEffect(() => {
+    if (
+      pluginId === 'system.workspace-blank' ||
+      pluginId === 'system.terminal' ||
+      pluginId === 'system.browser' ||
+      pluginId === 'system.unsupported-file'
+    ) {
+      requestAnimationFrame(() => {
+        setLoading(false);
+        setErrorMsg(null);
+      });
+      return;
+    }
+
+    const fetchPlugin = async (silent = false) => {
+      if (!window.electronAPI?.plugins) return;
+      try {
+        if (!silent) setLoading(true);
+        setErrorMsg(null); // Clear previous errors
+        const list = await window.electronAPI.plugins.getList();
+        const p = list.find((item: { id: string }) => item.id === pluginId);
+        if (p) {
+          setPlugin(p);
+          if (p.isActive) {
+            // Ensure the plugin (especially lazy ones) is activated in host and renderer processes
+            await PluginRegistry.getInstance().ensurePluginLoaded(pluginId);
+          }
+        } else {
+          setErrorMsg('未找到指定插件');
+        }
+      } catch (err) {
+        console.error('Failed to fetch plugin metadata:', err);
+        setErrorMsg('加载插件失败');
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    };
+    fetchPlugin(!!initialPlugin);
+
+    if (window.electronAPI?.plugins?.onPluginsChanged) {
+      const unsubscribe = window.electronAPI.plugins.onPluginsChanged(() => {
+        fetchPlugin(true);
+      });
+      return unsubscribe;
+    }
+  }, [pluginId, initialPlugin]);
+
+  // 2. Disable default window dragging if configured in plugin
+  useEffect(() => {
+    if (plugin && plugin.isActive && visible) {
+      setDisableDefaultDrag(!!plugin.disableDefaultDrag);
+    }
+    return () => {
+      if (visible) setDisableDefaultDrag(false);
+    };
+  }, [plugin, setDisableDefaultDrag, visible]);
+
+  // 3. Instantiate and mount/update plugin view
+  useEffect(() => {
+    if (!plugin || !plugin.isActive || loading || !containerRef.current) return;
+
+    const viewType = PluginRegistry.getInstance().resolveWorkspaceViewType(pluginId);
+    const ViewClass = PluginRegistry.getInstance().getViewClass(viewType) as new (
+      container: HTMLElement,
+      app: unknown
+    ) => { onOpen: (params: Record<string, string>) => void; onClose: () => Promise<void> };
+    if (!ViewClass) {
+      console.warn(`[WorkspaceTabPanel] No view class registered for type: ${viewType}`);
+      return;
+    }
+
+    let view = activeViewRef.current;
+    if (!view || view.constructor !== ViewClass) {
+      if (view) {
+        console.log(`[WorkspaceTabPanel] Closing old view (constructor changed) for: ${pluginId}`);
+        const oldResult = view.onClose();
+        if (oldResult instanceof Promise) {
+          oldResult.catch((err: unknown) => console.error('[WorkspaceTabPanel] Error closing old view:', err));
+        }
+      }
+      containerRef.current.innerHTML = '';
+      const pluginInstance = PluginRegistry.getInstance().getPluginInstance(pluginId);
+      const sdk = pluginInstance ? pluginInstance.app : window.berrytrace;
+      view = new ViewClass(containerRef.current, sdk);
+      activeViewRef.current = view;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    // Call onOpen when parameters change or tab becomes visible
+    if (visible) {
+      console.log(`[WorkspaceTabPanel] Mounting/Updating view ${viewType} with params:`, { filePath, articleId, theme, sessionId });
+      timer = setTimeout(() => {
+        if (activeViewRef.current) {
+          Promise.resolve(activeViewRef.current.onOpen({
+            tabId,
+            openFilePath: filePath || '',
+            articleId: articleId || '',
+            theme,
+            sessionId,
+            customParams
+          } as unknown as Record<string, string>)).catch((err: unknown) => {
+            console.error(`[WorkspaceTabPanel] Error in view.onOpen for ${viewType}:`, err);
+          });
+          useWorkspaceStore.getState().setActiveView(tabId, activeViewRef.current);
+        }
+      }, 50);
+    }
+
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  }, [plugin, pluginId, loading, filePath, articleId, theme, visible, sessionId, viewRegistered, tabId, customParams]);
+
+  // Cleanup view on unmount
+  useEffect(() => {
+    return () => {
+      if (activeViewRef.current) {
+        const t0 = performance.now();
+        console.log(`[WorkspaceTabPanel] Tab unmounting, closing view for: ${pluginId}, tabId: ${tabId}`);
+        const viewType = activeViewRef.current.constructor?.name || 'unknown';
+        console.log(`[WorkspaceTabPanel] View type: ${viewType}, has onClose: ${typeof activeViewRef.current.onClose}`);
+        try {
+          const result = activeViewRef.current.onClose();
+          console.log(`[WorkspaceTabPanel] onClose() returned: ${typeof result}, isPromise: ${result instanceof Promise}, time: ${(performance.now() - t0).toFixed(1)}ms`);
+          if (result instanceof Promise) {
+            result.catch((err: unknown) => console.error('[WorkspaceTabPanel] error closing view:', err));
+          }
+        } catch (err) {
+          console.error('[WorkspaceTabPanel] onClose() threw synchronously:', err);
+        }
+        activeViewRef.current = null;
+      }
+      console.log(`[WorkspaceTabPanel] calling removeActiveView(${tabId})`);
+      useWorkspaceStore.getState().removeActiveView(tabId);
+    };
+  }, [pluginId, tabId]);
+
+  const isWorkflowFile = Boolean(filePath && (filePath.endsWith('.workflow') || filePath.endsWith('.btskill')));
+  if (isWorkflowFile) {
+    return (
+      <div className="flex-1 flex flex-col w-full h-full overflow-hidden bg-[var(--bg-page)] text-[var(--text-primary)]">
+        <WorkflowInspectorView filePath={filePath} />
+      </div>
+    );
+  }
+
+  if (pluginId === 'system.workspace-blank' || pluginId === 'system.unsupported-file') {
+    const isUnsupported = pluginId === 'system.unsupported-file';
+    const fileName = filePath ? filePath.split(/[/\\]/).pop() : '未命名文件';
+    const cleanExt = extension ? extension.toUpperCase() : '未知';
+
+    return (
+      <div className="flex-1 flex flex-col w-full h-full overflow-hidden bg-[var(--bg-page)] text-[var(--text-primary)]">
+        {/* Local Toolbar */}
+        <div className="flex items-center justify-between px-4 h-9 border-b border-[var(--border-light,#3c3c3c)] bg-[var(--bg-page,#1e1e1e)] text-[var(--text-primary,#ffffff)] select-none shrink-0 relative" style={{ zIndex: 10 }}>
+          {/* Left Side: Title */}
+          <div className="text-[12px] text-[var(--text-secondary,#cccccc)] font-medium truncate max-w-[400px]">
+            {isUnsupported ? `${fileName} (${cleanExt})` : '新建标签页'}
+          </div>
+
+          {/* Right Side: Folder toggle icon in front of more menu button */}
+          <div className="flex items-center gap-2 relative no-drag">
+            {!zenMode && (
+              <button
+                onClick={() => setShowFileTree(!showFileTree)}
+                className={`p-1.5 rounded cursor-pointer transition-colors duration-200 flex items-center justify-center border-none ${
+                  showFileTree
+                    ? 'text-[var(--color-brand,#5b7fff)] bg-[var(--bg-brand-soft,rgba(91,127,255,0.1))]'
+                    : 'text-[var(--text-secondary,#cccccc)] hover:text-white bg-transparent'
+                }`}
+                title={showFileTree ? "隐藏文件目录" : "显示文件目录"}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                </svg>
+              </button>
+            )}
+
+            <button
+              className="p-1 rounded cursor-pointer text-[var(--text-secondary,#cccccc)] hover:bg-[rgba(255,255,255,0.08)] hover:text-white"
+              onClick={(e) => { e.stopPropagation(); setOptionsMenuOpen(!optionsMenuOpen); }}
+              title="更多操作"
+              style={{ border: 'none', background: 'transparent' }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="1.5"></circle>
+                <circle cx="12" cy="5" r="1.5"></circle>
+                <circle cx="12" cy="19" r="1.5"></circle>
+              </svg>
+            </button>
+
+            {optionsMenuOpen && (
+              <div
+                ref={dropdownRef}
+                className="absolute right-0 top-7 flex flex-col gap-px p-1 rounded-lg backdrop-blur-md"
+                style={{
+                  zIndex: 10000,
+                  width: '150px',
+                  backgroundColor: 'var(--bg-card, rgba(30,30,30,0.85))',
+                  border: '1px solid var(--border-light, rgba(255,255,255,0.08))',
+                  boxShadow: '0 10px 30px rgba(0,0,0,0.3)',
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div
+                  className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOptionsMenuOpen(false);
+                    useWorkspaceStore.getState().closeTab(tabId);
+                  }}
+                >
+                  关闭标签页
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Content Area */}
+        <div className="flex-1 flex min-h-0 divide-x divide-[var(--border-light,#3c3c3c)] bg-[var(--bg-page)]">
+          {/* Left Column */}
+          <div className="flex-1 flex flex-col items-center justify-center p-8 text-center select-none overflow-y-auto">
+            {isUnsupported ? (
+              <div className="flex flex-col items-center justify-center max-w-[600px] mx-auto w-full gap-6">
+                {/* File Icon */}
+                <div className="relative w-16 h-16 flex items-center justify-center rounded-xl bg-[rgba(255,255,255,0.03)] border border-[rgba(255,255,255,0.06)] text-[var(--text-secondary,#cccccc)]">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+                    <polyline points="14 2 14 8 20 8" />
+                  </svg>
+                  <span className="absolute -bottom-1 -right-1 px-1.5 py-0.5 rounded text-[8px] font-bold tracking-wider bg-[var(--color-brand,#5b7fff)] text-white shadow-sm">
+                    {cleanExt}
+                  </span>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <h3 className="text-base font-semibold text-[var(--text-primary,#ffffff)] m-0">
+                    不支持在编辑器中直接预览此文件
+                  </h3>
+                  <p className="text-[12px] text-[var(--text-secondary,#cccccc)] leading-relaxed m-0 max-w-[440px]">
+                    本文件格式（<span className="font-semibold text-white">.{cleanExt.toLowerCase()}</span>）没有已启用的关联编辑插件。您可以使用系统默认应用程序来打开并编辑它。
+                  </p>
+                </div>
+
+                {/* Action buttons - Clean flat design */}
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={async () => {
+                      if (window.electronAPI?.file?.openPath && filePath) {
+                        await window.electronAPI.file.openPath(filePath);
+                      } else {
+                        alert('无法调用系统默认程序');
+                      }
+                    }}
+                    disabled={!filePath}
+                    className="px-4 py-2 rounded-lg text-[12px] font-medium text-white bg-[var(--color-brand,#5b7fff)] hover:bg-[var(--color-brand-hover,#476ee6)] border-none cursor-pointer transition-colors duration-200 shadow-md shadow-[rgba(91,127,255,0.15)] flex items-center gap-1.5"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      <polyline points="15 3 21 3 21 9" />
+                      <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                    系统程序打开
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      useWorkspaceStore.getState().closeTab(tabId);
+                    }}
+                    className="px-4 py-2 rounded-lg text-[12px] font-medium border border-[var(--border-light,rgba(255,255,255,0.08))] hover:bg-[rgba(255,255,255,0.04)] text-[var(--text-secondary)] bg-transparent cursor-pointer transition-colors duration-200"
+                  >
+                    关闭标签页
+                  </button>
+                </div>
+
+                {/* File path display */}
+                {filePath && (
+                  <div className="mt-4 text-[11px] text-[var(--text-tertiary,#888888)] flex flex-col items-center gap-1 w-full max-w-[400px]">
+                    <span className="font-mono text-xs select-text text-center break-all opacity-60">
+                      {filePath}
+                    </span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="max-w-[320px] w-full flex flex-col items-center gap-4">
+                {/* Giant folder icon */}
+                <div className="w-12 h-12 rounded-full flex items-center justify-center bg-[rgba(91,127,255,0.1)] text-[var(--color-brand,#5b7fff)] mb-2">
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                  </svg>
+                </div>
+              <h3 className="text-sm font-semibold text-[var(--text-primary,#ffffff)] m-0">打开文件</h3>
+              <p className="text-[12px] text-[var(--text-secondary,#cccccc)] leading-relaxed m-0">
+                从工作区目录树中选择文件 或{' '}
+                <button
+                  onClick={() => {
+                    const sessionId = `draft_${Date.now()}`;
+                    useWorkspaceStore.getState().openWorkspaceTab(
+                      undefined,
+                      'com.berrytrace.plugin.markdown-editor',
+                      'md',
+                      undefined,
+                      sessionId,
+                      true // replaceActiveTab
+                    );
+                  }}
+                  className="text-[var(--color-brand,#5b7fff)] hover:underline border-none bg-transparent cursor-pointer font-medium p-0"
+                >
+                  创建新文件(MD)
+                </button>
+              </p>
+              {!showFileTree && !zenMode && (
+                <button
+                  onClick={() => setShowFileTree(true)}
+                  className="mt-2 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-[var(--bg-hover)] text-[var(--text-primary)] hover:bg-[rgba(255,255,255,0.08)] border border-[var(--border-light)] cursor-pointer transition-colors duration-200"
+                >
+                  展开目录树
+                </button>
+              )}
+            </div>
+          )}
+          </div>
+
+          {/* Right Column: File virtual directory */}
+          {showFileTree && !zenMode && (
+            <div className="w-[260px] shrink-0 flex flex-col min-h-0 bg-[var(--bg-page)] border-l border-[var(--border-light)] text-[var(--text-primary,#ffffff)]">
+              {/* Search Header */}
+              <div className="p-2 border-b border-[var(--border-light)] shrink-0">
+                <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[var(--bg-card)] border border-[var(--border-light)]">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-[var(--text-tertiary)]">
+                    <circle cx="11" cy="11" r="8" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
+                  <input
+                    type="text"
+                    placeholder="搜索文件..."
+                    value={filterQuery}
+                    onChange={(e) => setFilterQuery(e.target.value)}
+                    className="flex-1 bg-transparent border-none text-[12px] text-[var(--text-primary,#ffffff)] focus:outline-none placeholder-[var(--text-tertiary)]"
+                  />
+                  {filterQuery && (
+                    <button
+                      onClick={() => setFilterQuery('')}
+                      className="p-0.5 rounded-full hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] border-none bg-transparent cursor-pointer"
+                    >
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                        <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Scanned file tree virtual list */}
+              <div className="flex-1 overflow-hidden">
+                <WorkspaceVirtualList
+                  files={filteredFiles}
+                  isScanning={isScanning}
+                  scannedCount={scannedCount}
+                  onFileSelect={async (selectedPath) => {
+                    const ext = (selectedPath.split('.').pop() || '').toLowerCase().replace(/^\./, '');
+                    let pluginId = '';
+                    if (ext === 'workflow') {
+                      pluginId = 'system.workflow-inspector';
+                    } else if (window.electronAPI?.plugins?.getList) {
+                      try {
+                        const list = await window.electronAPI.plugins.getList();
+                        const matching = list.find((p: AssociatedPlugin) =>
+                          p.isActive && p.fileAssociations?.some((assoc: string) => assoc.toLowerCase().replace(/^\./, '') === ext)
+                        );
+                        if (matching) {
+                          pluginId = matching.id;
+                        }
+                      } catch (err) {
+                        console.error('Failed to get plugin list for file select:', err);
+                      }
+                    }
+
+                    if (!pluginId) {
+                      const isBinary = await isBinaryFile(selectedPath);
+                      pluginId = isBinary ? 'system.unsupported-file' : 'com.berrytrace.plugin.code-editor';
+                    }
+
+                    useWorkspaceStore.getState().openWorkspaceTab(
+                      selectedPath,
+                      pluginId,
+                      ext,
+                      undefined,
+                      undefined,
+                      true // replaceActiveTab
+                    );
+                  }}
+                  onFolderToggle={handleFolderToggle}
+                  onFolderExpand={(folderPath) => {
+                    if (!expandedFolders.has(folderPath)) {
+                      setExpandedFolders(prev => {
+                        const next = new Set(prev);
+                        next.add(folderPath);
+                        return next;
+                      });
+                      lazyLoadFolder(folderPath);
+                    }
+                  }}
+                  selectedPath={null}
+                  selectedPaths={new Set()}
+                  expandedFolders={searchExpandedFolders}
+                  isDark={theme === 'dark'}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center w-full h-full bg-[var(--bg-page)] text-[var(--text-secondary)]">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[var(--color-brand)] mr-2"></div>
+        <span>正在加载插件面板...</span>
+      </div>
+    );
+  }
+
+  const isSystemPlugin = pluginId === 'system.terminal' || pluginId === 'system.browser' || pluginId === 'system.workflow-inspector' || (filePath && (filePath.endsWith('.workflow') || filePath.endsWith('.btskill')));
+
+  if (!isSystemPlugin) {
+    if (errorMsg || !plugin) {
+      return (
+        <div className="flex items-center justify-center w-full h-full bg-[var(--bg-page)] text-[var(--text-secondary)]">
+          <span>❌ {errorMsg || '插件未激活或不存在'}</span>
+        </div>
+      );
+    }
+
+    if (!plugin.isActive) {
+      return (
+        <div className="flex flex-col items-center justify-center w-full h-full bg-[var(--bg-page)] text-[var(--text-secondary)] p-8">
+          <span style={{ fontSize: '32px', marginBottom: '16px' }}>🔌</span>
+          <h3 style={{ fontSize: '16px', fontWeight: 600, marginBottom: '8px' }}>插件 &quot;{plugin.name}&quot; 未启用</h3>
+          <p style={{ fontSize: '13px', color: 'var(--text-tertiary)', marginBottom: '16px' }}>请先前往 偏好设置 -&gt; 插件安全与管理 启用该插件。</p>
+        </div>
+      );
+    }
+  }
+
+  return (
+    <div
+      className="flex flex-col w-full h-full bg-[var(--bg-page)] overflow-hidden relative"
+      style={{
+        display: visible ? 'flex' : 'none'
+      }}
+    >
+      {/* Local Toolbar */}
+      {pluginId === 'system.terminal' || pluginId === 'system.browser' ? null : (
+        zenMode ? (
+          <div className="window-drag h-10 shrink-0 bg-[var(--bg-page,#1e1e1e)]" />
+        ) : (
+          <div
+            className="flex items-center justify-between px-4 h-[38px] bg-[var(--bg-page,#1e1e1e)] text-[var(--text-primary,#ffffff)] select-none shrink-0 relative"
+            style={{ zIndex: 10 }}
+          >
+          {/* Left: Navigation Actions */}
+          <div className="flex items-center gap-1">
+            <button
+              className="p-1 rounded cursor-pointer text-[var(--text-secondary,#cccccc)] hover:bg-[rgba(255,255,255,0.08)] hover:text-white disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--text-secondary,#cccccc)]"
+              onClick={() => useWorkspaceStore.getState().goBack(tabId)}
+              disabled={!canGoBack}
+              title="后退"
+              style={{ border: 'none', background: 'transparent' }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="19" y1="12" x2="5" y2="12"></line>
+                <polyline points="12 19 5 12 12 5"></polyline>
+              </svg>
+            </button>
+            <button
+              className="p-1 rounded cursor-pointer text-[var(--text-secondary,#cccccc)] hover:bg-[rgba(255,255,255,0.08)] hover:text-white disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--text-secondary,#cccccc)]"
+              onClick={() => useWorkspaceStore.getState().goForward(tabId)}
+              disabled={!canGoForward}
+              title="前进"
+              style={{ border: 'none', background: 'transparent' }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+                <polyline points="12 5 19 12 12 19"></polyline>
+              </svg>
+            </button>
+          </div>
+
+          {/* Center: File path display */}
+          <div
+            className={`text-[12px] text-[var(--text-secondary,#cccccc)] font-medium max-w-[400px] truncate ${
+              filePath ? 'cursor-pointer hover:text-white transition-colors' : ''
+            }`}
+            title={filePath ? `${filePath} (点击复制路径)` : ''}
+            onClick={() => {
+              if (filePath) {
+                navigator.clipboard.writeText(filePath).then(() => {
+                  showToast('已复制文件路径');
+                }).catch(() => {
+                  showToast('复制失败');
+                });
+              }
+            }}
+          >
+            {filePath || ''}
+          </div>
+
+          {/* Right: Options Button & Dropdown */}
+          <div className="flex items-center gap-2 relative no-drag">
+            {filePath && !zenMode && (
+              <button
+                onClick={() => setShowFileTree(!showFileTree)}
+                className={`p-1.5 rounded cursor-pointer transition-colors duration-200 flex items-center justify-center border-none ${
+                  showFileTree
+                    ? 'text-[var(--color-brand,#5b7fff)] bg-[var(--bg-brand-soft,rgba(91,127,255,0.1))]'
+                    : 'text-[var(--text-secondary,#cccccc)] hover:text-white bg-transparent'
+                }`}
+                title={showFileTree ? "隐藏文件目录" : "显示文件目录"}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                </svg>
+              </button>
+            )}
+
+            <button
+              className="p-1 rounded cursor-pointer text-[var(--text-secondary,#cccccc)] hover:bg-[rgba(255,255,255,0.08)] hover:text-white"
+              onClick={(e) => { e.stopPropagation(); setOptionsMenuOpen(!optionsMenuOpen); }}
+              title="更多操作"
+              style={{ border: 'none', background: 'transparent' }}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="1.5"></circle>
+                <circle cx="12" cy="5" r="1.5"></circle>
+                <circle cx="12" cy="19" r="1.5"></circle>
+              </svg>
+            </button>
+
+            {optionsMenuOpen && (
+              <div
+                ref={dropdownRef}
+                className="absolute right-0 top-7 flex flex-col gap-px p-1 rounded-lg backdrop-blur-md"
+                style={{
+                  zIndex: 10000,
+                  width: '150px',
+                  backgroundColor: 'var(--bg-card, rgba(30,30,30,0.85))',
+                  border: '1px solid var(--border-light, rgba(255,255,255,0.08))',
+                  boxShadow: '0 10px 30px rgba(0,0,0,0.3)',
+                  animation: 'contextMenuFadeIn 0.12s cubic-bezier(0.16,1,0.3,1)',
+                }}
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Plugin actions */}
+                {applicableActions.map(action => {
+                  const isEnabled = action.isEnabled ? action.isEnabled({
+                    tabId,
+                    filePath,
+                    articleId,
+                    sessionId
+                  }) : true;
+                  const isActive = action.isActive ? action.isActive({
+                    tabId,
+                    filePath,
+                    articleId,
+                    sessionId
+                  }) : false;
+
+                  return (
+                    <React.Fragment key={action.id}>
+                      {action.divider === 'before' && (
+                        <div className="h-px mx-1 my-1" style={{ backgroundColor: 'var(--border-light, rgba(255,255,255,0.08))' }} />
+                      )}
+                      <div
+                        className={`flex items-center justify-between px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 ${
+                          isEnabled ? 'text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white' : 'opacity-40 pointer-events-none'
+                        }`}
+                        onClick={() => {
+                          setOptionsMenuOpen(false);
+                          action.onClick({
+                            tabId,
+                            filePath,
+                            articleId,
+                            sessionId
+                          });
+                        }}
+                      >
+                        <span>{action.label}</span>
+                        {isActive && (
+                          <span className="text-[var(--color-brand,#5b7fff)] font-bold ml-2">✓</span>
+                        )}
+                      </div>
+                      {action.divider === 'after' && (
+                        <div className="h-px mx-1 my-1" style={{ backgroundColor: 'var(--border-light, rgba(255,255,255,0.08))' }} />
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+
+                {applicableActions.length > 0 && (
+                  <div className="h-px mx-1 my-1" style={{ backgroundColor: 'var(--border-light, rgba(255,255,255,0.08))' }} />
+                )}
+
+                {/* Built-in split screen actions */}
+                <div
+                  className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOptionsMenuOpen(false);
+                    useWorkspaceStore.getState().splitActiveTab('right');
+                  }}
+                >
+                  左右分屏
+                </div>
+                <div
+                  className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOptionsMenuOpen(false);
+                    useWorkspaceStore.getState().splitActiveTab('bottom');
+                  }}
+                >
+                  上下分屏
+                </div>
+
+                <div className="h-px mx-1 my-1" style={{ backgroundColor: 'var(--border-light, rgba(255,255,255,0.08))' }} />
+
+                {/* 大纲 / 属性 悬浮控制菜单 */}
+                <div
+                  className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOptionsMenuOpen(false);
+                    setShowOutlineFloat(!showOutlineFloat);
+                    setShowPropertiesFloat(false);
+                  }}
+                >
+                  大纲
+                </div>
+                <div
+                  className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOptionsMenuOpen(false);
+                    setShowPropertiesFloat(!showPropertiesFloat);
+                    setShowOutlineFloat(false);
+                  }}
+                >
+                  属性
+                </div>
+                <div
+                  className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOptionsMenuOpen(false);
+                    useWorkspaceStore.getState().closeTab(tabId);
+                  }}
+                >
+                  关闭标签页
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {/* Float Overlay Panels */}
+      {showOutlineFloat && (
+        <div
+          ref={outlineRef}
+          className="absolute top-10 right-4 z-[999] w-[260px] max-h-[380px] flex flex-col rounded-xl border border-[var(--border-light,#3c3c3c)] bg-[var(--bg-card,#252526)] shadow-2xl backdrop-blur-md no-drag"
+          style={{ animation: 'contextMenuFadeIn 0.12s cubic-bezier(0.16,1,0.3,1)' }}
+        >
+          <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border-light,#3c3c3c)] shrink-0 select-none">
+            <span className="text-[12px] font-semibold text-[var(--text-primary,#ffffff)]">文档大纲</span>
+            <button
+              onClick={() => setShowOutlineFloat(false)}
+              className="p-1 rounded text-[var(--text-tertiary,#888888)] hover:text-[var(--text-primary,#ffffff)] hover:bg-[rgba(255,255,255,0.08)] border-none bg-transparent cursor-pointer flex items-center justify-center"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-0.5 text-[12px]">
+            {outlines[tabId] && outlines[tabId].length > 0 ? (
+              outlines[tabId].map((h, idx) => (
+                <div
+                  key={idx}
+                  className={`p-1.5 rounded-md cursor-pointer transition-all duration-150 whitespace-nowrap overflow-hidden text-ellipsis hover:bg-[rgba(255,255,255,0.06)] ${
+                    h.level === 1 ? 'font-semibold pl-2' :
+                    h.level === 2 ? 'pl-5 opacity-90' :
+                    h.level === 3 ? 'pl-[28px] opacity-80' :
+                    'pl-[40px] opacity-70'
+                  }`}
+                  style={{ color: 'var(--text-secondary,#cccccc)' }}
+                  onClick={() => {
+                    setShowOutlineFloat(false);
+                    window.dispatchEvent(new CustomEvent('berrytrace:outline-click', {
+                      detail: { sessionId: tabId, text: h.text, line: h.line }
+                    }));
+                  }}
+                  title={h.text}
+                >
+                  {h.text}
+                </div>
+              ))
+            ) : (
+              <div className="p-4 text-center text-xs text-[var(--text-tertiary,#888888)]">暂无大纲目录</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showPropertiesFloat && (
+        <div
+          ref={propertiesRef}
+          className="absolute top-10 right-4 z-[999] w-[280px] max-h-[380px] flex flex-col rounded-xl border border-[var(--border-light,#3c3c3c)] bg-[var(--bg-card,#252526)] shadow-2xl backdrop-blur-md no-drag"
+          style={{ animation: 'contextMenuFadeIn 0.12s cubic-bezier(0.16,1,0.3,1)' }}
+        >
+          <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border-light,#3c3c3c)] shrink-0 select-none">
+            <span className="text-[12px] font-semibold text-[var(--text-primary,#ffffff)]">属性信息</span>
+            <button
+              onClick={() => setShowPropertiesFloat(false)}
+              className="p-1 rounded text-[var(--text-tertiary,#888888)] hover:text-[var(--text-primary,#ffffff)] hover:bg-[rgba(255,255,255,0.08)] border-none bg-transparent cursor-pointer flex items-center justify-center"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
+            {registeredPanels[tabId] && registeredPanels[tabId].length > 0 ? (
+              registeredPanels[tabId].map((panel) => {
+                if (panel.viewType) {
+                  return (
+                    <div key={panel.id} className="flex flex-col gap-1 min-h-0 shrink-0">
+                      <div className="text-[10px] font-bold text-[var(--text-tertiary,#888888)] uppercase tracking-wider mb-1">
+                        {panel.title}
+                      </div>
+                      <SidebarPanel
+                        viewType={panel.viewType}
+                        pluginId={panel.pluginId || 'system'}
+                        tabId={tabId}
+                        visible={true}
+                      />
+                    </div>
+                  );
+                }
+                return (
+                  <div key={panel.id} className="p-2 rounded bg-[rgba(255,255,255,0.02)] border border-dashed border-[var(--border-light,#3c3c3c)] text-xs">
+                    <h4 className="font-semibold m-0 text-[12px] text-[var(--text-primary,#ffffff)]">{panel.title}</h4>
+                    <p className="m-0 text-[11px] text-[var(--text-secondary,#cccccc)] leading-[1.4]">功能规划中...</p>
+                  </div>
+                );
+              })
+            ) : (
+              <div className="p-4 text-center text-xs text-[var(--text-tertiary,#888888)]">暂无属性信息</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Content Area */}
+      <div className="flex-1 flex min-h-0 divide-x divide-[var(--border-light,#3c3c3c)] bg-[var(--bg-page)] relative">
+        {pluginId === 'system.workflow-inspector' || (filePath && (filePath.endsWith('.workflow') || filePath.endsWith('.btskill'))) ? (
+          <WorkflowInspectorView filePath={filePath} />
+        ) : pluginId === 'system.terminal' ? (
+          <TerminalTabPanel tabId={tabId} visible={visible} customParams={customParams} />
+        ) : pluginId === 'system.browser' ? (
+          <BrowserTabPanel tabId={tabId} visible={visible} customParams={customParams} />
+        ) : (
+          <>
+            {/* Left: Editor/Plugin View Container */}
+            <div
+              ref={containerRef}
+              className="flex-1 min-w-0"
+              style={{
+                height: '100%',
+                overflow: 'hidden',
+                backgroundColor: 'var(--bg-page)'
+              }}
+            />
+
+            {/* Right: Directory File Tree */}
+            {showFileTree && !zenMode && (
+              <div className="w-[260px] shrink-0 flex flex-col min-h-0 bg-[var(--bg-page)] border-l border-[var(--border-light)] text-[var(--text-primary,#ffffff)]">
+                {/* Search Header */}
+                <div className="p-2 border-b border-[var(--border-light)] shrink-0">
+                  <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-[var(--bg-card)] border border-[var(--border-light)]">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-[var(--text-tertiary)]">
+                      <circle cx="11" cy="11" r="8" />
+                      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    </svg>
+                    <input
+                      type="text"
+                      placeholder="搜索文件..."
+                      value={filterQuery}
+                      onChange={(e) => setFilterQuery(e.target.value)}
+                      className="flex-1 bg-transparent border-none text-[12px] text-[var(--text-primary,#ffffff)] focus:outline-none placeholder-[var(--text-tertiary)]"
+                    />
+                    {filterQuery && (
+                      <button
+                        onClick={() => setFilterQuery('')}
+                        className="p-0.5 rounded-full hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] border-none bg-transparent cursor-pointer"
+                      >
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                          <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Scanned file tree virtual list */}
+                <div className="flex-1 overflow-hidden">
+                  <WorkspaceVirtualList
+                    files={filteredFiles}
+                    isScanning={isScanning}
+                    scannedCount={scannedCount}
+                    onFileSelect={async (selectedPath) => {
+                      const ext = (selectedPath.split('.').pop() || '').toLowerCase().replace(/^\./, '');
+                      let pluginId = '';
+                      if (window.electronAPI?.plugins?.getList) {
+                        try {
+                          const list = await window.electronAPI.plugins.getList();
+                          const matching = list.find((p: AssociatedPlugin) =>
+                            p.isActive && p.fileAssociations?.some((assoc: string) => assoc.toLowerCase().replace(/^\./, '') === ext)
+                          );
+                          if (matching) {
+                            pluginId = matching.id;
+                          }
+                        } catch (err) {
+                          console.error('Failed to get plugin list for file select:', err);
+                        }
+                      }
+
+                      useWorkspaceStore.getState().openWorkspaceTab(
+                        selectedPath,
+                        pluginId || 'system.unsupported-file',
+                        ext,
+                        undefined,
+                        undefined,
+                        true // replaceActiveTab
+                      );
+                    }}
+                    onFolderToggle={handleFolderToggle}
+                    onFolderExpand={(folderPath) => {
+                      if (!expandedFolders.has(folderPath)) {
+                        setExpandedFolders(prev => {
+                          const next = new Set(prev);
+                          next.add(folderPath);
+                          return next;
+                        });
+                        lazyLoadFolder(folderPath);
+                      }
+                    }}
+                    selectedPath={filePath}
+                    selectedPaths={new Set()}
+                    expandedFolders={searchExpandedFolders}
+                    isDark={theme === 'dark'}
+                  />
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

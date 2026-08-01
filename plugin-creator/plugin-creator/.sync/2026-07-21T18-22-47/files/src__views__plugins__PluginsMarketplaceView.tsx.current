@@ -1,0 +1,536 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { MOCK_ONLINE_ASSETS } from './types';
+import type { Asset } from './types';
+import PluginsManagementPanel from './PluginsManagementPanel';
+import { useDashboardStore } from '../../stores/dashboard';
+import { useAgentStore } from '../../stores/agent';
+
+export default function PluginsMarketplaceView() {
+  const [viewMode, setViewMode] = useState<'portal' | 'management'>('portal');
+  const [activeTab, setActiveTab] = useState<Asset['type']>('skill');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterMode, setFilterMode] = useState<'uninstalled' | 'installed' | 'all'>('uninstalled');
+
+  const handleCreatePlugin = () => {
+    const taskPrompt = `@plugin-creator 帮我创建一个全新的 BerryTrace 插件 / SKILLS 技能。
+请基于 plugin-creator 规范引导我完成创建步骤：
+1. 询问我需要的技能功能与工具接口需求。
+2. 帮我在项目 skills/ 或 electron/plugins/ 目录下生成对应的 SKILLS / 插件配置文件。`;
+
+    localStorage.setItem('berrytrace_pending_chat_prompt', JSON.stringify({ text: taskPrompt }));
+    useDashboardStore.getState().setContentView('chat');
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('berrytrace:set-chat-input', { detail: { text: taskPrompt } }));
+    }, 100);
+  };
+
+  // Real installed assets states
+  const [installedPlugins, setInstalledPlugins] = useState<any[]>([]);
+  const [installedMcpTools, setInstalledMcpTools] = useState<any[]>([]);
+  const [installedSkills, setInstalledSkills] = useState<any[]>([]);
+  const [installedTools, setInstalledTools] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  // Simulation of uninstalled assets mock store
+  const [simulatedInstalledIds, setSimulatedInstalledIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('berrytrace_mock_installed_assets');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [installingId, setInstallingId] = useState<string | null>(null);
+
+  // Load all local data matching settings panel sources
+  const loadLocalData = useCallback(async () => {
+    setLoading(true);
+    const win = window as any;
+    if (!win.electronAPI?.plugins) {
+      setLoading(false);
+      return;
+    }
+
+    try {
+      // 1. Fetch real installed plugins
+      const pluginsList = await win.electronAPI.plugins.getList();
+      setInstalledPlugins(pluginsList);
+
+      // 2. Fetch MCP tools using preload whitelist invoke channel
+      if (win.electronAPI.ipc?.invoke) {
+        try {
+          const tools = await win.electronAPI.ipc.invoke('mcp:list-tools');
+          const hiddenTools = new Set(['npx_get_installed_tools', 'npx_sync_tools_library']);
+          const filteredMcp = Array.isArray(tools) ? tools.filter((t: any) => !hiddenTools.has(t.name)) : [];
+          setInstalledMcpTools(filteredMcp);
+        } catch (err) {
+          console.warn('Failed invoking listTools IPC:', err);
+        }
+      }
+
+      // 3. Database-first loading for Skills & Tools
+      const tempSkills: any[] = [];
+      const tempTools: any[] = [];
+
+      if (win.electronAPI.ipc?.invoke) {
+        try {
+          const rows = await win.electronAPI.ipc.invoke(
+            'db:query',
+            "SELECT entity_id, entity_type, title, content, meta FROM FtsAgentIndex"
+          );
+
+          if (Array.isArray(rows) && rows.length > 0) {
+            for (const row of rows) {
+              let metaObj: any = {};
+              try {
+                metaObj = JSON.parse(row.meta || '{}');
+              } catch (e) {
+                console.warn('Failed parsing meta for', row.entity_id, e);
+              }
+
+              if (row.entity_type === 'skill') {
+                tempSkills.push({
+                  id: row.entity_id,
+                  name: row.entity_id,
+                  displayName: metaObj.displayName || row.title || row.entity_id,
+                  version: '1.0.0',
+                  description: metaObj.description || '',
+                  source: 'builtin',
+                  installedAt: '',
+                });
+              } else if (row.entity_type === 'tool') {
+                // isInstalled 状态直接从 meta 判断，不在渲染层实时检查文件系统
+                const isInstalled = !!(metaObj.category === 'mcp' || metaObj.pluginId || metaObj.isInstalled);
+
+                tempTools.push({
+                  id: row.entity_id,
+                  name: row.entity_id,
+                  displayName: metaObj.displayName || row.title || row.entity_id,
+                  version: '1.0.0',
+                  description: metaObj.description || '',
+                  package: metaObj.package || '',
+                  type: 'tool',
+                  category: metaObj.category || 'local',
+                  isInstalled,
+                });
+              }
+            }
+
+            // Deduplicate to avoid React duplicate key warnings
+            const uniqueSkills = Array.from(new Map(tempSkills.map(s => [s.id, s])).values());
+            const uniqueTools = Array.from(new Map(tempTools.map(t => [t.id, t])).values());
+
+            setInstalledSkills(uniqueSkills);
+            setInstalledTools(uniqueTools);
+            console.log(`[PluginsMarketplaceView] Loaded ${uniqueSkills.length} unique skills and ${uniqueTools.length} unique tools from DB`);
+          } else {
+            console.log('[PluginsMarketplaceView] FtsAgentIndex is empty (index may still be building). Showing empty state.');
+          }
+        } catch (dbErr) {
+          console.warn('[PluginsMarketplaceView] Failed loading from DB:', dbErr);
+        }
+      }
+
+    } catch (err) {
+      console.error('Error loading local plugins data:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+
+  useEffect(() => {
+    loadLocalData();
+    const win = window as any;
+    if (win.electronAPI?.plugins?.onPluginsChanged) {
+      const unsubscribe = win.electronAPI.plugins.onPluginsChanged(() => {
+        loadLocalData();
+      });
+      return unsubscribe;
+    }
+  }, [loadLocalData]);
+
+  // Handle mock installation
+  const handleInstallMockAsset = (id: string) => {
+    setInstallingId(id);
+    setTimeout(() => {
+      const nextList = [...simulatedInstalledIds, id];
+      setSimulatedInstalledIds(nextList);
+      localStorage.setItem('berrytrace_mock_installed_assets', JSON.stringify(nextList));
+      setInstallingId(null);
+    }, 1200);
+  };
+
+  // Handle mock uninstallation
+  const handleUninstallMockAsset = (id: string) => {
+    if (confirm('确认要卸载该项吗？')) {
+      const nextList = simulatedInstalledIds.filter(x => x !== id);
+      setSimulatedInstalledIds(nextList);
+      localStorage.setItem('berrytrace_mock_installed_assets', JSON.stringify(nextList));
+    }
+  };
+
+  // Helper: check if asset ID is installed (either real or simulated mock)
+  const isAssetInstalled = useCallback((assetId: string, type: Asset['type']) => {
+    if (simulatedInstalledIds.includes(assetId)) return true;
+    if (type === 'plugin') {
+      return installedPlugins.some(p => p.id === assetId);
+    }
+    if (type === 'skill') {
+      return installedSkills.some(s => s.id === assetId);
+    }
+    if (type === 'tool') {
+      return installedTools.some(t => t.id === assetId && t.isInstalled);
+    }
+    if (type === 'mcp') {
+      return installedMcpTools.some(t => t.name === assetId);
+    }
+    return false;
+  }, [simulatedInstalledIds, installedPlugins, installedSkills, installedTools, installedMcpTools]);
+
+  // Combine mock online database and local installed lists into a unified searchable pool.
+  // Use `type_id` internally as the map key to prevent name collisions, but keep Asset.id natural.
+  const allAssets = useMemo(() => {
+    const assetsMap = new Map<string, Asset>();
+
+    // Add mock online assets
+    MOCK_ONLINE_ASSETS.forEach(a => assetsMap.set(`${a.type}_${a.id}`, a));
+
+    // Incorporate real local items.
+    installedPlugins.forEach(p => {
+      assetsMap.set(`plugin_${p.id}`, {
+        id: p.id,
+        name: p.name,
+        displayName: p.name,
+        type: 'plugin',
+        version: p.version,
+        description: p.description || '',
+        author: p.isDevFolder ? '本地开发' : '已安装',
+      });
+    });
+
+    installedSkills.forEach(s => {
+      assetsMap.set(`skill_${s.id}`, {
+        id: s.id,
+        name: s.name,
+        displayName: s.displayName,
+        type: 'skill',
+        version: s.version,
+        description: s.description || '',
+        author: s.source === 'builtin' ? '系统内置' : '本地下载',
+      });
+    });
+
+    installedTools.forEach(t => {
+      assetsMap.set(`tool_${t.id}`, {
+        id: t.id,
+        name: t.name,
+        displayName: t.displayName || t.name,
+        type: 'tool',
+        version: t.version || '1.0.0',
+        description: t.description || '',
+        author: '本地自动化',
+      });
+    });
+
+    installedMcpTools.forEach(t => {
+      assetsMap.set(`mcp_${t.name}`, {
+        id: t.name,
+        name: t.name,
+        displayName: t.displayName || t.name,
+        type: 'mcp',
+        version: '1.0.0',
+        description: t.description || '暂无描述信息',
+        author: t.pluginId && t.pluginId !== 'system' && t.pluginId !== 'berrytrace.host' 
+          ? `来自插件: ${t.pluginId}` 
+          : '系统内置',
+      });
+    });
+
+    return Array.from(assetsMap.values());
+  }, [installedPlugins, installedSkills, installedTools, installedMcpTools]);
+
+  // Portal view list: filters by active tab, search query, and install status (uninstalled/installed/all)
+  const filteredPortalAssets = useMemo(() => {
+    return allAssets.filter(asset => {
+      if (asset.type !== activeTab) return false;
+
+      // Filter by install status
+      const isInstalled = isAssetInstalled(asset.id, asset.type);
+      if (filterMode === 'installed' && !isInstalled) return false;
+      if (filterMode === 'uninstalled' && isInstalled) return false;
+
+      // Filter by search query
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        return (
+          asset.name.toLowerCase().includes(q) ||
+          asset.displayName.toLowerCase().includes(q) ||
+          asset.description.toLowerCase().includes(q) ||
+          asset.author.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [allAssets, activeTab, filterMode, searchQuery, isAssetInstalled]);
+
+  // Portal Recommendation List
+  const recommendations = useMemo(() => {
+    return allAssets
+      .filter(a => ['com.berrytrace.plugin.code-explainer', 'git-analyst-skill'].includes(a.id))
+      .slice(0, 2);
+  }, [allAssets]);
+
+  // Actions for skills
+  const handleUninstallSkill = async (skillName: string) => {
+    if (!confirm(`确定要删除技能「${skillName}」吗？`)) return;
+    try {
+      const filesystem = (window as any).berrytrace?.filesystem;
+      const system = (window as any).berrytrace?.system;
+      if (!filesystem || !system) return;
+
+      const skillsDir = await filesystem.getSafePath('skills');
+      const skillDir = `${skillsDir}/${skillName}`;
+      const registryPath = `${skillsDir}/registry.json`;
+
+      const isWin = skillDir.includes('\\');
+      const rmCmd = isWin ? 'cmd' : 'rm';
+      const rmArgs = isWin ? ['/c', 'rmdir', '/s', '/q', skillDir] : ['-rf', skillDir];
+      await system.execCommand({ command: rmCmd, args: rmArgs, timeoutMs: 30000 });
+
+      const exists = await checkPathExists(registryPath, 'file');
+      if (exists) {
+        const data = await filesystem.readFile(registryPath, 'utf-8');
+        const registry = JSON.parse(data);
+        registry.skills = (registry.skills || []).filter((s: any) => s.name !== skillName);
+        registry.updatedAt = new Date().toISOString();
+        await filesystem.writeFile(registryPath, JSON.stringify(registry, null, 2));
+      }
+
+      loadLocalData();
+    } catch (err: any) {
+      alert('删除技能失败: ' + err.message);
+    }
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-full bg-[var(--bg-page)] text-[var(--text-primary)] overflow-y-auto no-drag">
+      <div className="max-w-[800px] mx-auto w-full px-5 py-6 flex flex-col gap-6">
+        
+        {viewMode === 'portal' ? (
+          /* ==================== PORTAL MODE ==================== */
+          <>
+            {/* Search Bar */}
+            <div className="relative w-full">
+              <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-[var(--text-tertiary)]">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+              </span>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="搜索插件、工具、SKILLS 里面的内容..."
+                className="w-full pl-10 pr-4 py-2.5 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] focus:border-[var(--color-brand)] text-sm rounded-xl text-[var(--text-primary)] placeholder-[var(--text-tertiary)] outline-none transition-all duration-200"
+              />
+            </div>
+
+            {/* Recommendations Section */}
+            {!searchQuery.trim() && (
+              <div className="flex flex-col gap-3">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-[var(--text-secondary)]">热门推荐</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {recommendations.map(rec => (
+                    <div 
+                      key={rec.id} 
+                      className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-2xl flex flex-col gap-2.5 transition-all duration-300 relative group overflow-hidden shadow-sm"
+                    >
+                      <div className="flex items-start justify-between">
+                        <div className="flex flex-col">
+                          <span className="text-sm font-semibold text-[var(--text-primary)] group-hover:text-[var(--color-brand)] transition-colors">{rec.displayName}</span>
+                          <span className="text-[10px] text-[var(--text-tertiary)] mt-0.5">{rec.author}</span>
+                        </div>
+                        <span className="text-[9px] px-2 py-0.5 rounded-full bg-[var(--bg-hover)] text-[var(--text-secondary)] border border-[var(--border-light)] uppercase tracking-wide">
+                          {rec.type === 'plugin' ? '插件' : '智能技能'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-[var(--text-secondary)] line-clamp-2 leading-relaxed">
+                        {rec.description}
+                      </p>
+                      <div className="flex justify-end mt-1">
+                        {isAssetInstalled(rec.id, rec.type) ? (
+                          <span className="text-[11px] font-semibold text-emerald-500 flex items-center gap-1">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                            已安装
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => handleInstallMockAsset(rec.id)}
+                            disabled={installingId === rec.id}
+                            className="px-3.5 py-1 text-[11px] font-semibold text-white bg-[var(--color-brand)] hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg shadow-sm border-none cursor-pointer transition-all duration-200"
+                          >
+                            {installingId === rec.id ? '安装中...' : '立即获取'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Portal Tab view with filters */}
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center justify-between border-b border-[var(--border-light)] pb-1">
+                {/* Tabs */}
+                <div className="flex gap-2">
+                  {(['skill', 'tool', 'plugin', 'mcp'] as const).map(tab => (
+                    <button
+                      key={tab}
+                      onClick={() => setActiveTab(tab)}
+                      className={`pb-2 px-1 text-xs font-semibold tracking-wide border-none bg-transparent cursor-pointer transition-all duration-200 ${
+                        activeTab === tab 
+                          ? 'text-[var(--color-brand)] border-b-2 border-[var(--color-brand)] border-solid' 
+                          : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                      }`}
+                    >
+                      {tab === 'skill' && '技能 (SKILLS)'}
+                      {tab === 'tool' && '工具 (Tools)'}
+                      {tab === 'plugin' && '插件 (Plugins)'}
+                      {tab === 'mcp' && 'MCP 工具'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Filters & Manage installed button */}
+                <div className="flex items-center gap-4">
+                  {/* Uninstalled / Installed / All filter */}
+                  <select
+                    value={filterMode}
+                    onChange={(e) => setFilterMode(e.target.value as any)}
+                    className="bg-[var(--bg-card)] border border-[var(--border-light)] text-[11px] text-[var(--text-secondary)] rounded-lg py-1 px-2 outline-none cursor-pointer transition-all duration-200"
+                  >
+                    <option value="uninstalled">未安装</option>
+                    <option value="installed">已安装</option>
+                    <option value="all">全部</option>
+                  </select>
+
+                  <button
+                    onClick={handleCreatePlugin}
+                    className="px-2.5 py-1 text-[11px] font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg border-none cursor-pointer flex items-center gap-1 transition-all shadow-sm"
+                    title="在 AgentChat 协作开发创建新插件或技能"
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                    创建插件/技能
+                  </button>
+
+                  <button
+                    onClick={() => setViewMode('management')}
+                    className="text-[11px] text-[var(--color-brand)] hover:opacity-90 font-semibold border-none bg-transparent cursor-pointer flex items-center gap-1 transition-all"
+                  >
+                    管理已安装
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                      <polyline points="12 5 19 12 12 19" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+
+              {/* Portal Asset Cards List */}
+              <div className="flex flex-col gap-3">
+                {loading ? (
+                  <div className="py-12 text-center text-xs text-[var(--text-tertiary)]">正在检索资源列表...</div>
+                ) : filteredPortalAssets.length === 0 ? (
+                  <div className="py-16 text-center text-xs text-[var(--text-tertiary)] flex flex-col items-center gap-2">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="opacity-30">
+                      <circle cx="12" cy="12" r="10" />
+                      <line x1="8" y1="12" x2="16" y2="12" />
+                    </svg>
+                    <span>无匹配的数据或已全部安装</span>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    {filteredPortalAssets.map(asset => {
+                      const isInstalled = isAssetInstalled(asset.id, asset.type);
+                      return (
+                        <div 
+                          key={asset.id} 
+                          className="p-4 bg-[var(--bg-card)] border border-[var(--border-light)] hover:border-[var(--border-hover)] rounded-xl flex items-center justify-between gap-4 transition-all duration-200"
+                        >
+                          <div className="flex-1 flex flex-col gap-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-semibold text-[var(--text-primary)] truncate">{asset.displayName}</span>
+                              <span className="text-[9px] text-[var(--text-tertiary)]">v{asset.version}</span>
+                            </div>
+                            <p className="text-[11px] text-[var(--text-secondary)] line-clamp-2 leading-relaxed">
+                              {asset.description}
+                            </p>
+                            <span className="text-[10px] text-[var(--text-tertiary)] mt-1">{asset.author}</span>
+                          </div>
+
+                          <div className="flex-shrink-0">
+                            {isInstalled ? (
+                              <button
+                                onClick={() => setViewMode('management')}
+                                className="px-3 py-1 text-[11px] font-semibold text-emerald-500 bg-emerald-500/5 hover:bg-emerald-500/10 border border-emerald-500/10 rounded-lg cursor-pointer transition-all duration-200"
+                              >
+                                已就绪
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => handleInstallMockAsset(asset.id)}
+                                disabled={installingId === asset.id}
+                                className="px-3.5 py-1 text-[11px] font-semibold text-white bg-[var(--color-brand)] hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg border-none cursor-pointer transition-all duration-200 shadow-sm"
+                              >
+                                {installingId === asset.id ? '安装中...' : '安装'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        ) : (
+          /* ==================== INSTALLED MANAGEMENT MODE ==================== */
+          <PluginsManagementPanel
+            onBack={() => setViewMode('portal')}
+            installedPlugins={installedPlugins}
+            installedSkills={installedSkills}
+            installedTools={installedTools}
+            installedMcpTools={installedMcpTools}
+            simulatedInstalledIds={simulatedInstalledIds}
+            onUninstallMockAsset={handleUninstallMockAsset}
+            onUninstallSkill={handleUninstallSkill}
+            loadLocalData={loadLocalData}
+          />
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+async function checkPathExists(filePath: string, type: 'file' | 'dir'): Promise<boolean> {
+  try {
+    const filesystem = (window as any).berrytrace?.filesystem;
+    if (!filesystem) return false;
+    const stat = await filesystem.stat(filePath);
+    if (!stat) return false;
+    return type === 'file' ? stat.isFile : stat.isDirectory;
+  } catch {
+    return false;
+  }
+}

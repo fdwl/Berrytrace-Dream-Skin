@@ -1,0 +1,148 @@
+/**
+ * @architecture-boundary PluginActivityTracker
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 职责与业务流程：
+ * 负责系统与插件的活跃状态跟踪与空闲自动化内存回收机制：
+ *  1. 插件活跃度记录 (recordActivity): 每次 IPC 或系统调用更新插件最后活跃时间戳。
+ *  2. 插件空闲回收 (startPluginsIdleTracker): 默认 30s 轮询，超过 5 分钟无活动的非常驻后台/混合插件自动释放。
+ *     - 跳过条件：声明 resident: true 的常驻插件、悬浮球打开状态、忙碌 session 状态。
+ *  3. 系统锁屏/休眠事件 (startSystemIdleTracker): powerMonitor 事件驱动 + 30s 兜底，广播 system:user-idle / user-active。
+ *
+ * AI 修改约束：
+ *  - 严禁将空闲轮询间隔设为 1s 以下，避免在高负载或桌面空闲时占用 CPU。
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import { powerMonitor } from 'electron';
+import type { ScannedPlugin } from './plugin-scanner';
+import { PluginLauncher } from './plugin-launcher';
+
+export class PluginActivityTracker {
+  private static instance: PluginActivityTracker;
+  private systemIdleTrackerInterval: NodeJS.Timeout | null = null;
+  private pluginIdleCheckInterval: NodeJS.Timeout | null = null;
+  private isUserIdleState = false;
+  private idleTrackerStarted = false;
+  private pluginLastActiveTime = new Map<string, number>();
+  private readonly PLUGINS_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟无活动自动释放
+
+  public static getInstance(): PluginActivityTracker {
+    if (!PluginActivityTracker.instance) {
+      PluginActivityTracker.instance = new PluginActivityTracker();
+    }
+    return PluginActivityTracker.instance;
+  }
+
+  public recordActivity(pluginId: string): void {
+    this.pluginLastActiveTime.set(pluginId, Date.now());
+  }
+
+  public getLastActiveTime(pluginId: string): number {
+    return this.pluginLastActiveTime.get(pluginId) || 0;
+  }
+
+  public startIfNeeded(
+    getLoadedPlugins: () => Set<string>,
+    getPlugin: (pluginId: string) => ScannedPlugin | undefined,
+    deactivatePluginFn: (pluginId: string) => Promise<void>,
+    broadcastEventFn: (eventName: string, data: unknown) => void
+  ): void {
+    if (this.idleTrackerStarted) return;
+    this.idleTrackerStarted = true;
+    this.startSystemIdleTracker(broadcastEventFn);
+    this.startPluginsIdleTracker(getLoadedPlugins, getPlugin, deactivatePluginFn);
+  }
+
+  public stopTrackers(): void {
+    if (this.pluginIdleCheckInterval) {
+      clearInterval(this.pluginIdleCheckInterval);
+      this.pluginIdleCheckInterval = null;
+    }
+    if (this.systemIdleTrackerInterval) {
+      clearInterval(this.systemIdleTrackerInterval);
+      this.systemIdleTrackerInterval = null;
+    }
+  }
+
+  private startSystemIdleTracker(broadcastEventFn: (eventName: string, data: unknown) => void): void {
+    if (this.systemIdleTrackerInterval) return;
+
+    const IDLE_THRESHOLD_SEC = 60;
+
+    const onUserActive = () => {
+      if (this.isUserIdleState) {
+        this.isUserIdleState = false;
+        console.log('[PluginManager] System: user became active (event).');
+        broadcastEventFn('system:user-active', null);
+      }
+    };
+
+    const onUserIdle = () => {
+      if (!this.isUserIdleState) {
+        this.isUserIdleState = true;
+        console.log('[PluginManager] System: user became idle (event).');
+        broadcastEventFn('system:user-idle', null);
+      }
+    };
+
+    powerMonitor.on('lock-screen', onUserIdle);
+    powerMonitor.on('suspend', onUserIdle);
+    powerMonitor.on('unlock-screen', onUserActive);
+    powerMonitor.on('resume', onUserActive);
+
+    this.systemIdleTrackerInterval = setInterval(() => {
+      try {
+        const idleTime = powerMonitor.getSystemIdleTime();
+        if (idleTime >= IDLE_THRESHOLD_SEC) {
+          onUserIdle();
+        } else {
+          onUserActive();
+        }
+      } catch { /* ignore */ }
+    }, 30_000);
+  }
+
+  private startPluginsIdleTracker(
+    getLoadedPlugins: () => Set<string>,
+    getPlugin: (pluginId: string) => ScannedPlugin | undefined,
+    deactivatePluginFn: (pluginId: string) => Promise<void>
+  ): void {
+    if (this.pluginIdleCheckInterval) return;
+
+    this.pluginIdleCheckInterval = setInterval(async () => {
+      const now = Date.now();
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { ElectronFloatBall } = require('../windows/float-ball');
+      const loadedPlugins = getLoadedPlugins();
+
+      for (const pluginId of loadedPlugins) {
+        const plugin = getPlugin(pluginId);
+        if (plugin?.manifest.resident) continue;
+
+        if (ElectronFloatBall.getInstance().hasPluginWindows(pluginId)) continue;
+
+        if (PluginLauncher.getInstance().isPluginBusy(pluginId)) {
+          this.recordActivity(pluginId);
+          continue;
+        }
+
+        let lastActive = this.getLastActiveTime(pluginId);
+        if (lastActive === 0) {
+          this.recordActivity(pluginId);
+          lastActive = now;
+        }
+        const timeout = plugin?.manifest.idleTimeout ?? this.PLUGINS_IDLE_TIMEOUT_MS;
+        if (now - lastActive > timeout) {
+          if (plugin && (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid')) {
+            console.log(`[PluginManager] Plugin "${pluginId}" has been idle for ${Math.round((now - lastActive) / 1000)}s (> ${timeout / 1000}s). Automatically unloading background process to free memory...`);
+            try {
+              await deactivatePluginFn(pluginId);
+            } catch (err) {
+              console.error(`[PluginManager] Failed to idle-unload plugin "${pluginId}":`, err);
+            }
+          }
+        }
+      }
+    }, 30000);
+  }
+}

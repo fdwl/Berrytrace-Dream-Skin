@@ -1,0 +1,238 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/02-quickstart.md b/plugins-dev/npx-tools/skills/plugin-creator/references/02-quickstart.md
+index c5f3e23..f2d4ca4 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/02-quickstart.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/02-quickstart.md
+@@ -1,166 +1,38 @@
+ # 02 — 快速上手：从零到 Hello World
+ 
+-## Step 1：生成 UUID
++## Step 1：创建插件
+ 
+ ```bash
+-node plugins-dev/npx-tools/skills/plugin-creator/scripts/generate-uuid.js
++node plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js create hello-world
+ ```
+ 
+-获得纯数字 UUID，例如 `4829173645`。
+-
+----
+-
+-## Step 2：创建插件
+-
+-```bash
+-node plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js create <name> --id com.berrytrace.plugin.<name>-<uuid>
+-```
+-
+-示例：
+-```bash
+-node plugins-dev/npx-tools/skills/plugin-creator/scripts/berrytrace-cli.js create hello-world --id com.berrytrace.plugin.hello-world-4829173645
+-```
+-
+-CLI 在 `plugins-dev/<name>/` 下生成以下结构：
++CLI 自动在 `plugins-dev/hello-world/` 下生成完整项目：
+ 
+ ```
+ hello-world/
+-├── package.json          # 项目配置
++├── package.json          # 项目配置（含 build 脚本）
+ ├── plugin.json           # 插件元数据
+ ├── src/
+-│   └── index.js          # 入口文件（activate/deactivate）
++│   └── index.tsx         # React 面板入口
++├── scripts/
++│   └── bundle.mjs        # esbuild 构建配置
+ └── tests/
+-    └── index.test.js     # 单元测试
++    └── index.test.js     # 测试模板
+ ```
+ 
+ ---
+ 
+-## Step 3：修正 plugin.json
+-
+-CLI 模板生成后需要手动修正：
+-
+-```json
+-{
+-  "id": "com.berrytrace.plugin.hello-world-4829173645",
+-  "name": "Hello World",
+-  "version": "1.0.0",
+-  "description": "我的第一个插件",
+-  "type": "panel",
+-  "view": "dist/renderer.js",
+-  "permissions": ["storage"],
+-  "activationEvents": ["onView:hello-world-view"],
+-  "contributes": {
+-    "selectionMenuItems": [
+-      {
+-        "id": "hello-world.greet",
+-        "label": "Hello World",
+-        "icon": "👋",
+-        "action": "hello-world.greet"
+-      }
+-    ]
+-  }
+-}
+-```
+-
+-**CLI 模板需改的项**：
+-- `main: "src/index.js"` → `view: "dist/renderer.js"`（panel 类型用 view）
+-- 删除 `namespace` 字段（不需要）
+-- 添加 `activationEvents`（否则每次启动都加载）
+-- 权限改为简短格式：`"storage"`（CLI 模板生成 `"ai:inference"` 格式）
+-
+----
+-
+-## Step 4：安装依赖
++## Step 2：安装依赖并构建
+ 
+ ```bash
+ cd plugins-dev/hello-world
+ npm install
+-```
+-
+-如需 React/TypeScript，额外安装：
+-```bash
+-npm install react react-dom
+-npm install -D @types/react @types/react-dom esbuild typescript
+-```
+-
+----
+-
+-## Step 5：编写代码
+-
+-### panel 类型
+-
+-```typescript
+-// src/renderer.tsx
+-import React from 'react';
+-import { createRoot } from 'react-dom/client';
+-import { createPluginSDK } from 'berrytrace-plugin-sdk';
+-
+-const sdk = createPluginSDK('com.berrytrace.plugin.hello-world-4829173645');
+-
+-function App() {
+-  return (
+-    <div style={{ padding: 20 }}>
+-      <h1>Hello World! 👋</h1>
+-      <p>如果你看到这个页面，插件已经成功加载。</p>
+-    </div>
+-  );
+-}
+-
+-const root = createRoot(document.getElementById('root')!);
+-root.render(<App />);
+-```
+-
+-### background 类型
+-
+-保留 CLI 生成的 `src/index.js` 模板，修正路径即可：
+-
+-```javascript
+-import { createPluginSDK } from 'berrytrace-plugin-sdk';
+-
+-const sdk = createPluginSDK('com.berrytrace.plugin.hello-world-4829173645');
+-
+-export async function activate() {
+-  sdk.log.info('后台服务启动');
+-  sdk.mcp.registerToolHandler('hello_world_run_action', async (args) => {
+-    return { content: [{ type: 'text', text: `处理: ${args.input}` }] };
+-  });
+-}
+-
+-export async function deactivate() {
+-  sdk.log.info('后台服务停止');
+-}
+-
+-activate().catch(err => console.error('[Plugin] 激活失败:', err));
+-```
+-
+----
+-
+-## Step 6：构建
+-
+-创建 `scripts/bundle.mjs`（参考 [08-build.md](./08-build.md)）：
+-
+-```bash
+-mkdir -p scripts
+-# 复制 08-build.md 中的 bundle.mjs 内容到 scripts/bundle.mjs
+-```
+-
+-修改 `package.json` 的 scripts：
+-```json
+-{
+-  "scripts": {
+-    "build": "node scripts/bundle.mjs",
+-    "test": "vitest run"
+-  }
+-}
+-```
+-
+-```bash
+ npm run build
+ ```
+ 
+ ---
+ 
+-## Step 7：加载到宿主
++## Step 3：加载到宿主
+ 
+ ```
+ plugin_manager_load_unpacked
+@@ -169,18 +41,18 @@ plugin_manager_load_unpacked
+ 
+ ---
+ 
+-## Step 8：验证
++## Step 4：验证
+ 
+ ```
+ plugin_manager_get_logs
+-参数: { "pluginId": "com.berrytrace.plugin.hello-world-4829173645", "limit": 30 }
++参数: { "pluginId": "com.berrytrace.plugin.hello-world-xxxxx", "limit": 30 }
+ ```
+ 
+ 确认日志无报错。
+ 
+ ---
+ 
+-## Step 9：热重载
++## Step 5：热重载
+ 
+ 修改代码后：
+ 
+@@ -190,5 +62,33 @@ npm run build
+ 
+ ```
+ plugin_manager_reload
+-参数: { "pluginId": "com.berrytrace.plugin.hello-world-4829173645" }
++参数: { "pluginId": "com.berrytrace.plugin.hello-world-xxxxx" }
+ ```
++
++---
++
++## 生成的代码说明
++
++**src/index.tsx**（面板入口）：
++
++```tsx
++import React from 'react';
++import { createRoot } from 'react-dom/client';
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++
++const sdk = createPluginSDK('com.berrytrace.plugin.hello-world-xxxxx');
++
++function App() {
++  return (
++    <div style={{ padding: 20 }}>
++      <h1>Hello World</h1>
++      <p>Plugin loaded successfully.</p>
++    </div>
++  );
++}
++
++const root = createRoot(document.getElementById('root')!);
++root.render(<App />);
++```
++
++SDK、React、react-dom 通过全局 shim 注入，无需手动 external。

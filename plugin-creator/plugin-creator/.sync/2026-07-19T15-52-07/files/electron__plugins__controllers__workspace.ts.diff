@@ -1,0 +1,26 @@
+diff --git a/electron/plugins/controllers/workspace.ts b/electron/plugins/controllers/workspace.ts
+index 3b2f64e..36c63fb 100644
+--- a/electron/plugins/controllers/workspace.ts
++++ b/electron/plugins/controllers/workspace.ts
+@@ -318,4 +318,21 @@ export class WorkspaceController extends BaseApiController {
+     ElectronSelection.getInstance().unregisterSelectionMenuItem(id);
+     return null;
+   }
++
++  /**
++   * 在工作区中打开浏览器标签页（主窗口）。自动显示并聚焦主窗口。
++   * @param url 目标网址
++   * @param title 标签标题（可选）
++   */
++  async workspace_openBrowserTab(url: string, title?: string): Promise<null> {
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      if (!mainWindow.isVisible()) {
++        mainWindow.show();
++      }
++      mainWindow.focus();
++      mainWindow.webContents.send('main:open-browser-tab', { url, title });
++    }
++    return null;
++  }
+ }

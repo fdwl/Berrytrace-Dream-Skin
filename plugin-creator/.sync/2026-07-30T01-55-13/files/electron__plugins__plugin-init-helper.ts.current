@@ -1,0 +1,213 @@
+/**
+ * @architecture-boundary PluginInitHelper
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 职责与业务流程：
+ * 负责插件系统两阶段（Early 启动阶段 / Deferred 延后阶段）的初始化序列：
+ *  1. performInitHelper (Early Phase):
+ *     - 执行 SDK 符号链接、PluginScanner.scanAll 扫描所有磁盘插件。
+ *     - EventSubscriptionRegistry 建立事件订阅索引。
+ *     - 针对常驻 (resident) 与高优先级 (high) 插件并发/即刻预加载。
+ *  2. initDeferredHelper (Deferred Phase):
+ *     - UI 就绪 (app:ready) 后延后加载其余非常驻非高优先级插件。
+ *     - 启动空闲回收追踪器。
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import { cache } from '../config/index';
+import { CacheAttribute } from '../../src/config/CacheAttribute';
+import { PluginUpdater } from './plugin-update';
+import type { PluginManifest } from './plugin-verifier';
+import type { ScannedPlugin } from './plugin-scanner';
+import { PluginScanner } from './plugin-scanner';
+import { PluginLauncher } from './plugin-launcher';
+import * as PluginConfig from './plugin-config-repository';
+import { pluginStateRegistry } from './plugin-state-registry';
+import { EventSubscriptionRegistry } from './event-subscription-registry';
+import { isVersionNewer } from './plugin-utils';
+import { loadPersistedDevPlugins } from './plugin-dev-helper';
+import type { PluginLifecycleContext, PluginLoadMode, PluginLifecycleAction } from './plugin-manager';
+
+export async function performInitHelper(
+  pluginsMapRef: { get: () => Map<string, ScannedPlugin>; set: (m: Map<string, ScannedPlugin>) => void },
+  pluginLifecycleContextMap: Map<string, PluginLifecycleContext>,
+  ensureSdkInPluginsHomeFn: () => void,
+  markPluginLifecycleFn: (id: string, action: PluginLifecycleAction, loadMode?: PluginLoadMode) => void,
+  isPluginEnabledFn: (id: string) => boolean,
+  registerStaticContributionsFn: (plugin: ScannedPlugin) => void,
+  shouldLoadEagerlyFn: (manifest: PluginManifest) => boolean,
+  startBackgroundPluginFn: (id: string) => Promise<void>,
+  startMainPluginFn: (id: string) => Promise<void>,
+  notifyPluginsChangedFn: () => void
+): Promise<void> {
+  const t0 = performance.now();
+  console.debug(`[PluginManager] [Perf] Early initializing plugin system starts at +${t0.toFixed(2)}ms`);
+
+  ensureSdkInPluginsHomeFn();
+
+  const t_scan_start = performance.now();
+  const scannedPlugins = await PluginScanner.scanAll();
+  await loadPersistedDevPlugins(scannedPlugins, registerStaticContributionsFn);
+  pluginsMapRef.set(scannedPlugins);
+  console.debug(`[PluginManager] [Perf] Scanned all plugins and dev plugins in ${(performance.now() - t_scan_start).toFixed(2)}ms`);
+
+  const registry = EventSubscriptionRegistry.getInstance();
+  for (const [id, plugin] of scannedPlugins.entries()) {
+    registry.registerFromManifest(id, plugin.manifest);
+  }
+  registry.debugPrint();
+
+  const enabledList = PluginConfig.getEnabledPlugins();
+  const disabledList = PluginConfig.getDisabledPlugins();
+  if (enabledList !== undefined) {
+    let updated = false;
+    for (const id of scannedPlugins.keys()) {
+      if (!enabledList.includes(id) && !disabledList.includes(id)) {
+        enabledList.push(id);
+        updated = true;
+      }
+    }
+    // 自动清洗本地持久化配置中已卸载/移除的废弃插件 ID
+    const validIds = new Set(scannedPlugins.keys());
+    const cleanedList = enabledList.filter((id) => validIds.has(id));
+    if (cleanedList.length !== enabledList.length) {
+      enabledList.length = 0;
+      enabledList.push(...cleanedList);
+      updated = true;
+    }
+    if (updated) {
+      PluginConfig.initEnabledPlugins(enabledList);
+    }
+  }
+
+  PluginLauncher.getInstance().registerInteractionForwarders(registry.getAllSubscribedEvents());
+
+  const t_setup_start = performance.now();
+  for (const [id, plugin] of scannedPlugins.entries()) {
+    if (!pluginLifecycleContextMap.has(id)) {
+      markPluginLifecycleFn(id, 'initial-load', 'normal');
+    }
+
+    const updateInfo = PluginUpdater.getInstance().getUpdate?.(id);
+    if (updateInfo && !isVersionNewer(updateInfo.version, plugin.manifest.version)) {
+      console.log(`[PluginManager] Version ${plugin.manifest.version} matches/newer than update. Clearing update cache.`);
+      PluginUpdater.getInstance().removeUpdate?.(id);
+    }
+
+    if (isPluginEnabledFn(id)) {
+      registerStaticContributionsFn(plugin);
+    }
+  }
+  console.debug(`[PluginManager] [Perf] Early setup lifecycle and static registration for builtin plugins in ${(performance.now() - t_setup_start).toFixed(2)}ms`);
+
+  notifyPluginsChangedFn();
+
+  for (const [id, plugin] of scannedPlugins.entries()) {
+    if (isPluginEnabledFn(id) && plugin.manifest.type !== 'builtin') {
+      if (shouldLoadEagerlyFn(plugin.manifest)) {
+        if (!pluginStateRegistry.isActive(id)) {
+          pluginStateRegistry.markActive(id);
+          registerStaticContributionsFn(plugin);
+          if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
+            console.log(`[PluginManager] [Phase1-EagerLaunch] Starting resident background plugin: ${id}`);
+            startBackgroundPluginFn(id).catch(err => {
+              console.error(`[PluginManager] [Phase1-EagerLaunch] Failed to start ${id}: ${err}`);
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const t_launch_start = performance.now();
+  const launchPromises: Promise<void>[] = [];
+  for (const [id, plugin] of scannedPlugins.entries()) {
+    const typeStr = plugin.manifest.type as string;
+    if (isPluginEnabledFn(id) && typeStr === 'builtin' && plugin.manifest.startupPriority === 'high') {
+      if (plugin.manifest.agentKernel) {
+        console.log(`[PluginManager] Skipping background launch for agent kernel plugin "${id}" at startup (will load lazily)`);
+        continue;
+      }
+      if (!shouldLoadEagerlyFn(plugin.manifest)) {
+        console.log(`[PluginManager] Skipping eager launch for lazy plugin "${id}" at startup`);
+        continue;
+      }
+      pluginStateRegistry.markActive(id);
+      if (plugin.manifest.main) {
+        const t_main_start = performance.now();
+        launchPromises.push(
+          startMainPluginFn(id).then(() => {
+            console.debug(`[PluginManager] [Perf] startMainPlugin for "${id}" took ${(performance.now() - t_main_start).toFixed(2)}ms`);
+          }).catch((err: unknown) => {
+            console.error(`[PluginManager] Failed to start main plugin "${id}":`, err);
+          })
+        );
+      }
+    }
+  }
+
+  await Promise.all(launchPromises);
+  console.debug(`[PluginManager] [Perf] Early builtin plugins startup completed in ${(performance.now() - t_launch_start).toFixed(2)}ms. Total early init took ${(performance.now() - t0).toFixed(2)}ms.`);
+}
+
+export async function initDeferredHelper(
+  pluginsMap: Map<string, ScannedPlugin>,
+  isPluginEnabledFn: (id: string) => boolean,
+  registerStaticContributionsFn: (plugin: ScannedPlugin) => void,
+  shouldLoadEagerlyFn: (manifest: PluginManifest) => boolean,
+  startBackgroundPluginFn: (id: string) => Promise<void>,
+  startMainPluginFn: (id: string) => Promise<void>,
+  startIdleTrackerIfNeededFn: () => void
+): Promise<void> {
+  const t0 = performance.now();
+  console.debug(`[PluginManager] [Perf] Deferred initializing plugin system (non-builtin plugins) starts at +${t0.toFixed(2)}ms`);
+
+  for (const [id, plugin] of pluginsMap.entries()) {
+    if (isPluginEnabledFn(id) && plugin.manifest.type !== 'builtin') {
+      registerStaticContributionsFn(plugin);
+    }
+  }
+
+  const launchPromises: Promise<void>[] = [];
+  for (const [id, plugin] of pluginsMap.entries()) {
+    const enabled = isPluginEnabledFn(id);
+    const isBuiltin = plugin.manifest.type === 'builtin';
+    const isLoaded = pluginStateRegistry.isActive(id);
+    const isEager = shouldLoadEagerlyFn(plugin.manifest);
+
+    if (enabled && !isBuiltin) {
+      if (isLoaded) continue;
+
+      if ((plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') && plugin.manifest.agentKernel) {
+        continue;
+      }
+      if (!isEager) continue;
+      pluginStateRegistry.markActive(id);
+
+      if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
+        const t_bg_start = performance.now();
+        console.log(`[PluginManager:initDeferred] Launching background plugin=${id}`);
+        launchPromises.push(
+          startBackgroundPluginFn(id).then(() => {
+            console.log(`[PluginManager:initDeferred] Launched background plugin=${id} in ${(performance.now() - t_bg_start).toFixed(2)}ms`);
+          }).catch((err: unknown) => {
+            console.error(`[PluginManager:initDeferred] Failed to launch background plugin=${id}: ${err}`);
+          })
+        );
+      } else if (plugin.manifest.type === 'main') {
+        const t_main_start = performance.now();
+        launchPromises.push(
+          startMainPluginFn(id).then(() => {
+            console.debug(`[PluginManager] [Perf] startMainPlugin for "${id}" took ${(performance.now() - t_main_start).toFixed(2)}ms`);
+          }).catch((err: unknown) => {
+            console.error(`[PluginManager] Failed to start main plugin "${id}":`, err);
+          })
+        );
+      }
+    }
+  }
+
+  await Promise.all(launchPromises);
+  startIdleTrackerIfNeededFn();
+
+  console.debug(`[PluginManager] [Perf] Deferred plugins startup completed in ${(performance.now() - t0).toFixed(2)}ms.`);
+}

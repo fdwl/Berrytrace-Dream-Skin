@@ -1,0 +1,21 @@
+diff --git a/electron/plugins/controllers/api-context.ts b/electron/plugins/controllers/api-context.ts
+index 56be854..31b4390 100644
+--- a/electron/plugins/controllers/api-context.ts
++++ b/electron/plugins/controllers/api-context.ts
+@@ -13,13 +13,13 @@ export abstract class BaseApiController implements PluginApiController {
+   async execute(methodName: string, args: unknown[], context: ApiContext): Promise<unknown> {
+     const apiName = context.apiName;
+     const cleanMethodName = methodName.replace(/\./g, '_');
+-    let fn: Function | undefined;
++    let fn: ((...args: unknown[]) => unknown) | undefined;
+     if (apiName) {
+       const apiPrefix = apiName.replace(/-/g, '_');
+-      fn = (this as any)[`${apiPrefix}_${cleanMethodName}`];
++      fn = (this as Record<string, unknown>)[`${apiPrefix}_${cleanMethodName}`] as ((...args: unknown[]) => unknown) | undefined;
+     }
+     if (!fn) {
+-      fn = (this as any)[cleanMethodName];
++      fn = (this as Record<string, unknown>)[cleanMethodName] as ((...args: unknown[]) => unknown) | undefined;
+     }
+     if (typeof fn !== 'function') {
+       throw new Error(`Method ${methodName} (apiName: ${apiName}) not found on controller`);

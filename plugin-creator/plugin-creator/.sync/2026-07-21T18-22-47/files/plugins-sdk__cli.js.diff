@@ -1,0 +1,194 @@
+diff --git a/plugins-sdk/cli.js b/plugins-sdk/cli.js
+index 9cf2d62..fa06975 100755
+--- a/plugins-sdk/cli.js
++++ b/plugins-sdk/cli.js
+@@ -241,6 +241,25 @@ async function performSdkBuild(pluginPath) {
+ 
+     const { build } = await import('esbuild');
+ 
++    // 别名解析插件，将以 @/ 开头的路径重定向到宿主 src/ 目录，方便内置插件开发引用
++    const aliasPlugin = {
++      name: 'berrytrace-alias-plugin',
++      setup(buildContext) {
++        const ROOT = path.resolve(__dirname, '../..');
++        buildContext.onResolve({ filter: /^@\// }, args => {
++          const targetPath = path.resolve(ROOT, 'src', args.path.slice(2));
++          const exts = ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js', '/index.jsx'];
++          for (const ext of exts) {
++            const fullPath = targetPath + ext;
++            if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
++              return { path: fullPath };
++            }
++          }
++          return { path: targetPath };
++        });
++      }
++    };
++
+     // 默认内置的 esbuild 插件，用于对原生二进制文件（.node）和特殊动态包进行打桩，以避免编译失败
+     const defaultStubPlugin = {
+       name: 'berrytrace-stub-plugin',
+@@ -349,6 +368,11 @@ async function performSdkBuild(pluginPath) {
+         allowOverwrite: true,
+         mainFields: ['module', 'main'],
+         plugins: [defaultStubPlugin, umdFixPlugin],
++        tsconfigRaw: {
++          compilerOptions: {
++            experimentalDecorators: true
++          }
++        },
+         banner: {
+           js: "import { createRequire as __createRequire } from 'module'; import { fileURLToPath as __fileURLToPath } from 'url'; import { dirname as __dirnamePolyfill } from 'path'; const require = __createRequire(import.meta.url); const __filename = __fileURLToPath(import.meta.url); const __dirname = __dirnamePolyfill(__filename);",
+         },
+@@ -389,9 +413,22 @@ async function performSdkBuild(pluginPath) {
+       const cssPlugin = {
+         name: 'berrytrace-css-plugin',
+         setup(buildContext) {
+-          buildContext.onResolve({ filter: /\.css$/ }, args => ({
+-            path: path.resolve(args.resolveDir, args.path), namespace: 'css-ns',
+-          }));
++          buildContext.onResolve({ filter: /\.css$/ }, args => {
++            let resolvedPath = '';
++            if (args.path.startsWith('.') || args.path.startsWith('/') || path.isAbsolute(args.path)) {
++              resolvedPath = path.resolve(args.resolveDir, args.path);
++            } else {
++              try {
++                const ROOT = path.resolve(__dirname, '../..');
++                resolvedPath = require.resolve(args.path, { paths: [args.resolveDir, ROOT] });
++              } catch (e) {
++                resolvedPath = path.resolve(args.resolveDir, args.path);
++              }
++            }
++            return {
++              path: resolvedPath, namespace: 'css-ns',
++            };
++          });
+           buildContext.onLoad({ filter: /.*/, namespace: 'css-ns' }, args => {
+             const css = fs.readFileSync(args.path, 'utf-8').replace(/\s+/g, ' ');
+             return {
+@@ -502,6 +539,7 @@ async function performSdkBuild(pluginPath) {
+                   export const createRoot = ReactDOM.createRoot;
+                   export const hydrateRoot = ReactDOM.hydrateRoot;
+                   export const flushSync = ReactDOM.flushSync;
++                  export const createPortal = ReactDOM.createPortal;
+                 `,
+                 loader: 'js'
+               };
+@@ -522,6 +560,86 @@ async function performSdkBuild(pluginPath) {
+         }
+       };
+ 
++      // 共享宿主核心单例状态，防止在插件内部多次打包生成副本导致状态脱节
++      const globalHostImportsPlugin = {
++        name: 'berrytrace-global-host-imports-plugin',
++        setup(buildContext) {
++          const ROOT = path.resolve(__dirname, '../..');
++          const hostImports = {
++            '@/stores/user': `
++              const useUserStore = (typeof window !== 'undefined' ? window : globalThis).useUserStore;
++              export { useUserStore };
++            `,
++            '@/stores/app': `
++              const useAppStore = (typeof window !== 'undefined' ? window : globalThis).useAppStore;
++              export { useAppStore };
++            `,
++            '@/services/http': `
++              const httpService = (typeof window !== 'undefined' ? window : globalThis).httpService;
++              export { httpService };
++            `,
++            '@/services/event_bus': `
++              const event_bus = (typeof window !== 'undefined' ? window : globalThis).event_bus;
++              export default event_bus;
++            `,
++            '@/services/publish_bridge': `
++              const publish_bridge = (typeof window !== 'undefined' ? window : globalThis).publish_bridge;
++              export const bindConsumers = publish_bridge ? publish_bridge.bindConsumers : undefined;
++              export const unbindConsumers = publish_bridge ? publish_bridge.unbindConsumers : undefined;
++            `,
++            '@/plugins/PluginRegistry': `
++              const PluginRegistry = (typeof window !== 'undefined' ? window : globalThis).PluginRegistry;
++              export { PluginRegistry };
++            `
++          };
++          buildContext.onResolve({ filter: /.*/ }, args => {
++            if (!args.resolveDir) return null;
++            
++            let absolutePath = '';
++            if (args.path.startsWith('@/')) {
++              absolutePath = path.resolve(ROOT, 'src', args.path.slice(2));
++            } else if (args.path.startsWith('.')) {
++              absolutePath = path.resolve(args.resolveDir, args.path);
++            } else {
++              return null;
++            }
++            
++            const normalized = absolutePath.replace(/\.(?:ts|tsx|js|jsx)$/, '');
++            
++            const userStorePath = path.resolve(ROOT, 'src/stores/user');
++            const appStorePath = path.resolve(ROOT, 'src/stores/app');
++            const httpServicePath = path.resolve(ROOT, 'src/services/http');
++            const eventBusPath = path.resolve(ROOT, 'src/services/event_bus');
++            const publishBridgePath = path.resolve(ROOT, 'src/services/publish_bridge');
++            const pluginRegistryPath = path.resolve(ROOT, 'src/plugins/PluginRegistry');
++            
++            if (normalized === userStorePath) {
++              return { path: '@/stores/user', namespace: 'global-host-imports-ns' };
++            }
++            if (normalized === appStorePath) {
++              return { path: '@/stores/app', namespace: 'global-host-imports-ns' };
++            }
++            if (normalized === httpServicePath) {
++              return { path: '@/services/http', namespace: 'global-host-imports-ns' };
++            }
++            if (normalized === eventBusPath) {
++              return { path: '@/services/event_bus', namespace: 'global-host-imports-ns' };
++            }
++            if (normalized === publishBridgePath) {
++              return { path: '@/services/publish_bridge', namespace: 'global-host-imports-ns' };
++            }
++            if (normalized === pluginRegistryPath) {
++              return { path: '@/plugins/PluginRegistry', namespace: 'global-host-imports-ns' };
++            }
++            
++            return null;
++          });
++          buildContext.onLoad({ filter: /.*/, namespace: 'global-host-imports-ns' }, args => {
++            return { contents: hostImports[args.path], loader: 'js' };
++          });
++        }
++      };
++
+       await build({
+         entryPoints: [entryPoint],
+         outfile: path.join(pluginPath, view),
+@@ -532,9 +650,29 @@ async function performSdkBuild(pluginPath) {
+         minify: false,
+         jsxFactory: 'React.createElement',
+         jsxFragment: 'React.Fragment',
+-        plugins: [cssPlugin, globalSdkPlugin, globalReactPlugin],
++        plugins: [globalHostImportsPlugin, aliasPlugin, cssPlugin, globalSdkPlugin, globalReactPlugin],
++        tsconfigRaw: {
++          compilerOptions: {
++            experimentalDecorators: true
++          }
++        },
+         logLevel: 'info',
+-        external: [],
++        external: ['electron'],
++        define: {
++          'import.meta.env': JSON.stringify({
++            DEV: true,
++            MODE: 'development',
++            VITE_APP_SOCKET_URL: '',
++            VITE_BASE_URL: '',
++            VITE_APP_API_URL: '',
++            VITE_UPLOAD_URL: '',
++            VITE_APP_USE_MOCK: 'true',
++            VITE_BERRYTRACE_MODEL: 'qwen3-vl-plus',
++            VITE_BERRYTRACE_ENDPOINT: '',
++            VITE_WEB_APP: 'false',
++            VITE_ENABLE_PHONE_LOGIN: 'false',
++          })
++        },
+       });
+     }

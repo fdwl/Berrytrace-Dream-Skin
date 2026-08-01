@@ -1,0 +1,20 @@
+diff --git a/electron/plugins/plugin-launcher.ts b/electron/plugins/plugin-launcher.ts
+index 8ba3b7d..e9800cf 100644
+--- a/electron/plugins/plugin-launcher.ts
++++ b/electron/plugins/plugin-launcher.ts
+@@ -175,14 +175,7 @@ export class PluginLauncher {
+     return this.activeAgentSessions.size > 0;
+   }
+ 
+-  public isPluginBusy(pluginId: string): boolean {
+-    for (const mappedPluginId of this.sessionToPluginMap.values()) {
+-      if (mappedPluginId === pluginId) {
+-        return true;
+-      }
+-    }
+-    return false;
+-  }
++
+ 
+   public emitToBackgroundPlugin(pluginId: string, eventName: string, payload: unknown): void {
+     const proc = this.backgroundProcesses.get(pluginId);

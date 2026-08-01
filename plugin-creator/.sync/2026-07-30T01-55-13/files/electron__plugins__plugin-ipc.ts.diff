@@ -1,0 +1,875 @@
+diff --git a/electron/plugins/plugin-ipc.ts b/electron/plugins/plugin-ipc.ts
+index 353b00f..25b3429 100644
+--- a/electron/plugins/plugin-ipc.ts
++++ b/electron/plugins/plugin-ipc.ts
+@@ -1,360 +1,89 @@
+-import { ipcMain, BrowserWindow, dialog, IpcMainEvent, net, app } from 'electron';
+-import { PluginManager } from './plugin-manager';
++import { ipcMain, BrowserWindow, dialog, net, app } from 'electron';
++import type { PluginManager } from './plugin-manager';
+ import { McpHost } from './mcp-host';
+-import { cache } from '../config/index';
+-import { CacheAttribute } from '../../src/config/CacheAttribute';
++import * as PluginConfig from './plugin-config-repository';
+ import { PluginUpdater } from './plugin-update';
+ import { verifyPackage, confirmInstallPackage } from './plugin-install';
+ import { dispatchPluginApiCall } from './api-dispatcher';
+-import { SignatureJson } from './signature-verifier';
+-import path, { join } from 'path';
++import type { SignatureJson } from './signature-verifier';
++import { join } from 'path';
+ import { promises as fs } from 'fs';
+ import * as fsSync from 'fs';
+ import { spawn } from 'child_process';
+ import { isVersionNewer } from './plugin-utils';
+-
++import { registerMcpHostTools } from './plugin-ipc-mcp-tools';
++import { registerAgentIpcHandlers } from './plugin-ipc-agent';
++import { PluginActivityTracker } from './plugin-activity-tracker';
++import type { ScannedPlugin } from './plugin-scanner';
+ 
+ export function registerIpcHandlers(pm: PluginManager): void {
+   console.log('[plugin-ipc] registerIpcHandlers called');
+ 
+-  // 注册一等公民开发者 MCP 工具，供 AI 调试和管理开发插件
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'plugin_manager_load_unpacked',
+-      description: '加载本地开发中的未打包插件目录 (必须包含 plugin.json)',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          path: {
+-            type: 'string',
+-            description: '本地开发插件目录的绝对物理路径，例如 /Users/li/work/work/berrytrace_app/plugins-dev/opencli-bridge'
+-          }
+-        },
+-        required: ['path']
+-      }
+-    },
+-    async (args) => {
+-      const pluginPath = args.path as string;
+-      try {
+-        const scanned = await pm.loadUnpackedPlugin(pluginPath);
+-        return { success: true, pluginId: scanned.manifest.id, message: `Successfully loaded unpacked plugin from ${pluginPath}` };
+-      } catch (err: any) {
+-        return { success: false, error: err.message || String(err) };
+-      }
+-    }
+-  );
+-
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'plugin_manager_reload',
+-      description: '重新加载/热重载已载入的插件，适用于修改完代码编译后热生效',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          pluginId: {
+-            type: 'string',
+-            description: '插件ID，例如 com.berrytrace.plugin.opencli_bridge'
+-          }
+-        },
+-        required: ['pluginId']
+-      }
+-    },
+-    async (args) => {
+-      const pluginId = args.pluginId as string;
+-      try {
+-        const success = await pm.reloadPlugin(pluginId);
+-        return { success, message: success ? `Successfully reloaded plugin ${pluginId}` : `Plugin ${pluginId} not found` };
+-      } catch (err: any) {
+-        return { success: false, error: err.message || String(err) };
+-      }
+-    }
+-  );
++  function buildPluginEntry(p: ScannedPlugin, isActive: boolean, pinnedList: string[], override?: Record<string, unknown>) {
++    const updateInfo = PluginUpdater.getInstance().getUpdate(p.manifest.id);
++    const hasUpdate = updateInfo && isVersionNewer(updateInfo.version, p.manifest.version);
++    const scope = p.manifest.scope || (p.manifest.type === 'background' || p.manifest.type === 'main' ? 'global' : 'workspace');
+ 
+-  // 辅助函数：校验文件路径是否在允许的工作区或系统持久化数据目录下
+-  const isPathAllowed = (filePath: string): boolean => {
+-    try {
+-      const resolved = path.resolve(filePath);
+-      const { WorkspaceManager, getDefaultWorkspacePath } = require('../services/workspace-manager');
+-      const wsRoot = WorkspaceManager.getInstance().getPath() || getDefaultWorkspacePath();
+-      const resolvedWs = path.resolve(wsRoot);
+-      const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+-      const berrytraceHome = path.join(homeDir, '.berrytrace');
+-      return resolved.startsWith(resolvedWs) || resolved.startsWith(berrytraceHome) || resolved.startsWith('/tmp');
+-    } catch {
+-      return true;
+-    }
+-  };
+-
+-  // 注册一等公民内置宿主 MCP 工具：图片 OCR
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'read_image_ocr',
+-      description: '读取图片文件并使用 PaddleOCR ONNX 引擎执行文字识别，提取图片中的文本内容（支持 .png, .jpg, .jpeg, .webp, .bmp, .tiff, .gif）',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          filePath: {
+-            type: 'string',
+-            description: '图片文件的绝对物理路径'
+-          }
+-        },
+-        required: ['filePath']
+-      }
+-    },
+-    async (args) => {
+-      const rawPath = args?.filePath;
+-      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
+-        return { error: 'filePath parameter is required and must be a non-empty string' };
+-      }
+-      const filePath = path.resolve(rawPath.trim());
+-      if (!isPathAllowed(filePath)) {
+-        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
+-      }
+-      try {
+-        const { parseImageOcr } = await import('../services/ocr-image-parser');
+-        const text = await parseImageOcr(filePath);
+-        return { text, filePath };
+-      } catch (err: any) {
+-        return { error: err.message || String(err), filePath };
+-      }
+-    }
+-  );
+-
+-  // 注册一等公民内置宿主 MCP 工具：Office 文档解析
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'read_office_document',
+-      description: '读取并提取 Office 文档中的纯文本内容（支持 .pptx, .xlsx, .xls, .docx；旧版 .doc/.ppt 采用降级匹配）',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          filePath: {
+-            type: 'string',
+-            description: 'Office 文档文件的绝对物理路径'
+-          }
+-        },
+-        required: ['filePath']
+-      }
+-    },
+-    async (args) => {
+-      const rawPath = args?.filePath;
+-      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
+-        return { error: 'filePath parameter is required and must be a non-empty string' };
+-      }
+-      const filePath = path.resolve(rawPath.trim());
+-      if (!isPathAllowed(filePath)) {
+-        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
+-      }
+-      try {
+-        const stats = await fs.stat(filePath).catch(() => null);
+-        if (stats && stats.size > 50 * 1024 * 1024) {
+-          return { error: `Office document too large (${(stats.size / 1024 / 1024).toFixed(2)}MB > 50MB). Please use 'read_document_outline' for structure.`, filePath };
+-        }
+-        const { extractFileContent } = await import('../services/fulltext-file-parsers');
+-        const ext = path.extname(filePath) || '';
+-        const text = await extractFileContent(filePath, ext);
+-        return { text, filePath };
+-      } catch (err: any) {
+-        return { error: err.message || String(err), filePath };
+-      }
+-    }
+-  );
+-
+-  // 注册一等公民内置宿主 MCP 工具：PDF 电子书/文档解析 (支持按页码范围读取)
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'read_pdf_document',
+-      description: '读取并提取 PDF 电子书或文档中的纯文本内容，支持指定页码范围（startPage - endPage，未指定 endPage 时默认读取 startPage 起始的 10 页）',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          filePath: {
+-            type: 'string',
+-            description: 'PDF 文件的绝对物理路径'
+-          },
+-          startPage: {
+-            type: 'number',
+-            description: '起始页码（1-indexed，默认 1）'
+-          },
+-          endPage: {
+-            type: 'number',
+-            description: '结束页码（包含，可选；若未提供则默认读取 10 页）'
+-          }
+-        },
+-        required: ['filePath']
+-      }
+-    },
+-    async (args) => {
+-      const rawPath = args?.filePath;
+-      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
+-        return { error: 'filePath parameter is required and must be a non-empty string' };
+-      }
+-      const filePath = path.resolve(rawPath.trim());
+-      if (!isPathAllowed(filePath)) {
+-        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
+-      }
+-      const startPage = typeof args.startPage === 'number' && args.startPage > 0 ? Math.floor(args.startPage) : 1;
+-      const endPage = typeof args.endPage === 'number' && args.endPage >= startPage ? Math.floor(args.endPage) : undefined;
+-      try {
+-        const { parsePdfPageRange } = await import('../services/fulltext-file-parsers');
+-        const res = await parsePdfPageRange(filePath, startPage, endPage);
+-        return { ...res, filePath };
+-      } catch (err: any) {
+-        return { error: err.message || String(err), filePath };
+-      }
+-    }
+-  );
+-
+-  // 注册一等公民内置宿主 MCP 工具：提炼文档大纲与目录结构
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'read_document_outline',
+-      description: '提取文档的目录大纲、书签与结构概览（支持 PDF 书签目录、DOCX/MD 标题大纲、XLSX 表格清单等）',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          filePath: {
+-            type: 'string',
+-            description: '目标文档的绝对物理路径'
+-          }
+-        },
+-        required: ['filePath']
+-      }
+-    },
+-    async (args) => {
+-      const rawPath = args?.filePath;
+-      if (!rawPath || typeof rawPath !== 'string' || !rawPath.trim()) {
+-        return { error: 'filePath parameter is required and must be a non-empty string' };
+-      }
+-      const filePath = path.resolve(rawPath.trim());
+-      if (!isPathAllowed(filePath)) {
+-        return { error: 'Access denied: File path is outside allowed workspace boundaries.', filePath };
+-      }
+-      try {
+-        const { extractDocumentOutline } = await import('../services/fulltext-file-parsers');
+-        const res = await extractDocumentOutline(filePath);
+-        return typeof res === 'object' && res !== null ? { ...res, filePath } : { outline: res, filePath };
+-      } catch (err: any) {
+-        return { error: err.message || String(err), filePath };
+-      }
+-    }
+-  );
+-
+-  // 注册一等公民内置宿主 MCP 工具：注册定时与自动唤醒任务
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'schedule_task_register',
+-      description: '注册定时自动任务或每日首次打开任务。支持由 AI Agent 自动思考执行（提供 prompt 参数）或触发系统终端命令（提供 command 参数）。',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          id: {
+-            type: 'string',
+-            description: '任务唯一标识符，例如 daily-ai-news'
+-          },
+-          cron: {
+-            type: 'string',
+-            description: '定时表达式。支持标准 5 段式 cron (如 "0 8 * * *" 每天 8 点)，或特殊关键字 "first-open"（每天用户第一次打开 App 时激活一次 Agent 任务）'
+-          },
+-          prompt: {
+-            type: 'string',
+-            description: '自动任务要让 Agent 执行的自然语言 Prompt（例如 "帮我收集 10 条 AI Agent 相关新闻并整理"）'
+-          },
+-          command: {
+-            type: 'string',
+-            description: '系统终端 Shell 命令（可选，如 "npm run lint"）'
+-          },
+-          intervalMs: {
+-            type: 'number',
+-            description: '间隔触发的毫秒数（可选，如 3600000 表示每小时）'
+-          },
+-          workDir: {
+-            type: 'string',
+-            description: '任务执行的目标工作区目录路径（可选，默认使用当前活动工作区）'
+-          }
+-        },
+-        required: ['id']
+-      }
+-    },
+-    async (args) => {
+-      try {
+-        const { PluginScheduler } = await import('./scheduler');
+-        const { WorkspaceManager, getDefaultWorkspacePath } = await import('../services/workspace-manager');
+-        const workDir = (args.workDir as string) || WorkspaceManager.getInstance().getPath() || getDefaultWorkspacePath();
+-
+-        await PluginScheduler.getInstance().register('agent-schedule', {
+-          id: args.id as string,
+-          cron: args.cron as string | undefined,
+-          prompt: args.prompt as string | undefined,
+-          command: args.command as string | undefined,
+-          intervalMs: typeof args.intervalMs === 'number' ? args.intervalMs : undefined,
+-          cwd: workDir,
+-        });
++    return {
++      id: p.manifest.id,
++      name: p.manifest.name,
++      version: p.manifest.version,
++      description: p.manifest.description,
++      isActive,
++      isLoaded: pm.isPluginActive(p.manifest.id),
++      isPinned: pinnedList.includes(p.manifest.id),
++      hasBackend: false,
++      status: p.status,
++      isDevFolder: p.isDevFolder,
++      isCustomDev: false,
++      type: p.manifest.type,
++      windowScope: p.manifest.windowScope,
++      scope,
++      view: p.manifest.view,
++      keywords: p.manifest.keywords ?? [],
++      fileAssociations: p.manifest.fileAssociations ?? [],
++      documentCreators: p.manifest.documentCreators ?? [],
++      triggerPrefix: p.manifest.triggerPrefix,
++      quickPanelMode: p.manifest.quickPanelMode || 'window',
++      disableDefaultDrag: p.manifest.disableDefaultDrag ?? false,
++      supportTabs: p.manifest.supportTabs ?? false,
++      startupPriority: p.manifest.startupPriority || 'normal',
++      uiMode: 'iframe',
++      nativeElectron: p.manifest.nativeElectron ?? false,
++      updateVersion: hasUpdate ? updateInfo?.version : undefined,
++      updateUrl: hasUpdate ? updateInfo?.url : undefined,
++      updateChangelog: hasUpdate ? updateInfo?.changelog : undefined,
++      main: p.manifest.main,
++      settingsSchema: p.manifest.settingsSchema,
++      auth: p.manifest.auth,
++      activationEvents: p.manifest.activationEvents,
++      contributes: p.manifest.contributes,
++      processIsolation: p.manifest.processIsolation ?? 'optional',
++      pluginLifecycle: pm.getLifecycleContext(p.manifest.id),
++      workspaceOverride: override,
++    };
++  }
+ 
+-        return {
+-          success: true,
+-          message: `Successfully registered scheduled task "${args.id}" (cron: ${args.cron || 'N/A'}, prompt: ${args.prompt ? 'yes' : 'no'})`
+-        };
+-      } catch (err: any) {
+-        return { success: false, error: err.message || String(err) };
+-      }
++  // 当用户在设置面板查看某插件的 Tab 时，Renderer 定期调用此接口刷新活跃时间戳，
++  // 防止 PluginActivityTracker 将正在被用户查看的插件判定为空闲并自动卸载。
++  ipcMain.handle('plugins:record-activity', (_event, pluginId: string) => {
++    if (typeof pluginId === 'string' && pluginId.trim()) {
++      PluginActivityTracker.getInstance().recordActivity(pluginId);
+     }
+-  );
+-
+-  // 注册一等公民内置宿主 MCP 工具：列出当前所有定时任务
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'schedule_task_list',
+-      description: '列出当前系统与工作区中所有已注册的定时/自动唤醒任务清单及状态',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {},
+-        required: []
+-      }
+-    },
+-    async () => {
+-      try {
+-        const { PluginScheduler } = await import('./scheduler');
+-        const tasks = PluginScheduler.getInstance().list();
+-        return { success: true, tasks };
+-      } catch (err: any) {
+-        return { success: false, error: err.message || String(err) };
+-      }
+-    }
+-  );
+-
+-  // 注册一等公民内置宿主 MCP 工具：注销定时任务
+-  McpHost.getInstance().registerHostTool(
+-    {
+-      name: 'schedule_task_unregister',
+-      description: '取消或注销指定的定时/自动唤醒任务',
+-      inputSchema: {
+-        type: 'object',
+-        properties: {
+-          id: {
+-            type: 'string',
+-            description: '要注销的任务 ID'
+-          }
+-        },
+-        required: ['id']
+-      }
+-    },
+-    async (args) => {
+-      try {
+-        const { PluginScheduler } = await import('./scheduler');
+-        await PluginScheduler.getInstance().unregister('agent-schedule', args.id as string);
+-        await PluginScheduler.getInstance().unregister('workspace-schedule', args.id as string);
+-        return { success: true, message: `Successfully unregistered scheduled task "${args.id}"` };
+-      } catch (err: any) {
+-        return { success: false, error: err.message || String(err) };
+-      }
+-    }
+-  );
++  });
++
++  // Renderer 通过 PluginActiveViewTracker 上报当前正在渲染的插件列表。
++  // PluginActivityTracker 的空闲轮询会跳过这些插件，防止"用户正在查看"时被卸载。
++  ipcMain.handle('plugins:set-active-rendered', (_event, pluginIds: string[]) => {
++    if (!Array.isArray(pluginIds)) return;
++    PluginActivityTracker.getInstance().setActiveRenderedPlugins(pluginIds);
++  });
+ 
+   ipcMain.handle('plugins:get-list', async (event) => {
+     await pm.init();
+-    const enabledList = cache.get(CacheAttribute.prefEnabledPlugins) as string[] | undefined;
+-    const pinnedList = cache.get(CacheAttribute.prefPinnedPlugins) as string[] | undefined || [];
++    const enabledList = PluginConfig.getEnabledPlugins();
++    const disabledList = PluginConfig.getDisabledPlugins();
++    const pinnedList = PluginConfig.getPinnedPlugins();
+ 
+     // Phase 3: Load per-workspace plugin overrides
+     let workspaceOverrides: Record<string, { enabled?: boolean; config?: Record<string, unknown> }> = {};
+@@ -373,6 +102,10 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     const allowedBuiltins = oemManager.getConfig().builtinPlugins || [];
+ 
+     return pm.getPluginsList().map(p => {
++      // 用户显式禁用优先级最高，无论 isBuiltin/resident 均强制 isActive=false
++      if (disabledList.includes(p.manifest.id)) {
++        return buildPluginEntry(p, false, pinnedList);
++      }
+       const isBuiltin = allowedBuiltins.includes(p.manifest.id);
+       const globalEnabled = isBuiltin
+         ? true
+@@ -487,15 +220,7 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     const plugin = pm.getPlugin(id);
+     if (!plugin) return false;
+ 
+-    let pinnedList = cache.get(CacheAttribute.prefPinnedPlugins) as string[] | undefined || [];
+-    if (pinned) {
+-      if (!pinnedList.includes(id)) {
+-        pinnedList.push(id);
+-      }
+-    } else {
+-      pinnedList = pinnedList.filter(x => x !== id);
+-    }
+-    cache.set(CacheAttribute.prefPinnedPlugins, pinnedList);
++    PluginConfig.setPinned(id, pinned);
+     pm.notifyPluginsChanged();
+     return true;
+   });
+@@ -507,54 +232,81 @@ export function registerIpcHandlers(pm: PluginManager): void {
+ 
+   ipcMain.handle('plugins:get-settings', () => {
+     return {
+-      developerMode: cache.get(CacheAttribute.prefDeveloperMode) !== false,
+-      allowUntrustedPlugins: cache.get(CacheAttribute.prefAllowUntrustedPlugins) === true,
++      developerMode: PluginConfig.isDeveloperMode(),
++      allowUntrustedPlugins: PluginConfig.isAllowUntrustedPlugins(),
+     };
+   });
+ 
+   ipcMain.handle('plugins:set-developer-mode', async (_event, enabled: boolean) => {
+-    cache.set(CacheAttribute.prefDeveloperMode, enabled);
++    PluginConfig.setDeveloperMode(enabled);
+     await pm.init(true);
+     return true;
+   });
+ 
+   ipcMain.handle('plugins:set-allow-untrusted', async (_event, enabled: boolean) => {
+-    cache.set(CacheAttribute.prefAllowUntrustedPlugins, enabled);
++    PluginConfig.setAllowUntrustedPlugins(enabled);
+     await pm.init(true);
+     return true;
+   });
+ 
+   ipcMain.handle('plugins:api-call', async (_event, apiName: string, methodName: string, args: unknown[], callerPluginId?: string) => {
+     const safeArgs = Array.isArray(args) ? args : [];
+-    const isVerbosePolling = 
+-      (apiName === 'terminal' && (methodName === 'getCwd' || methodName === 'getPromptState')) ||
++    const isSilentPolling = 
++      (apiName === 'workspace' && (methodName === 'scanPorts' || methodName === 'getHistory')) ||
++      (apiName === 'terminal' && (methodName === 'getAllStatus' || methodName === 'getCwd' || methodName === 'getPromptState')) ||
+       (apiName === 'window' && (methodName === 'updateWindowOptions' || methodName === 'startDrag'));
+-    if (!isVerbosePolling) {
+-      console.log(`[PluginIPC] plugins:api-call: api=${apiName} method=${methodName} args=${JSON.stringify(safeArgs)} caller=${callerPluginId || 'auto'}`);
++
++    const cleanArgs = safeArgs.map(arg => {
++      if (arg instanceof Uint8Array || ArrayBuffer.isView(arg) || Buffer.isBuffer(arg)) {
++        const bin = arg as unknown as { length?: number; byteLength?: number };
++        return `<Binary Data: ${bin.length || bin.byteLength} bytes>`;
++      }
++      if (arg && typeof arg === 'object') {
++        const keys = Object.keys(arg);
++        if (keys.length > 100) {
++          return `<Large Object: ${keys.length} keys>`;
++        }
++        const str = JSON.stringify(arg);
++        if (str.length > 500) {
++          return `${str.slice(0, 300)}... <truncated ${str.length - 300} chars>`;
++        }
++      }
++      return arg;
++    });
++
++    if (isSilentPolling) {
++      if (console.debug) {
++        console.debug(`[PluginIPC:debug] api=${apiName} method=${methodName} caller=${callerPluginId || 'auto'}`);
++      }
++    } else {
++      console.log(`[PluginIPC:api-call] api=${apiName} method=${methodName} args=${JSON.stringify(cleanArgs)} caller=${callerPluginId || 'auto'}`);
+     }
++
+     try {
+       await pm.init();
+       let callerId = callerPluginId || 'generic-ui';
+-      if (!callerPluginId) {
++      if (!callerPluginId && _event?.sender) {
+         const url = _event.sender.getURL();
+-        if (url.startsWith('berrytrace-plugin://')) {
++        if (url && url.startsWith('berrytrace-plugin://')) {
+           const match = url.match(/berrytrace-plugin:\/\/([^/]+)/);
+           if (match && match[1]) {
+             callerId = match[1];
+           }
+         }
+       }
+-      return await dispatchPluginApiCall(callerId, apiName, methodName, safeArgs, undefined, _event.sender);
+-    } catch (err: any) {
+-      console.log(`[PluginIPC] plugins:api-call failed (returning soft error to avoid log pollution):`, err.message || err);
++
++      return await dispatchPluginApiCall(callerId, apiName, methodName, safeArgs, undefined, _event?.sender);
++    } catch (err: unknown) {
++      const e = err as { message?: string; code?: string };
++      console.error(`🚨 [PluginIPC:ERROR] api=${apiName} method=${methodName} failed:`, e.message || err);
+       return {
+         __isApiError: true,
+-        message: err.message || String(err),
+-        code: err.code || undefined
++        code: e.code || undefined
+       };
+     }
+   });
+ 
++
+   // callApiResult: token 回调模式，通过 send/on 而非 invoke 通道，避免阻塞
+   ipcMain.on('plugins:api-call-result', async (_event, payload: {
+     apiName: string;
+@@ -623,9 +375,10 @@ export function registerIpcHandlers(pm: PluginManager): void {
+       console.log(`[plugin-ipc] UI triggered plugins:load-unpacked for dir: ${pluginDir}`);
+       const scanned = await pm.loadUnpackedPlugin(pluginDir);
+       return { success: true, plugin: scanned };
+-    } catch (err: any) {
++    } catch (err: unknown) {
++      const e = err as Error;
+       console.error(`[plugin-ipc] Failed to load unpacked plugin at ${pluginDir}:`, err);
+-      return { success: false, error: err.message || String(err) };
++      return { success: false, error: e.message || String(err) };
+     }
+   });
+ 
+@@ -641,9 +394,10 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     try {
+       await PluginUpdater.getInstance().checkForUpdates();
+       return { success: true };
+-    } catch (err: any) {
++    } catch (err: unknown) {
++      const e = err as Error;
+       console.error('[plugin-ipc] Error running manual update checker:', err);
+-      return { success: false, error: err.message || String(err) };
++      return { success: false, error: e.message || String(err) };
+     }
+   });
+ 
+@@ -742,9 +496,10 @@ export function registerIpcHandlers(pm: PluginManager): void {
+         await copyDir(url, targetPath);
+         event.sender.send(`plugins:clone-repo-progress:${token}`, `复制成功！\r\n`);
+         return { success: true, path: targetPath, name: repoName };
+-      } catch (err: any) {
+-        event.sender.send(`plugins:clone-repo-progress:${token}`, `复制失败: ${err.message}\r\n`);
+-        return { success: false, error: err.message };
++      } catch (err: unknown) {
++        const e = err as Error;
++        event.sender.send(`plugins:clone-repo-progress:${token}`, `复制失败: ${e.message}\r\n`);
++        return { success: false, error: e.message };
+       }
+     }
+ 
+@@ -764,10 +519,10 @@ export function registerIpcHandlers(pm: PluginManager): void {
+           return new Promise((res) => {
+             event.sender.send(`plugins:clone-repo-progress:${token}`, `> ${cmd} ${args.join(' ')}\r\n`);
+             const child = spawn(cmd, args, { cwd });
+-            child.stdout.on('data', (data: any) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
+-            child.stderr.on('data', (data: any) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
++            child.stdout.on('data', (data: Buffer | string) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
++            child.stderr.on('data', (data: Buffer | string) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
+             child.on('close', (code: number) => res(code));
+-            child.on('error', (err: any) => {
++            child.on('error', (err: Error) => {
+               event.sender.send(`plugins:clone-repo-progress:${token}`, `错误: ${err.message}\r\n`);
+               res(1);
+             });
+@@ -805,11 +560,11 @@ export function registerIpcHandlers(pm: PluginManager): void {
+         event.sender.send(`plugins:clone-repo-progress:${token}`, `> git clone --depth 1 -b ${gitRef} ${url} ${targetDirName}\r\n`);
+         const child = spawn('git', ['clone', '--depth', '1', '-b', gitRef, url, targetDirName], { cwd: tmpDir });
+ 
+-        child.stdout.on('data', (data: any) => {
++        child.stdout.on('data', (data: Buffer | string) => {
+           event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString());
+         });
+ 
+-        child.stderr.on('data', (data: any) => {
++        child.stderr.on('data', (data: Buffer | string) => {
+           event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString());
+         });
+ 
+@@ -823,8 +578,8 @@ export function registerIpcHandlers(pm: PluginManager): void {
+             const fallbackPath = join(tmpDir, `${targetDirName}-fallback`);
+             const fallbackChild = spawn('git', ['clone', '--depth', '1', url, `${targetDirName}-fallback`], { cwd: tmpDir });
+             
+-            fallbackChild.stdout.on('data', (data: any) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
+-            fallbackChild.stderr.on('data', (data: any) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
++            fallbackChild.stdout.on('data', (data: Buffer | string) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
++            fallbackChild.stderr.on('data', (data: Buffer | string) => event.sender.send(`plugins:clone-repo-progress:${token}`, data.toString()));
+             
+             fallbackChild.on('close', (fallbackCode: number) => {
+               if (fallbackCode === 0) {
+@@ -840,214 +595,34 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     });
+   });
+ 
+-  // Adding the new plugins:ensure-loaded IPC handler
+-  ipcMain.handle('plugins:ensure-loaded', async (_event, id: string) => {
+-    const t0 = Date.now();
+-    console.log(`[PluginIPC] 🔍 plugins:ensure-loaded request for: ${id}`);
+-    await pm.init();
+-    console.log(`[PluginIPC] 🔍 pm.init completed for ${id} (+${Date.now() - t0}ms), calling pm.ensurePluginLoaded...`);
+-    const result = await pm.ensurePluginLoaded(id);
+-    console.log(`[PluginIPC] 🔍 plugins:ensure-loaded result for ${id}: ${result ? `manifest(id=${result.id})` : 'NULL'} (total=${Date.now() - t0}ms)`);
+-    return result;
+-  });
+ 
+-  // Agent IPC Handlers
+-  ipcMain.handle('agent:test-connection', async (_event, options: {
+-    provider: string;
+-    model?: string;
+-    apiKey?: string;
+-    baseUrl?: string;
+-  }) => {
+-    try {
+-      let baseUrl = options.baseUrl?.trim() || '';
+-      if (!baseUrl) {
+-        return { success: false, error: 'API 地址 (Base URL) 不能为空' };
+-      }
+-      
+-      // Construct the models endpoint URL
+-      let modelsUrl = baseUrl;
+-      if (!modelsUrl.endsWith('/models')) {
+-        modelsUrl = modelsUrl.endsWith('/') ? `${modelsUrl}models` : `${modelsUrl}/models`;
+-      }
+-      
+-      const headers: Record<string, string> = {
+-        'Accept': 'application/json',
+-      };
+-      if (options.apiKey?.trim()) {
+-        headers['Authorization'] = `Bearer ${options.apiKey.trim()}`;
+-      }
+-      
+-      console.log(`[PluginIPC] Testing connection to: ${modelsUrl}`);
+-      
+-      const response = await net.fetch(modelsUrl, {
+-        method: 'GET',
+-        headers,
+-      });
+-      
+-      if (!response.ok) {
+-        const text = await response.text();
+-        return { success: false, error: `HTTP ${response.status}: ${text || response.statusText}` };
+-      }
+-      
+-      const data = await response.json() as any;
+-      let modelsList: string[] = [];
+-      if (data && Array.isArray(data.data)) {
+-        modelsList = data.data.map((m: any) => m.id);
+-      } else if (data && Array.isArray(data)) {
+-        modelsList = data.map((m: any) => typeof m === 'string' ? m : m.id || m.name);
+-      }
+-      
+-      modelsList = modelsList.filter(Boolean);
+-      
+-      return { success: true, models: modelsList };
+-    } catch (err: any) {
+-      console.error('[PluginIPC] Test connection error:', err);
+-      return { success: false, error: err.message || String(err) };
+-    }
++  // ── 声明式启动入口 (Startup Entry) IPC ──────────────────────────────────
++  /**
++   * 获取所有插件声明的 startupEntry 列表，供宿主设置 UI 展示
++   */
++  ipcMain.handle('plugins:get-startup-entries', () => {
++    return pm.getStartupEntries();
+   });
+ 
+-  ipcMain.handle('agent:ensure-kernel', async () => {
+-    await pm.init();
+-    const kernelPluginId = await pm.ensureAgentKernelRunning();
+-    return kernelPluginId !== null;
++  /**
++   * 获取当前激活的 startupEntry（用于设置页回显当前状态）
++   */
++  ipcMain.handle('plugins:get-active-startup-entry', () => {
++    return pm.getActiveStartupEntry();
+   });
+ 
+-  ipcMain.handle('agent:get-kernel-status', async () => {
+-    await pm.init();
+-    const targetPluginId = pm.getAgentKernelPluginId();
+-    const isRunning = targetPluginId ? pm.isBackgroundPluginRunning(targetPluginId) : false;
+-    return {
+-      isRunning,
+-      pluginId: targetPluginId,
+-    };
++  /**
++   * 设置激活的 startupEntry（由设置 UI 调用，下次启动生效）
++   * @param pluginId  null = 恢复正常模式
++   * @param voiceUiPluginId  选择的 voice UI 子插件 ID
++   */
++  ipcMain.handle('plugins:set-active-startup-entry', (_event, pluginId: string | null, voiceUiPluginId?: string | null) => {
++    pm.setActiveStartupEntry(pluginId, voiceUiPluginId);
++    return { success: true };
+   });
+ 
+-  ipcMain.on('agent:dispatch-task', async (_event, payload: any) => {
+-    try {
+-      const { WorkflowIntentRouter } = await import('./workflow-intent-router');
+-      const intentResult = WorkflowIntentRouter.getInstance().matchIntent(payload.task);
+-      if (intentResult.matched && intentResult.workflowId) {
+-        console.log(`[plugin-ipc] Intent matched workflow: ${intentResult.workflowId}. Routing dispatch to workflow execution.`);
+-
+-        const broadcast = (stepUpdate: any) => {
+-          BrowserWindow.getAllWindows().forEach((win) => {
+-            if (!win.isDestroyed()) {
+-              win.webContents.send('plugin:event:agent:step_update', stepUpdate);
+-            }
+-          });
+-        };
+-
+-        // 1. 发送开始事件
+-        broadcast({
+-          sessionId: payload.sessionId,
+-          turnId: payload.turnId,
+-          status: 'started',
+-          currentStep: 0,
+-          message: `🔍 已识别到匹配的工作流: "${intentResult.workflowName || intentResult.workflowId}"。准备执行...`
+-        });
+-
+-        // 2. 监听本地进展并桥接
+-        const { WorkflowEngine } = await import('./workflow-engine');
+-        const progressHandler = (progressPayload: any) => {
+-          if (!progressPayload || progressPayload.workflowId !== intentResult.workflowId) return;
+-
+-          let agentStatus: any = 'running';
+-          let message = '';
+-          let toolName = undefined;
+-          let toolDisplayName = undefined;
+-
+-          switch (progressPayload.event) {
+-            case 'workflow_started':
+-              agentStatus = 'thinking';
+-              message = `🚀 启动工作流「${intentResult.workflowName || intentResult.workflowId}」...`;
+-              break;
+-            case 'step_started':
+-              agentStatus = 'calling_tool';
+-              toolName = progressPayload.stepId || '';
+-              toolDisplayName = progressPayload.stepName || toolName;
+-              message = `⏳ 正在执行步骤: ${toolDisplayName}`;
+-              break;
+-            case 'step_success':
+-              agentStatus = 'tool_result';
+-              toolName = progressPayload.stepId || '';
+-              toolDisplayName = progressPayload.stepName || toolName;
+-              message = `✅ 步骤 "${toolDisplayName}" 执行成功（耗时 ${progressPayload.durationMs}ms）。`;
+-              break;
+-            case 'step_failed':
+-              agentStatus = 'error';
+-              toolName = progressPayload.stepId || '';
+-              toolDisplayName = progressPayload.stepName || toolName;
+-              message = `❌ 步骤 "${toolDisplayName}" 执行失败: ${progressPayload.error}`;
+-              break;
+-            case 'workflow_completed':
+-              agentStatus = progressPayload.success ? 'completed' : 'error';
+-              message = progressPayload.success 
+-                ? `🏁 工作流执行成功！总耗时 ${progressPayload.totalDurationMs}ms。`
+-                : `🏁 工作流执行失败: ${progressPayload.error}`;
+-              
+-              // 移除监听器
+-              process.nextTick(() => {
+-                WorkflowEngine.getInstance().removeListener('step-progress', progressHandler);
+-              });
+-              break;
+-          }
+-
+-          broadcast({
+-            sessionId: payload.sessionId,
+-            turnId: payload.turnId,
+-            status: agentStatus,
+-            currentStep: (progressPayload.stepIndex ?? 0) + 1,
+-            totalSteps: progressPayload.totalSteps,
+-            toolName,
+-            toolDisplayName,
+-            message,
+-          });
+-        };
+-
+-        WorkflowEngine.getInstance().on('step-progress', progressHandler);
+-
+-        // 3. 执行工作流
+-        WorkflowEngine.getInstance().execute(intentResult.workflowId, intentResult.extractedParams || {}, 'direct').catch(err => {
+-          console.error('[plugin-ipc] Failed to execute matched workflow:', err);
+-          broadcast({
+-            sessionId: payload.sessionId,
+-            turnId: payload.turnId,
+-            status: 'error',
+-            currentStep: 0,
+-            message: `❌ 执行工作流失败: ${err?.message || err}`
+-          });
+-          WorkflowEngine.getInstance().removeListener('step-progress', progressHandler);
+-        });
+-
+-        return;
+-      }
+-
+-      const { ApiDispatcher } = await import('./api-dispatcher');
+-      await ApiDispatcher.getInstance().dispatch(
+-        'generic-ui',
+-        'ai',
+-        'runAgentTask',
+-        [payload],
+-        undefined,
+-        _event.sender
+-      );
+-    } catch (err) {
+-      const errMsg = err instanceof Error ? err.message : String(err);
+-      console.error('[plugin-ipc] Failed to dispatch agent task:', err);
+-      // 向 renderer 发送 error 状态，避免 AgentChat UI 永远卡在等待状态
+-      const sessionId = payload?.sessionId;
+-      if (sessionId) {
+-        BrowserWindow.getAllWindows().forEach((win) => {
+-          if (!win.isDestroyed()) {
+-            win.webContents.send('plugin:event:agent:step_update', {
+-              sessionId,
+-              status: 'error',
+-              currentStep: 0,
+-              message: `任务派发失败：${errMsg}`,
+-            });
+-          }
+-        });
+-      }
+-    }
+-  });
++  // ── 子模块注册 ─────────────────────────────────────────────────────────────
++  registerMcpHostTools(pm);
++  registerAgentIpcHandlers(pm);
+ }
++

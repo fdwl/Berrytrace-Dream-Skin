@@ -1,0 +1,78 @@
+diff --git a/electron/services/ripgrep-service.ts b/electron/services/ripgrep-service.ts
+index 6a96ec2..f32a4b5 100644
+--- a/electron/services/ripgrep-service.ts
++++ b/electron/services/ripgrep-service.ts
+@@ -43,20 +43,23 @@ export class RipgrepService {
+ 
+   /**
+    * 使用 ripgrep 在工作区中搜索文本内容
++   *
++   * extensions 默认为空数组，此时 ripgrep 依据文件内容自动跳过二进制文件（null-byte 检测），
++   * 无需维护扩展名列表，同时覆盖 .env .log .conf .ini 等无标准扩展名的纯文本文件。
++   * 仅在需要精确限定某些后缀时才传入 extensions。
+    */
+   public async searchContent(
+     query: string,
+     workspacePath: string,
+-    extensions: string[]
++    extensions: string[] = []
+   ): Promise<RipgrepMatch[]> {
+-    console.log(`[RipgrepService:searchContent] Searching for "${query}" in "${workspacePath}" with exts:`, extensions)
+-    
++    console.log(`[RipgrepService:searchContent] Searching for "${query}" in "${workspacePath}"${extensions.length ? ` with exts: ${extensions.join(',')}` : ' (binary-auto-detect)'}`)
++
+     if (!query || !workspacePath) return []
+ 
+-    // 构造 Ripgrep 的包含后缀参数，例如 -g "*.js" -g "*.ts"
++    // 若指定了扩展名则按后缀过滤；否则不加 -g glob，由 ripgrep 自动跳过二进制文件
+     const globArgs: string[] = []
+     for (const ext of extensions) {
+-      // 兼容可能带点或不带点的情况
+       const cleanExt = ext.startsWith('.') ? ext.slice(1) : ext
+       globArgs.push('-g', `*.${cleanExt}`)
+     }
+@@ -83,7 +86,7 @@ export class RipgrepService {
+     return new Promise((resolve) => {
+       const results: RipgrepMatch[] = []
+       const child = spawn(this.resolvedRgPath, args)
+-      
++
+       let stdoutData = ''
+       child.stdout.on('data', (chunk) => {
+         stdoutData += chunk.toString()
+@@ -99,7 +102,7 @@ export class RipgrepService {
+ 
+       child.on('close', (code) => {
+         console.log(`[RipgrepService:searchContent] rg process exited with code ${code}, found matches`)
+-        
++
+         // 逐行解析 JSON 输出
+         const lines = stdoutData.split('\n')
+         for (const line of lines) {
+@@ -115,7 +118,7 @@ export class RipgrepService {
+ 
+               const fileName = relativePath.split(/[/\\]/).pop() || relativePath
+               const lineNumber = data.data.line_number
+-              
++
+               // 提取文本行片段并清理首尾空格
+               const lineText = data.data.lines.text || data.data.lines || ''
+               const snippet = lineText.trim()
+@@ -154,7 +157,7 @@ export class RipgrepService {
+ 
+     const defaultIgnores = ['.git', 'node_modules', 'dist', 'build', '.berrytrace', '.DS_Store']
+     const mergedIgnores = [...new Set([...defaultIgnores, ...ignoreDirs])]
+-    
++
+     const ignoreArgs: string[] = []
+     for (const dir of mergedIgnores) {
+       ignoreArgs.push('-g', `!**/${dir}/**`)
+@@ -169,7 +172,7 @@ export class RipgrepService {
+     return new Promise((resolve) => {
+       const filePaths: string[] = []
+       const child = spawn(this.resolvedRgPath, args)
+-      
++
+       let stdoutData = ''
+       child.stdout.on('data', (chunk) => {
+         stdoutData += chunk.toString()

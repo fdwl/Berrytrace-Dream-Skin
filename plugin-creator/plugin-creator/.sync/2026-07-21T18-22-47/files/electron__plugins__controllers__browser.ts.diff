@@ -1,0 +1,13 @@
+diff --git a/electron/plugins/controllers/browser.ts b/electron/plugins/controllers/browser.ts
+index 286127d..9e4178c 100644
+--- a/electron/plugins/controllers/browser.ts
++++ b/electron/plugins/controllers/browser.ts
+@@ -167,7 +167,8 @@ export class BrowserController extends BaseApiController {
+    * 返回活跃 Tab ID（React 侧创建 Tab 后通过 IPC 回传）。
+    */
+   private async _prepareWorkspace(mainWindow: Electron.BrowserWindow): Promise<string> {
+-    if (this._preparedAt > 0 && Date.now() - this._preparedAt < 180_000 && this._lastTabId) {
++    const bvm = BrowserViewManager.getInstance();
++    if (this._preparedAt > 0 && Date.now() - this._preparedAt < 180_000 && this._lastTabId && bvm.hasView(this._lastTabId)) {
+       return this._lastTabId;
+     }

@@ -1,0 +1,257 @@
+diff --git a/electron/services/preferences-manager.ts b/electron/services/preferences-manager.ts
+index acd4c42..16de6b6 100644
+--- a/electron/services/preferences-manager.ts
++++ b/electron/services/preferences-manager.ts
+@@ -1,11 +1,11 @@
+-import { app, shell, BrowserWindow, ipcMain, IpcMainInvokeEvent } from 'electron'
++import type { IpcMainInvokeEvent } from 'electron';
++import { app, shell, BrowserWindow, ipcMain } from 'electron'
+ import { join } from 'path'
+ import { exec } from 'child_process'
+ import { cache, CacheAttribute } from '../config/index'
+ import { ElectronGlobalShortcuts } from './global-shortcuts'
+ import { ElectronMenu } from './menu'
+-import { ElectronFloatBall } from '../windows/float-ball'
+-import { ElectronBufferWindow } from '../windows/buffer-window'
++import { ElectronFloatWeb } from '../windows/float-web'
+ import { ElectronMainWindow } from '../windows/main-window'
+ import { ElectronPublishWindow } from '../windows/publish-window'
+ import { PluginManager } from '../plugins/plugin-manager'
+@@ -14,6 +14,7 @@ import { WorkspaceManager } from './workspace-manager'
+ import { ElectronQuickPanelWindow } from '../windows/quick-panel'
+ import { PermissionGuideWindow } from '../windows/permission-guide-window'
+ import { restartGlobalDoubleTapHook, isDoubleTapPermissionGranted } from './double-tap-detector'
++import { KeybindingsManager } from './keybindings-manager'
+ 
+ let screenshotLoaded = false
+ async function getScreenshotInstance(getLastActiveWindow: () => 'main' | 'publish') {
+@@ -37,10 +38,20 @@ async function getDesktopLockInstance() {
+   return ElectronDesktopLock.getInstance()
+ }
+ 
++export function syncNativeHooksState(): void {
++  console.log('[NativeHook:Sync] Synchronizing C++ keyboard and mouse hook helper processes...')
++  restartGlobalDoubleTapHook()
++  import('./mouse-hook').then(({ startGlobalMouseHook }) => {
++    startGlobalMouseHook()
++  }).catch((err) => {
++    console.error('🚨 [NativeHook:Sync:ERROR] Failed to start global mouse hook:', err)
++  })
++}
++
+ export function registerPreferencesIpcHandlers(
+   getLastActiveWindow: () => 'main' | 'publish',
+-  startGlobalMouseHook: () => void,
+-  stopGlobalMouseHook: () => void
++  _startGlobalMouseHook: () => void,
++  _stopGlobalMouseHook: () => void
+ ) {
+   const broadcastPreferencesChanged = (excludeWebContentsId?: number) => {
+     BrowserWindow.getAllWindows().forEach((win) => {
+@@ -51,21 +62,25 @@ export function registerPreferencesIpcHandlers(
+   }
+ 
+   ipcMain.handle('pref:get', () => {
+-    const shortcuts = ElectronGlobalShortcuts.getInstance()
++    const defaultShortcut = process.platform === 'darwin' ? 'Ctrl+Cmd+O' : 'Ctrl+Alt+O'
++    const defaultBufferShortcut = process.platform === 'darwin' ? 'Ctrl+Cmd+B' : 'Ctrl+Alt+B'
++    const defaultLockShortcut = process.platform === 'darwin' ? 'Ctrl+Cmd+L' : 'Ctrl+Alt+L'
++    const defaultScreenshotShortcut = process.platform === 'darwin' ? 'Ctrl+Cmd+Shift+A' : 'Ctrl+Alt+Shift+A'
++
+     return {
+       autoLaunch: (cache.get(CacheAttribute.prefAutoLaunch) as boolean) ?? false,
+       globalShortcut:
+-        (cache.get(CacheAttribute.prefGlobalShortcut) as string) || shortcuts.getDefaultShortcut(),
++        (cache.get(CacheAttribute.prefGlobalShortcut) as string) || defaultShortcut,
+       showMainShortcut:
+-        (cache.get(CacheAttribute.prefShowMainShortcut) as string) || shortcuts.getDefaultShowMainShortcut(),
++        (cache.get(CacheAttribute.prefShowMainShortcut) as string) || defaultShortcut,
+       bufferShortcut:
+         (cache.get(CacheAttribute.prefBufferShortcut) as string) ||
+         (cache.get('prefPinboardShortcut') as string) ||
+-        shortcuts.getDefaultBufferShortcut(),
++        defaultBufferShortcut,
+       lockShortcut:
+-        (cache.get(CacheAttribute.prefLockShortcut) as string) || shortcuts.getDefaultLockShortcut(),
++        (cache.get(CacheAttribute.prefLockShortcut) as string) || defaultLockShortcut,
+       screenshotShortcut:
+-        (cache.get(CacheAttribute.prefScreenshotShortcut) as string) || shortcuts.getDefaultScreenshotShortcut(),
++        (cache.get(CacheAttribute.prefScreenshotShortcut) as string) || defaultScreenshotShortcut,
+       zenShortcut:
+         (cache.get(CacheAttribute.prefZenShortcut) as string) || 'F10',
+       pinShortcut:
+@@ -97,9 +112,9 @@ export function registerPreferencesIpcHandlers(
+         }
+       })(),
+       rightClickLongPressUrl:
+-        (cache.get(CacheAttribute.prefRightClickLongPressUrl) as string) || '',
+-      doubleTapEnabled:
+-        (cache.get(CacheAttribute.prefDoubleTapEnabled) as boolean) ?? true,
++        (cache.get(CacheAttribute.prefRightClickLongPressUrl) as string) || 'berrytrace://quick-panel',
++      nativeHookMasterSwitch: (cache.get('prefNativeHookMasterSwitch') as boolean) ?? false,
++      doubleTapEnabled: (cache.get(CacheAttribute.prefDoubleTapEnabled) as boolean) ?? false,
+       doubleTapModifier:
+         (cache.get(CacheAttribute.prefDoubleTapModifier) as string) || 'cmd',
+       doubleTapAction:
+@@ -121,8 +136,6 @@ export function registerPreferencesIpcHandlers(
+   })
+ 
+   ipcMain.handle('pref:applyAutoLaunch', () => {
+-    // We will let main.ts handle autoLaunch logic or export applyAutoLaunch
+-    // But since it's just a login item settings, we can implement it directly:
+     const enabled = (cache.get(CacheAttribute.prefAutoLaunch) as boolean) ?? false
+     app.setLoginItemSettings({ openAtLogin: enabled, openAsHidden: true })
+   })
+@@ -134,16 +147,17 @@ export function registerPreferencesIpcHandlers(
+ 
+   ipcMain.handle('pref:reloadShortcuts', () => {
+     ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
++    syncNativeHooksState()
+   })
+ 
+   ipcMain.handle('pref:getSystemShortcuts', () => {
+-    const shortcuts = ElectronGlobalShortcuts.getInstance()
++    const isMac = process.platform === 'darwin'
+     return {
+-      defaultShortcut: shortcuts.getDefaultShortcut(),
+-      defaultShowMainShortcut: shortcuts.getDefaultShowMainShortcut(),
+-      defaultBufferShortcut: shortcuts.getDefaultBufferShortcut(),
+-      defaultLockShortcut: shortcuts.getDefaultLockShortcut(),
+-      defaultScreenshotShortcut: shortcuts.getDefaultScreenshotShortcut(),
++      defaultShortcut: isMac ? 'Ctrl+Cmd+O' : 'Ctrl+Alt+O',
++      defaultShowMainShortcut: isMac ? 'Ctrl+Cmd+O' : 'Ctrl+Alt+O',
++      defaultBufferShortcut: isMac ? 'Ctrl+Cmd+B' : 'Ctrl+Alt+B',
++      defaultLockShortcut: isMac ? 'Ctrl+Cmd+L' : 'Ctrl+Alt+L',
++      defaultScreenshotShortcut: isMac ? 'Ctrl+Cmd+Shift+A' : 'Ctrl+Alt+Shift+A',
+     }
+   })
+ 
+@@ -204,6 +218,8 @@ export function registerPreferencesIpcHandlers(
+ 
+   ipcMain.handle('pref:setLockShortcut', (_event: IpcMainInvokeEvent, shortcut: string) => {
+     cache.set(CacheAttribute.prefLockShortcut, shortcut)
++    KeybindingsManager.getInstance().saveUserOverride('system:lock-app', { key: shortcut })
++    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
+     ElectronMenu.getInstance().setupMenu()
+     broadcastPreferencesChanged(_event.sender.id)
+     return true
+@@ -236,22 +252,14 @@ export function registerPreferencesIpcHandlers(
+ 
+   ipcMain.handle('pref:setRightClickLongPress', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+     cache.set(CacheAttribute.prefRightClickLongPress, enabled)
+-    if (enabled) {
+-      startGlobalMouseHook()
+-    } else {
+-      stopGlobalMouseHook()
+-    }
++    syncNativeHooksState()
+     broadcastPreferencesChanged(_event.sender.id)
+     return true
+   })
+ 
+   ipcMain.handle('pref:setRightClickLongPressDelay', (_event: IpcMainInvokeEvent, delay: number) => {
+     cache.set(CacheAttribute.prefRightClickLongPressDelay, delay)
+-    const enabled = (cache.get(CacheAttribute.prefRightClickLongPress) as boolean) ?? false
+-    if (enabled) {
+-      stopGlobalMouseHook()
+-      startGlobalMouseHook()
+-    }
++    syncNativeHooksState()
+     broadcastPreferencesChanged(_event.sender.id)
+     return true
+   })
+@@ -262,7 +270,7 @@ export function registerPreferencesIpcHandlers(
+       switch (type) {
+         case 'url': {
+           const isInternal = target.startsWith('berrytrace://') || target.startsWith('berrytrace-dev://')
+-          ElectronFloatBall.getInstance().openFloatWebWindow(target, isInternal)
++          ElectronFloatWeb.getInstance().openFloatWebWindow(target, isInternal)
+           return true
+         }
+         case 'url-external': {
+@@ -297,19 +305,11 @@ export function registerPreferencesIpcHandlers(
+             getDesktopLockInstance().then((l) => l.triggerLock(win))
+           } else if (target === 'open-main') {
+             ElectronMainWindow.getInstance().showWindow()
+-          } else if (target === 'new-note') {
+-            ElectronBufferWindow.getInstance().toggleBufferWindow()
+           } else if (target === 'toggle-zen') {
+             const win = ElectronMainWindow.getInstance().getWindow()
+             if (win && !win.isDestroyed()) {
+               win.webContents.send('zen:toggle')
+             }
+-          } else if (target === 'toggle-buffer') {
+-            ElectronBufferWindow.getInstance().toggleBufferWindow()
+-          } else if (target === 'open-buffer-clipboard') {
+-            ElectronBufferWindow.getInstance().showBufferWindowWithTab('clipboard')
+-          } else if (target === 'open-buffer-notes') {
+-            ElectronBufferWindow.getInstance().showBufferWindowWithTab('global')
+           } else if (target === 'open-pref') {
+             ElectronMainWindow.getInstance().openPreferences()
+           } else if (target.startsWith('open-plugin:')) {
+@@ -320,16 +320,6 @@ export function registerPreferencesIpcHandlers(
+             } else {
+               ElectronMainWindow.getInstance().openPlugin(pluginId)
+             }
+-          } else if (target.startsWith('save-to-buffer:')) {
+-            const text = target.substring('save-to-buffer:'.length)
+-            const noteItem = {
+-              uuid: `temp_note_${Date.now()}`,
+-              content: JSON.stringify({ say: text.trim(), spaceId: 'buffer' }),
+-              event_date: new Date().toISOString(),
+-              keywords: ['临时笔记'],
+-              spaceId: 'buffer'
+-            }
+-            ElectronBufferWindow.getInstance().addBufferItem(noteItem)
+           } else if (target.startsWith('save-to-workspace:')) {
+             const text = target.substring('save-to-workspace:'.length)
+             const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(_event.sender)
+@@ -397,6 +387,13 @@ export function registerPreferencesIpcHandlers(
+     return true
+   })
+ 
++  ipcMain.handle('pref:setNativeHookMasterSwitch', (_event: IpcMainInvokeEvent, enabled: boolean) => {
++    cache.set('prefNativeHookMasterSwitch', enabled)
++    restartGlobalDoubleTapHook()
++    broadcastPreferencesChanged(_event.sender.id)
++    return true
++  })
++
+   ipcMain.handle('pref:setDoubleTapEnabled', (_event: IpcMainInvokeEvent, enabled: boolean) => {
+     cache.set(CacheAttribute.prefDoubleTapEnabled, enabled)
+     restartGlobalDoubleTapHook()
+@@ -581,4 +578,34 @@ export function registerPreferencesIpcHandlers(
+       console.warn('[main][ipc] publish:eventProgress 丢弃：mainWindow 不存在/已销毁')
+     }
+   })
++
++  // ── Keybindings & Gestures SSOT IPC Handlers ──
++  ipcMain.handle('keybindings:get-all', () => {
++    return KeybindingsManager.getInstance().getEffectiveKeybindings()
++  })
++
++  ipcMain.handle('keybindings:save-override', (_event: IpcMainInvokeEvent, command: string, custom: { key?: string; gesture?: string }) => {
++    KeybindingsManager.getInstance().saveUserOverride(command, custom)
++    if (command === 'system:lock-app' && custom.key) {
++      cache.set(CacheAttribute.prefLockShortcut, custom.key)
++      ElectronMenu.getInstance().setupMenu()
++    }
++    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
++    syncNativeHooksState()
++    broadcastPreferencesChanged(_event.sender.id)
++    return true
++  })
++
++  ipcMain.handle('keybindings:reset', (_event: IpcMainInvokeEvent, command: string) => {
++    KeybindingsManager.getInstance().resetUserOverride(command)
++    if (command === 'system:lock-app') {
++      const defaultLockShortcut = process.platform === 'darwin' ? 'Ctrl+Cmd+L' : 'Ctrl+Alt+L'
++      cache.set(CacheAttribute.prefLockShortcut, defaultLockShortcut)
++      ElectronMenu.getInstance().setupMenu()
++    }
++    ElectronGlobalShortcuts.getInstance().registerGlobalShortcuts()
++    syncNativeHooksState()
++    broadcastPreferencesChanged(_event.sender.id)
++    return true
++  })
+ }

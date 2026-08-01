@@ -1,0 +1,100 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07d-ai-mcp.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07d-ai-mcp.md
+index 8d5a218..16d4add 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07d-ai-mcp.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07d-ai-mcp.md
+@@ -1,58 +1,57 @@
+ # ai / mcp — AI 与 MCP 工具
+ 
+-
+-> 此文件由 `scripts/generate-skill-docs.js` 自动生成。修改 controller 后运行 `node scripts/generate-skill-docs.js` 更新。
+ ## ai
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `cancelAgentTask` | `sessionId: string` | `null` | 取消指定会话的 Agent 任务。 |
+-| `chat` | `options: { messages?: { role: 'system' | 'user' | 'assistant'; content: string }[]; sessionId?: string; [key: string]: unknown }` | `unknown` | 调用 AI 聊天（非流式）。自动路由到 Agent 内核插件。 await callApi("ai", "chat", … |
+-| `chatStream` | `options: { messages?: { role: 'system' | 'user' | 'assistant'; content: string }[]; sessionId?: string; [key: string]: unknown }` | `unknown` | 调用 AI 聊天（流式）。通过 onChunk 回调接收增量文本。 await callApi("ai", "chatS… |
+-| `getAgentKernelStatus` | `—` | `unknown` | 查询 Agent 内核状态。 |
+-| `runAgentTask` | `options: {
+-    sessionId?: string;
+-    task: string;
+-    history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+-    workDir?: string;
+-    activeDocument?: {
+-      tabId: string;
+-      title: string;
+-      path?: string;
+-      extension?: string;
+-      pluginId?: string;
+-      isUntitled?: boolean;
+-    };
+-    llmConfig?: {
+-      provider: 'aliyun' | 'ollama' | 'berrytrace' | 'custom';
+-      model: string;
+-      apiKey?: string;
+-      baseUrl?: string;
+-    };
+-    maxSteps?: number;
+-    systemPrompt?: string;
+-    skipDefaultSystemPrompt?: boolean;
+-  }` | `unknown` | 启动 AI Agent 任务。自动获取 LLM 配置，找到可用的 Agent 内核插件，发送任务到后台进程异步执行。 a… |
++| `chat` | `options: { messages?, sessionId?, ... }` | `ChatResponse` | 调用 AI 聊天（非流式）。自动路由到 Agent 内核插件。 |
++| `chatStream` | `options, onChunk: (chunk: string) => void` | `void` | 调用 AI 聊天（流式）。通过 onChunk 回调接收增量文本。 |
++| `runAgentTask` | `options: { task, sessionId?, history?, ... }` | `{ sessionId, kernelPluginId, accepted }` | 启动 AI Agent 任务。自动获取 LLM 配置，找到可用的 Agent 内核插件。 |
++| `cancelAgentTask` | `sessionId: string` | `void` | 取消指定会话的 Agent 任务。 |
++| `getAgentKernelStatus` | `—` | `AgentKernelStatus` | 查询 Agent 内核状态。 |
+ 
+ **调用示例**：
+ ```typescript
+-await callApi('ai', 'cancelAgentTask', [sessionId]);
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++
++const response = await sdk.ai.chat({
++  messages: [{ role: 'user', content: '你好' }]
++});
++
++await sdk.ai.chatStream({
++  messages: [{ role: 'user', content: '写一段代码' }]
++}, (chunk) => process.stdout.write(chunk));
+ ```
+ 
+ ## mcp
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `callTool` | `toolName: string, toolArgs: Record<string, unknown>` | `unknown` | 调用指定的 MCP 工具。 await callApi("mcp", "callTool", [{ toolName: … |
+-| `listSystemPrompts` | `—` | `unknown` | 列出所有已注册的系统提示词。 |
+-| `listTools` | `—` | `unknown` | 列出所有已注册的 MCP 工具。 |
+-| `registerDynamicTool` | `callerPluginId: string, toolSpec: { name: string; description: string; inputSchema: Record<string, unknown> }` | `null` | 动态注册 MCP 工具（运行时注册，非 plugin.json 声明）。 |
+-| `registerSystemPrompt` | `callerPluginId: string, options: { promptId: string; promptText: string }` | `null` | 注册系统提示词（注入到 AI Agent 的 system prompt 中）。 |
+-| `unregisterDynamicTool` | `callerPluginId: string, toolName: string` | `null` | 注销动态 MCP 工具。 |
+-| `unregisterSystemPrompt` | `callerPluginId: string, promptId: string` | `null` | 注销系统提示词。 |
++| `registerToolHandler` | `toolName: string, handler: (args) => Promise<McpToolResult>` | `void` | 注册 MCP 工具处理器（静态，需在 plugin.json 的 mcp.tools 中声明）。 |
++| `registerResourceHandler` | `uriPattern: string, handler: (params) => Promise<McpResourceResult>` | `void` | 注册 MCP 资源处理器。 |
++| `registerDynamicTool` | `toolSpec: { name, description, inputSchema, displayName?, userQueries? }, handler: (args) => Promise<McpToolResult>` | `void` | 动态注册 MCP 工具（运行时注册，无需 plugin.json 声明）。 |
++| `unregisterDynamicTool` | `toolName: string` | `void` | 注销动态 MCP 工具。 |
++| `registerSystemPrompt` | `promptId: string, promptText: string` | `void` | 注册系统提示词（注入到 AI Agent 的 system prompt 中）。 |
++| `unregisterSystemPrompt` | `promptId: string` | `void` | 注销系统提示词。 |
++| `listTools` | `—` | `unknown[]` | 列出所有已注册的 MCP 工具。 |
++| `callTool` | `name: string, args: Record<string, unknown>` | `unknown` | 调用指定的 MCP 工具。 |
+ 
+ **调用示例**：
+ ```typescript
+-await callApi('mcp', 'callTool', [{ toolName, toolArgs }]);
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++
++// 静态注册（对应 plugin.json 的 mcp.tools）
++sdk.mcp.registerToolHandler('my_tool', async (args) => {
++  return { content: [{ type: 'text', text: `处理: ${args.input}` }] };
++});
++
++// 动态注册
++await sdk.mcp.registerDynamicTool(
++  { name: 'dynamic_tool', description: '动态工具', inputSchema: { type: 'object' } },
++  async (args) => ({ content: [{ type: 'text', text: 'OK' }] })
++);
+ ```
+ 
++> **注意**：controller 中还有 listSystemPrompts 方法，但**未注册到 SDK**。

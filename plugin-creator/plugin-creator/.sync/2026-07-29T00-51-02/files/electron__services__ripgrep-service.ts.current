@@ -1,0 +1,244 @@
+import { spawn } from 'child_process'
+import { createRequire } from 'module'
+import { join } from 'path'
+import { app } from 'electron'
+import * as fs from 'fs'
+
+const require = createRequire(import.meta.url)
+const { rgPath } = require('@vscode/ripgrep')
+
+export interface RipgrepMatch {
+  filePath: string
+  fileName: string
+  snippet: string
+  lineNumber: number
+  rank: number
+}
+
+export class RipgrepService {
+  private static instance: RipgrepService
+  private resolvedRgPath: string
+
+  private constructor() {
+    // 自动适配开发环境与打包后的生产环境路径
+    this.resolvedRgPath = rgPath
+
+    // 针对 electron-builder 打包可能会把 node_modules 压缩进 app.asar 的情况，进行安全兼容
+    if (app.isPackaged) {
+      const unpackedPath = rgPath.replace('app.asar', 'app.asar.unpacked')
+      if (fs.existsSync(unpackedPath)) {
+        this.resolvedRgPath = unpackedPath
+      }
+    }
+
+    console.log('[RipgrepService:init] Initialized with resolved rgPath:', this.resolvedRgPath)
+  }
+
+  public static getInstance(): RipgrepService {
+    if (!RipgrepService.instance) {
+      RipgrepService.instance = new RipgrepService()
+    }
+    return RipgrepService.instance
+  }
+
+  /**
+   * 使用 ripgrep 在工作区中搜索文本内容
+   *
+   * extensions 默认为空数组，此时 ripgrep 依据文件内容自动跳过二进制文件（null-byte 检测），
+   * 无需维护扩展名列表，同时覆盖 .env .log .conf .ini 等无标准扩展名的纯文本文件。
+   * 仅在需要精确限定某些后缀时才传入 extensions。
+   */
+  public async searchContent(
+    query: string,
+    workspacePath: string,
+    extensions: string[] = []
+  ): Promise<RipgrepMatch[]> {
+    console.log(`[RipgrepService:searchContent] Searching for "${query}" in "${workspacePath}"${extensions.length ? ` with exts: ${extensions.join(',')}` : ' (binary-auto-detect)'}`)
+
+    if (!query || !workspacePath) return []
+
+    // 若指定了扩展名则按后缀过滤；否则不加 -g glob，由 ripgrep 自动跳过二进制文件
+    const globArgs: string[] = []
+    for (const ext of extensions) {
+      const cleanExt = ext.startsWith('.') ? ext.slice(1) : ext
+      globArgs.push('-g', `*.${cleanExt}`)
+    }
+
+    // 默认忽略的目录
+    const defaultIgnores = ['.git', 'node_modules', 'dist', 'build', '.berrytrace', '.DS_Store']
+    const ignoreArgs: string[] = []
+    for (const dir of defaultIgnores) {
+      ignoreArgs.push('-g', `!**/${dir}/**`)
+    }
+
+    // Spawn rg 进程以 JSON 格式输出匹配行
+    // 命令示例: rg --json -i --fixed-strings -e "query" -g "*.ts" /path/to/workspace
+    const args = [
+      '--json',
+      '-i',              // 忽略大小写
+      '--fixed-strings', // 纯文本精确匹配，非正则匹配
+      '-e', query,       // 匹配关键字
+      ...globArgs,       // 限定文件后缀
+      ...ignoreArgs,     // 忽略构建/系统文件夹
+      workspacePath      // 目标工作区目录
+    ]
+
+    return new Promise((resolve) => {
+      const results: RipgrepMatch[] = []
+      const child = spawn(this.resolvedRgPath, args)
+
+      let stdoutData = ''
+      child.stdout.on('data', (chunk) => {
+        stdoutData += chunk.toString()
+      })
+
+      child.stderr.on('data', (chunk) => {
+        // 部分无危害警告可能通过 stderr 输出，不阻断正常流程
+        const errStr = chunk.toString().trim()
+        if (errStr) {
+          console.warn('[RipgrepService:searchContent] rg stderr:', errStr)
+        }
+      })
+
+      child.on('close', (code) => {
+        console.log(`[RipgrepService:searchContent] rg process exited with code ${code}, found matches`)
+
+        // 逐行解析 JSON 输出
+        const lines = stdoutData.split('\n')
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const data = JSON.parse(line)
+            if (data.type === 'match') {
+              const fullPath = data.data.path.text || data.data.path
+              // 转为相对工作区的路径
+              const relativePath = fullPath.startsWith(workspacePath)
+                ? fullPath.slice(workspacePath.length).replace(/^[/\\]+/, '')
+                : fullPath
+
+              const fileName = relativePath.split(/[/\\]/).pop() || relativePath
+              const lineNumber = data.data.line_number
+
+              // 提取文本行片段并清理首尾空格
+              const lineText = data.data.lines.text || data.data.lines || ''
+              const snippet = lineText.trim()
+
+              // 给 ripgrep 匹配评分，这里使用简单的常量 1.0 (后续可在多数据源混合时进行加权排序)
+              const rank = 1.0
+
+              results.push({
+                filePath: relativePath,
+                fileName,
+                snippet,
+                lineNumber,
+                rank
+              })
+            }
+          } catch (err) {
+            console.error('[RipgrepService:searchContent] Failed to parse rg json line:', err)
+          }
+        }
+        resolve(results)
+      })
+
+      child.on('error', (err) => {
+        console.error('[RipgrepService:searchContent] Failed to spawn rg process:', err)
+        resolve([])
+      })
+    })
+  }
+
+  /**
+   * 使用 ripgrep 快速获取工作区扁平路径列表
+   */
+  public async getFilesList(workspacePath: string, ignoreDirs: string[] = []): Promise<string[]> {
+    console.log(`[RipgrepService:getFilesList] Getting flat files list for: ${workspacePath}`)
+    if (!workspacePath) return []
+
+    const defaultIgnores = ['.git', 'node_modules', 'dist', 'build', '.berrytrace', '.DS_Store']
+    const mergedIgnores = [...new Set([...defaultIgnores, ...ignoreDirs])]
+
+    const ignoreArgs: string[] = []
+    for (const dir of mergedIgnores) {
+      ignoreArgs.push('-g', `!**/${dir}/**`)
+    }
+
+    const args = [
+      '--files',
+      ...ignoreArgs,
+      workspacePath
+    ]
+
+    return new Promise((resolve) => {
+      const filePaths: string[] = []
+      const child = spawn(this.resolvedRgPath, args)
+
+      let stdoutData = ''
+      child.stdout.on('data', (chunk) => {
+        stdoutData += chunk.toString()
+      })
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          console.warn(`[RipgrepService:getFilesList] rg files list exited with code ${code}`)
+        }
+        const lines = stdoutData.split('\n')
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (trimmed) {
+            const relPath = trimmed.startsWith(workspacePath)
+              ? trimmed.slice(workspacePath.length).replace(/^[/\\]+/, '')
+              : trimmed
+            filePaths.push(relPath)
+          }
+        }
+        resolve(filePaths)
+      })
+
+      child.on('error', (err) => {
+        console.error('[RipgrepService:getFilesList] Failed to spawn rg files:', err)
+        resolve([])
+      })
+    })
+  }
+
+  /**
+   * 使用 ripgrep 极速查找指定路径下所有的 .workflow 文件 (毫秒级 Rust 引擎)
+   */
+  public async findWorkflowFiles(targetPath: string): Promise<string[]> {
+    console.log(`[RipgrepService:findWorkflowFiles] 极速检索 .workflow 文件，目标: "${targetPath}"`)
+    if (!targetPath || !fs.existsSync(targetPath)) return []
+
+    const defaultIgnores = ['.git', 'node_modules', 'dist', 'build', '.DS_Store']
+    const ignoreArgs: string[] = []
+    for (const dir of defaultIgnores) {
+      ignoreArgs.push('-g', `!**/${dir}/**`)
+    }
+
+    const args = [
+      '--files',
+      '-g', '*.workflow',
+      ...ignoreArgs,
+      targetPath
+    ]
+
+    return new Promise((resolve) => {
+      const child = spawn(this.resolvedRgPath, args)
+      let stdoutData = ''
+      child.stdout.on('data', (chunk) => {
+        stdoutData += chunk.toString()
+      })
+      child.on('close', () => {
+        const lines = stdoutData.split('\n')
+          .map(l => l.trim())
+          .filter(Boolean)
+        console.log(`[RipgrepService:findWorkflowFiles] ripgrep 检索完成，找到 ${lines.length} 个 .workflow 文件:`, lines)
+        resolve(lines)
+      })
+      child.on('error', (err) => {
+        console.error('[RipgrepService:findWorkflowFiles] Failed to spawn rg process:', err)
+        resolve([])
+      })
+    })
+  }
+}

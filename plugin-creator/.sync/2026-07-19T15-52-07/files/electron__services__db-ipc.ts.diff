@@ -1,0 +1,30 @@
+diff --git a/electron/services/db-ipc.ts b/electron/services/db-ipc.ts
+index a3d4955..e824a70 100644
+--- a/electron/services/db-ipc.ts
++++ b/electron/services/db-ipc.ts
+@@ -244,4 +244,25 @@ export function registerDatabaseIpcHandlers() {
+     await FullTextIndexManager.getInstance().indexAllSkills()
+     return true
+   })
++
++  // 彻底级联删除会话关联的所有文件资源
++  ipcMain.handle('session:deleteResources', async (event, opts: { sessionId: string; workDir?: string }) => {
++    const { SessionResourceManager } = await import('./session-resource-manager.js')
++    const workspacePath = opts.workDir || WorkspaceManager.getInstance().getPathForWebContents(event.sender) || ''
++    return SessionResourceManager.deleteSession(opts.sessionId, workspacePath)
++  })
++
++  // 获取单个会话的资源清单 Manifest
++  ipcMain.handle('session:getManifest', async (event, opts: { sessionId: string; workDir?: string }) => {
++    const { SessionResourceManager } = await import('./session-resource-manager.js')
++    const workspacePath = opts.workDir || WorkspaceManager.getInstance().getPathForWebContents(event.sender) || ''
++    return SessionResourceManager.loadManifest(opts.sessionId, workspacePath)
++  })
++
++  // 触发过期会话 GC 清理
++  ipcMain.handle('session:gcExpired', async (event, opts?: { retentionDays?: number; workDir?: string }) => {
++    const { SessionResourceManager } = await import('./session-resource-manager.js')
++    const workspacePath = opts?.workDir || WorkspaceManager.getInstance().getPathForWebContents(event.sender) || ''
++    return SessionResourceManager.gcExpiredSessions(workspacePath, opts?.retentionDays || 30)
++  })
+ }

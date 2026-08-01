@@ -1,0 +1,2859 @@
+import type { BerrytraceEventMap, BerrytraceEventName, BerrytraceCommandMap, BerrytraceCommandName } from './event-catalog.js';
+export interface SSHHostProfile {
+    host: string;
+    hostname?: string;
+    user?: string;
+    port?: number;
+    identityFile?: string;
+    proxyCommand?: string;
+    name?: string;
+}
+/**
+ * 莓莓印记 (BerryTrace) 插件 SDK 类型定义文件
+ *
+ * 本文件定义了插件开发所需的所有类型接口。
+ * 插件开发者可以通过 `berrytrace` 全局对象访问这些 API。
+ *
+ * @example
+ * // 在插件中访问 SDK
+ * const sdk: BerryTraceSDK = window.berrytrace;
+ *
+ * // 获取插件信息
+ * const info = await sdk.plugin.getInfo();
+ *
+ * // 记录日志
+ * sdk.log.info('插件已加载');
+ */
+export interface PluginInfo {
+    id: string;
+    name: string;
+    version: string;
+    description?: string;
+    path: string;
+}
+/**
+ * 插件信息 API
+ * 用于获取当前插件的元数据信息
+ */
+export interface PluginInfoAPI extends GeneratedPluginInfoAPI {
+    /**
+     * 获取当前插件的详细信息
+     * @returns 返回插件信息对象，包含 id、name、version、path 等
+     * @example
+     * const info = await sdk.plugin.getInfo();
+     * console.log(info.name, info.version);
+     */
+    getInfo(): Promise<PluginInfo>;
+    /**
+     * 获取当前插件的生命周期上下文
+     * @returns 返回生命周期上下文对象
+     */
+    getLifecycleContext(): Promise<PluginLifecycleContext>;
+}
+/**
+ * 日志 API
+ * 提供插件日志记录功能，日志会统一输出到宿主应用的日志系统
+ */
+export interface LogAPI extends Omit<GeneratedLogAPI, 'info' | 'warn' | 'error' | 'debug'> {
+    /**
+     * 记录信息级别日志
+     * @param message 日志消息
+     * @example
+     * sdk.log.info('插件初始化完成');
+     */
+    info(message: string): Promise<void>;
+    /**
+     * 记录警告级别日志
+     * @param message 日志消息
+     * @example
+     * sdk.log.warn('配置文件不存在，使用默认配置');
+     */
+    warn(message: string): Promise<void>;
+    /**
+     * 记录错误级别日志
+     * @param message 日志消息
+     * @example
+     * sdk.log.error('连接服务器失败');
+     */
+    error(message: string): Promise<void>;
+    /**
+     * 记录调试级别日志
+     * @param message 日志消息
+     * @example
+     * sdk.log.debug('处理数据:', JSON.stringify(data));
+     */
+    debug(message: string): Promise<void>;
+}
+export interface ChatMessage {
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+}
+export interface ChatOptions {
+    modelId?: string;
+    messages: ChatMessage[];
+    temperature?: number;
+    maxTokens?: number;
+    sessionId?: string;
+}
+export interface ChatResponse {
+    content: string;
+    usage: {
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+    };
+}
+export type AgentLlmProvider = 'aliyun' | 'ollama' | 'berrytrace' | 'custom';
+export interface AgentLlmConfig {
+    provider: AgentLlmProvider;
+    model: string;
+    apiKey?: string;
+    baseUrl?: string;
+}
+export interface AgentTaskOptions {
+    sessionId?: string;
+    task: string;
+    history?: Array<{
+        role: 'user' | 'assistant';
+        content: string;
+    }>;
+    workDir?: string;
+    activeDocument?: {
+        tabId: string;
+        title: string;
+        path?: string;
+        extension?: string;
+        pluginId?: string;
+        isUntitled?: boolean;
+    };
+    /**
+     * @internal
+     * 首选 LLM 配置由宿主根据用户全局 AI 设置自动填充，插件无需传入。
+     * 若插件显式传入，宿主 SDK 层会优先使用全局配置覆盖此字段。
+     */
+    llmConfig?: AgentLlmConfig;
+    /**
+     * @internal
+     * 所有可用的 AI 服务器配置列表，供 Agent 内核根据任务复杂度智能选择模型。
+     * 由宿主 SDK 层从用户全局 AI 设置自动填充。
+     */
+    availableConfigs?: AgentLlmConfig[];
+    maxSteps?: number;
+    /**
+     * 自定义系统提示词。
+     */
+    systemPrompt?: string;
+    /**
+     * 是否跳过系统默认提示词。
+     */
+    skipDefaultSystemPrompt?: boolean;
+}
+export interface AgentKernelStatus {
+    isRunning: boolean;
+    pluginId: string;
+}
+export interface RerankResult {
+    index: number;
+    score: number;
+}
+export interface OCRResult {
+    text: string;
+    blocks: Array<{
+        text: string;
+        box: [number, number, number, number];
+    }>;
+}
+/**
+ * AI 功能 API
+ * 提供 AI 对话、Agent 任务执行等功能
+ * 注意：embed/rerank/OCR 等能力位于独立的 local-ai 命名空间
+ */
+export interface AIApi extends Omit<GeneratedAIApi, 'chat' | 'chatStream' | 'runAgentTask' | 'cancelAgentTask' | 'getAgentKernelStatus'> {
+    /**
+     * 发起 AI 对话（非流式）
+     * @param options 对话选项，包含消息历史、模型配置等
+     * @returns 返回 AI 的回复内容和使用统计
+     * @example
+     * const response = await sdk.ai.chat({
+     *   messages: [
+     *     { role: 'user', content: '你好，请介绍一下自己' }
+     *   ],
+     *   temperature: 0.7
+     * });
+     * console.log(response.content);
+     */
+    chat(options: ChatOptions): Promise<ChatResponse>;
+    /**
+     * 发起 AI 对话（流式）
+     * @param options 对话选项
+     * @param onChunk 接收每个文本块的回调函数
+     * @example
+     * await sdk.ai.chatStream(
+     *   { messages: [{ role: 'user', content: '写一首诗' }] },
+     *   (chunk) => process.stdout.write(chunk)
+     * );
+     */
+    chatStream(options: ChatOptions, onChunk: (chunk: string) => void): Promise<void>;
+    /**
+     * 运行 AI Agent 任务（需要 Agent 内核插件）
+     * @param options 任务选项，包含任务描述、工作目录、LLM 配置等
+     * @returns 返回会话 ID 和内核插件 ID
+     * @example
+     * const result = await sdk.ai.runAgentTask({
+     *   task: '帮我分析这个目录下的代码结构',
+     *   workDir: '/path/to/project'
+     * });
+     * console.log('会话 ID:', result.sessionId);
+     */
+    runAgentTask(options: AgentTaskOptions): Promise<{
+        sessionId: string;
+        kernelPluginId: string;
+        accepted: boolean;
+    }>;
+    /**
+     * 取消正在运行的 AI Agent 任务
+     * @param sessionId 要取消的会话 ID
+     */
+    cancelAgentTask(sessionId: string): Promise<void>;
+    /**
+     * 获取 Agent 内核状态
+     * @returns 返回内核是否运行中及其插件 ID
+     */
+    getAgentKernelStatus(): Promise<AgentKernelStatus>;
+    /**
+     * 插件注册检测到的 Agent 为 AI 服务商
+     * @param config 服务商配置
+     * @returns 返回生成的 serverId
+     * @example
+     * const serverId = await sdk.ai.registerAgentProvider({
+     *   name: 'Codex CLI (本地)',
+     *   provider: 'custom',
+     *   model: 'gpt-5.3-codex',
+     *   baseUrl: 'http://localhost:32100/v1',
+     *   supportedModels: ['gpt-5.3-codex'],
+     * });
+     */
+    registerAgentProvider(config: {
+        name: string;
+        provider: AgentLlmProvider;
+        model: string;
+        baseUrl?: string;
+        apiKey?: string;
+        supportedModels?: string[];
+        icon?: string;
+        uniqueKey?: string;
+    }): Promise<string>;
+    /**
+     * 插件注销 AI 服务商
+     * @param serverId 要注销的服务商 ID
+     * @example
+     * await sdk.ai.unregisterAgentProvider('plugin_xxx');
+     */
+    unregisterAgentProvider(serverId: string): Promise<void>;
+    /**
+     * 获取所有已注册的 AI 服务商列表（包含支持的模型）
+     */
+    getAiServers(): Promise<Array<{
+        id: string;
+        name: string;
+        provider: string;
+        model: string;
+        supportedModels?: string[];
+        baseUrl?: string;
+        apiKey?: string;
+    }>>;
+    getCapabilityModels(): Promise<Record<string, { serverId: string; model: string }>>;
+    setCapabilityModel(capability: string, serverId: string, model: string): Promise<void>;
+    /**
+     * 获取指定服务商对应的全量已解析 LLM 配置
+     */
+    getServerLlmConfig(serverId: string): Promise<{
+        provider: string;
+        model: string;
+        apiKey?: string;
+        baseUrl?: string;
+    } | null>;
+    /**
+     * 获取 Voice Settings 配置对象
+     */
+    getVoiceSettings(): Promise<any>;
+}
+export interface ActiveAppInfo {
+    name: string;
+    title: string;
+    path: string;
+    bundleId?: string;
+    pid: number;
+}
+export interface SelectionInfo {
+    text: string;
+    html?: string;
+    appSource: string;
+}
+/**
+ * 上下文 API
+ * 获取用户当前上下文信息，如活动应用、选中文本等
+ */
+export interface ContextAPI extends Omit<GeneratedContextAPI, 'getActiveApp' | 'getSelection'> {
+    /**
+     * 获取当前活动应用信息
+     * @returns 返回活动应用的名称、标题、路径等信息
+     * @example
+     * const app = await sdk.context.getActiveApp();
+     * console.log('当前应用:', app.name);
+     */
+    getActiveApp(): Promise<ActiveAppInfo>;
+    /**
+     * 监听活动应用变化
+     * @param callback 当活动应用变化时调用
+     * @returns 取消监听的函数
+     * @example
+     * const off = sdk.context.onActiveAppChanged((app) => {
+     *   console.log('活动应用变为:', app.name);
+     * });
+     * // 取消监听
+     * off();
+     */
+    onActiveAppChanged(callback: (appInfo: ActiveAppInfo) => void): () => void;
+    /**
+     * 获取用户当前选中的文本
+     * @returns 返回选中文本信息，如果没有选中则返回 null
+     * @example
+     * const selection = await sdk.context.getSelection();
+     * if (selection) {
+     *   console.log('选中文本:', selection.text);
+     * }
+     */
+    getSelection(): Promise<SelectionInfo | null>;
+    /**
+     * 写入共享上下文数据
+     */
+    set(key: string, value: unknown, options?: {
+        ttlMs?: number;
+        scope?: 'session' | 'workspace' | 'global';
+    }): Promise<null>;
+    /**
+     * 读取共享上下文数据
+     */
+    get(key: string, options?: {
+        scope?: 'session' | 'workspace' | 'global';
+    }): Promise<unknown>;
+    /**
+     * 列出指定 scope 下的所有 key
+     */
+    list(options?: {
+        scope?: 'session' | 'workspace' | 'global';
+    }): Promise<string[]>;
+    /**
+     * 清除指定 scope 下的数据
+     */
+    clear(options?: {
+        scope?: 'session' | 'workspace' | 'global';
+    }): Promise<null>;
+}
+export interface WorkflowAPI {
+    register(def: Record<string, unknown>): Promise<null>;
+    execute(workflowId: string, input?: Record<string, unknown>, triggerType?: string): Promise<unknown>;
+    list(): Promise<unknown[]>;
+    get(workflowId: string): Promise<unknown>;
+    unregister(workflowId: string): Promise<boolean>;
+    cancel(runId: string): Promise<boolean>;
+    pause(runId: string): Promise<boolean>;
+    resume(runId: string): Promise<boolean>;
+    executeFrom(workflowId: string, fromStepId: string, previousInput?: Record<string, unknown>): Promise<unknown>;
+    getActiveRun(workflowId: string): Promise<unknown>;
+    matchIntent(userQuery: string): Promise<{
+        matched: boolean;
+        workflowId?: string;
+        workflowName?: string;
+        confidence: number;
+        matchedTrigger?: string;
+    }>;
+    getHistory(workflowId: string): Promise<unknown[]>;
+}
+export interface McpContent {
+    type: 'text' | 'image';
+    text?: string;
+    data?: string;
+    mimeType?: string;
+}
+export interface McpToolResult {
+    content: McpContent[];
+    isError?: boolean;
+}
+export interface McpResourceContents {
+    uri: string;
+    mimeType?: string;
+    text?: string;
+    blob?: string;
+}
+export interface McpResourceResult {
+    contents: McpResourceContents[];
+}
+/**
+ * MCP (Model Context Protocol) API
+ * 允许插件注册工具和资源，供 AI Agent 调用
+ *
+ * @see https://modelcontextprotocol.io
+ */
+export interface McpAPI extends Omit<GeneratedMcpAPI, 'registerDynamicTool' | 'unregisterDynamicTool' | 'listTools' | 'callTool' | 'registerSystemPrompt' | 'unregisterSystemPrompt'> {
+    /**
+     * 注册 MCP 工具处理器（静态工具，需在 plugin.json 中声明）
+     * @param toolName 工具名称，需与 plugin.json 中 mcp.tools 数组里的 name 字段匹配
+     * @param handler 工具处理函数，接收参数并返回结果
+     * @example
+     * sdk.mcp.registerToolHandler('my_plugin_search', async (args) => {
+     *   const results = await search(args.query as string);
+     *   return { content: [{ type: 'text', text: JSON.stringify(results) }] };
+     * });
+     */
+    registerToolHandler(toolName: string, handler: (args: Record<string, unknown>) => Promise<McpToolResult>): void;
+    /**
+     * 注册 MCP 资源处理器
+     * @param uriPattern URI 模式，如 'file:///{path}'
+     * @param handler 资源处理函数
+     */
+    registerResourceHandler(uriPattern: string, handler: (params: Record<string, string>) => Promise<McpResourceResult>): void;
+    /**
+     * 注册动态 MCP 工具（运行时动态注册，无需在 plugin.json 中预先声明）
+     * @param toolSpec 工具规范，包含名称、描述、输入模式等
+     * @param handler 工具处理函数
+     * @example
+     * await sdk.mcp.registerDynamicTool(
+     *   {
+     *     name: 'dynamic_search',
+     *     description: '动态搜索工具',
+     *     inputSchema: { type: 'object', properties: { query: { type: 'string' } } }
+     *   },
+     *   async (args) => {
+     *     return { content: [{ type: 'text', text: '搜索结果' }] };
+     *   }
+     * );
+     */
+    registerDynamicTool(toolSpec: {
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+        displayName?: string;
+        userQueries?: string[];
+    }, handler: (args: Record<string, unknown>) => Promise<McpToolResult>): Promise<void>;
+    /**
+     * 动态注册系统提示词指令
+     * @param promptId 提示词 ID，用于唯一标识该提示词
+     * @param promptText 提示词文本内容
+     */
+    registerSystemPrompt(promptId: string, promptText: string): Promise<void>;
+    /**
+     * 取消注册动态系统提示词指令
+     * @param promptId 提示词 ID
+     */
+    unregisterSystemPrompt(promptId: string): Promise<void>;
+    /**
+     * 取消注册动态 MCP 工具
+     * @param toolName 要取消注册的工具名称
+     */
+    unregisterDynamicTool(toolName: string): Promise<void>;
+    /**
+     * 列出当前可用的所有 MCP 工具
+     * @returns 工具列表
+     */
+    listTools(): Promise<unknown[]>;
+    /**
+     * 调用 MCP 工具
+     * @param name 工具名称
+     * @param args 工具参数
+     * @returns 工具执行结果
+     */
+    callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
+}
+/**
+ * 存储 API
+ * 提供键值对存储和简易数据库功能，数据按插件 ID 隔离存储
+ */
+export interface StorageAPI extends Omit<GeneratedStorageAPI, 'kv' | 'db'> {
+    /** 键值对存储 - 适合简单的配置项、用户偏好等 */
+    kv: {
+        /**
+         * 获取存储的值
+         * @param key 键名
+         * @param defaultValue 默认值（当键不存在时返回）
+         * @example
+         * const theme = await sdk.storage.kv.get('theme', 'light');
+         */
+        get<T>(key: string, defaultValue?: T): Promise<T>;
+        /**
+         * 设置存储的值
+         * @param key 键名
+         * @param value 值（会被 JSON 序列化）
+         * @example
+         * await sdk.storage.kv.set('theme', 'dark');
+         */
+        set<T>(key: string, value: T): Promise<void>;
+        /**
+         * 删除指定的键
+         * @param key 要删除的键名
+         */
+        delete(key: string): Promise<void>;
+        /** 清空所有键值对 */
+        clear(): Promise<void>;
+    };
+    /** 简易数据库 - 使用类 SQL 语法操作（基于 JSON 文件实现） */
+    db: {
+        /**
+         * 执行 SQL 查询（支持 CREATE TABLE、INSERT INTO、SELECT）
+         * @param sql SQL 语句
+         * @param params 参数数组
+         * @returns 查询结果数组（SELECT）或操作结果（CREATE/INSERT）
+         * @example
+         * // 创建表
+         * await sdk.storage.db.execute('CREATE TABLE IF NOT EXISTS notes (id, title, content)');
+         * // 插入数据
+         * await sdk.storage.db.execute('INSERT INTO notes VALUES (?, ?, ?)', [1, '标题', '内容']);
+         * // 查询数据
+         * const notes = await sdk.storage.db.execute('SELECT * FROM notes');
+         */
+        execute(sql: string, params?: unknown[]): Promise<Record<string, unknown>[]>;
+    };
+}
+/**
+ * 文件系统 API
+ * 提供文件读写、目录操作等功能
+ * 注意：出于安全考虑，文件访问受到限制，建议使用 getSafePath 获取允许的目录
+ */
+export interface FileSystemAPI extends Omit<GeneratedFileSystemAPI, 'readFile' | 'readDir' | 'writeFile' | 'renameFile' | 'deleteFile' | 'getSafePath' | 'showItemInFolder' | 'stat' | 'mkdir' | 'extractZip' | 'copyDir' | 'removeDir' | 'hashFile' | 'downloadFile'> {
+    /**
+     * 读取文件内容
+     * @param filePath 文件绝对路径
+     * @param encoding 编码方式，'utf-8' 返回字符串，'base64' 返回 base64 字符串，不传返回 Buffer
+     * @example
+     * const text = await sdk.filesystem.readFile('/path/to/file.txt', 'utf-8');
+     * const base64 = await sdk.filesystem.readFile('/path/to/image.png', 'base64');
+     */
+    readFile(filePath: string, encoding?: 'utf-8' | 'base64'): Promise<string | Buffer>;
+    /**
+     * 读取目录内容
+     * @param dirPath 目录绝对路径
+     * @returns 目录项数组，每项包含名称和类型信息
+     * @example
+     * const items = await sdk.filesystem.readDir('/path/to/dir');
+     * items.forEach(item => console.log(item.name, item.isDirectory ? '目录' : '文件'));
+     */
+    readDir(dirPath: string): Promise<Array<{
+        name: string;
+        isDirectory: boolean;
+        isFile: boolean;
+    }>>;
+    /**
+     * 写入文件内容（如果文件不存在会创建，如果存在会覆盖）
+     * @param filePath 文件绝对路径
+     * @param content 要写入的内容（字符串或 Buffer）
+     */
+    writeFile(filePath: string, content: string | Buffer): Promise<void>;
+    /**
+     * 重命名/移动文件
+     * @param oldPath 原路径
+     * @param newPath 新路径
+     */
+    renameFile(oldPath: string, newPath: string): Promise<void>;
+    /**
+     * 删除文件
+     * @param filePath 要删除的文件路径
+     */
+    deleteFile(filePath: string): Promise<void>;
+    /**
+     * 获取安全的系统目录路径
+     * @param name 目录名称：'userData'（应用数据目录）、'documents'（文档目录）、'desktop'（桌面目录）、'temp'（临时目录）
+     * @returns 目录的绝对路径
+     * @example
+     * const dataDir = await sdk.filesystem.getSafePath('userData');
+     * // 在应用数据目录下写入文件
+     * await sdk.filesystem.writeFile(dataDir + '/my-data.json', JSON.stringify(data));
+     */
+    getSafePath(name: 'userData' | 'documents' | 'desktop' | 'temp' | 'skills' | 'pluginData'): Promise<string>;
+    /**
+     * 在文件管理器中显示文件（跨平台）
+     * @param filePath 文件路径
+     */
+    showItemInFolder(filePath: string): Promise<void>;
+    /**
+     * 获取文件/目录状态
+     * @param filePath 路径
+     * @returns 包含 isFile、isDirectory、size、mtimeMs 的对象
+     */
+    stat(filePath: string): Promise<{
+        isFile: boolean;
+        isDirectory: boolean;
+        size: number;
+        mtimeMs: number;
+    }>;
+    /**
+     * 递归创建目录
+     * @param dirPath 目录路径
+     */
+    mkdir(dirPath: string): Promise<void>;
+    /**
+     * 解压 ZIP 文件到目标目录（含 Zip Slip 安全检查）
+     * @param zipPath ZIP 文件路径
+     * @param destDir 目标目录
+     * @param overwrite 是否覆盖已有文件（默认 true）
+     */
+    extractZip(zipPath: string, destDir: string, overwrite?: boolean): Promise<void>;
+    /**
+     * 递归复制目录
+     * @param srcPath 源目录
+     * @param dstPath 目标目录
+     */
+    copyDir(srcPath: string, dstPath: string): Promise<void>;
+    /**
+     * 递归删除目录
+     * @param dirPath 目录路径
+     */
+    removeDir(dirPath: string): Promise<void>;
+    /**
+     * 计算文件哈希值
+     * @param filePath 文件路径
+     * @param algorithm 哈希算法（默认 'sha256'）
+     * @returns 十六进制哈希字符串
+     */
+    hashFile(filePath: string, algorithm?: string): Promise<string>;
+    /**
+     * 从 URL 下载文件到本地路径
+     * @param url 下载地址
+     * @param destPath 目标文件路径（含文件名）
+     */
+    downloadFile(url: string, destPath: string): Promise<void>;
+}
+/**
+ * 命令选项
+ * 用于注册可执行的命令
+ */
+export interface CommandOptions {
+    /** 命令唯一标识符 */
+    id: string;
+    /** 命令显示名称 */
+    name: string;
+    /** 命令描述（可选） */
+    description?: string;
+    /** 命令图标（可选，支持 emoji 或图标类名） */
+    icon?: string;
+    /** 快捷键（可选），如 'CmdOrCtrl+Shift+P' */
+    shortcut?: string;
+    /** 命令处理函数 */
+    handler: (args?: Record<string, unknown>) => Promise<unknown> | unknown;
+}
+/**
+ * 命令 API
+ * 允许插件注册命令，用户可通过命令面板调用
+ */
+export interface CommandAPI {
+    /**
+     * 注册命令
+     * @param options 命令选项
+     * @returns 注册的命令 ID
+     * @example
+     * const cmdId = sdk.commands.register({
+     *   id: 'my-plugin.hello',
+     *   name: 'Say Hello',
+     *   icon: '👋',
+     *   handler: () => sdk.log.info('Hello!')
+     * });
+     */
+    register(options: CommandOptions): string;
+    /**
+     * 取消注册命令
+     * @param id 要取消注册的命令 ID
+     */
+    unregister(id: string): void;
+    /**
+     * 执行命令
+     * @param id 命令 ID
+     * @param args 传递给处理函数的参数
+     * @returns 处理函数返回的值
+     * @example
+     * const result = await sdk.commands.execute('my-plugin.hello');
+     */
+    execute(id: string, args?: Record<string, unknown>): Promise<unknown>;
+}
+export type EventHandler = (...args: unknown[]) => void;
+/**
+ * 事件 API
+ * 插件间通信的核心机制，基于发布-订阅模式
+ *
+ * 平台级事件（BerrytraceEventName）拥有完整的 TypeScript 类型推断。
+ * 插件内部私有事件（如 'my-plugin:data-updated'）使用 string 重载，payload 为 unknown。
+ *
+ * @see event-catalog.ts — 平台级事件类型注册表
+ */
+export interface EventAPI {
+    /**
+     * 监听平台级广播事件（持续监听，payload 有完整类型推断）
+     * @example
+     * const off = sdk.events.on('agent:step_update', (payload) => {
+     *   console.log(payload.status); // 类型安全：AgentStepUpdatePayload
+     * });
+     */
+    on<K extends BerrytraceEventName>(eventName: K, handler: (payload: BerrytraceEventMap[K]) => void): () => void;
+    /**
+     * 监听插件私有事件（持续监听）
+     * @example
+     * const off = sdk.events.on('my-plugin:data-updated', (data) => {
+     *   console.log('数据已更新:', data);
+     * });
+     * // 取消监听
+     * off();
+     */
+    on(eventName: string, handler: EventHandler): () => void;
+    /**
+     * 监听平台级广播事件（仅触发一次，payload 有完整类型推断）
+     */
+    once<K extends BerrytraceEventName>(eventName: K, handler: (payload: BerrytraceEventMap[K]) => void): void;
+    /**
+     * 监听插件私有事件（仅触发一次）
+     */
+    once(eventName: string, handler: EventHandler): void;
+    /**
+     * 发射平台级广播事件（payload 类型与事件名强绑定）
+     * @example
+     * sdk.events.emit('agent:kernel_ready', { kernelId: '...', framework: 'mastra', protocol: '...' });
+     */
+    emit<K extends BerrytraceEventName>(eventName: K, payload: BerrytraceEventMap[K]): void;
+    /**
+     * 发射插件私有事件
+     * @example
+     * sdk.events.emit('my-plugin:data-updated', { id: 123, name: 'test' });
+     */
+    emit(eventName: string, payload?: unknown): void;
+    /**
+     * 取消监听事件
+     * @param eventName 事件名称
+     * @param handler 要移除的处理函数（必须与注册时相同引用）
+     */
+    off(eventName: string, handler: EventHandler): void;
+}
+/**
+ * 宿主命令 API（仅 background / main 插件有意义）
+ *
+ * 用于订阅宿主下发的命令。命令（Command）与事件（Event）的语义区别：
+ *   - sdk.events.on → 广播通知：某事已发生，任意插件可发射，任意插件可订阅
+ *   - sdk.host.onCommand → 宿主指令：宿主请你做某事，只有宿主可发射，只有目标插件订阅
+ *
+ * @example
+ * // Agent 内核插件监听执行任务命令
+ * const off = sdk.host.onCommand('agent:execute_task', (payload) => {
+ *   // payload 是 AgentExecuteTaskPayload，有完整类型
+ *   kernel.executeTask(payload);
+ * });
+ *
+ * @see BerrytraceCommandMap in event-catalog.ts — 命令类型注册表
+ */
+export interface HostCommandAPI {
+    /**
+     * 监听宿主下发的命令（持续监听，payload 有完整类型推断）
+     */
+    onCommand<K extends BerrytraceCommandName>(commandName: K, handler: (payload: BerrytraceCommandMap[K]) => void): () => void;
+    /**
+     * 监听宿主下发的命令（仅触发一次）
+     */
+    onceCommand<K extends BerrytraceCommandName>(commandName: K, handler: (payload: BerrytraceCommandMap[K]) => void): void;
+}
+export interface FloatWindowOptions {
+    url: string;
+    width?: number;
+    height?: number;
+    x?: number;
+    y?: number;
+    alwaysOnTop?: boolean;
+    resizable?: boolean;
+    title?: string;
+    frame?: boolean;
+    transparent?: boolean;
+    skipTaskbar?: boolean;
+    focusable?: boolean;
+    ignoreMouseEvents?: boolean;
+    hasShadow?: boolean;
+    show?: boolean;
+    fullscreen?: boolean;
+    type?: string;
+    [key: string]: unknown;
+}
+export interface WindowState {
+    id: string;
+    visible: boolean;
+    bounds: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    };
+    alwaysOnTop: boolean;
+}
+/**
+ * 窗口 API
+ * 统一管理当前窗口操作与浮窗创建/控制
+ */
+export interface WindowAPI extends Omit<GeneratedWindowAPI, 'close' | 'minimize' | 'maximize' | 'startDrag' | 'move' | 'disableDefaultDrag' | 'setIgnoreMouseEvents' | 'create' | 'show' | 'hide' | 'getState' | 'getNativeHandle' | 'updateWindowOptions'> {
+    /** 关闭窗口（不传参关闭当前窗口，传 id 关闭指定浮窗） */
+    close(id?: string): Promise<void>;
+    /** 最小化当前窗口 */
+    minimize(): Promise<void>;
+    /** 最大化/还原当前窗口 */
+    maximize(): Promise<void>;
+    /** 开始拖拽窗口（macOS） */
+    startDrag(): Promise<void>;
+    /** 相对移动窗口 */
+    move(deltaX: number, deltaY: number): Promise<void>;
+    /** 禁用默认拖拽行为 */
+    disableDefaultDrag(disabled: boolean): Promise<void>;
+    /** 设置鼠标穿透（桌面特效场景） */
+    setIgnoreMouseEvents(ignore: boolean, options?: {
+        forward: boolean;
+    }): Promise<void>;
+    /** 创建独立浮窗，返回 windowId */
+    create(options: FloatWindowOptions): Promise<string>;
+    /** 显示指定浮窗 */
+    show(id: string): Promise<void>;
+    /** 隐藏指定浮窗 */
+    hide(id: string): Promise<void>;
+    /** 获取浮窗状态 */
+    getState(id: string): Promise<WindowState>;
+    /** 获取浮窗的 OS 原生窗口句柄（Windows: HWND, macOS: window ID），用于 ffmpeg/自动化等场景 */
+    getNativeHandle(opts: {
+        winId: string;
+    }): Promise<{
+        handle: number;
+        platform: string;
+        title: string;
+    }>;
+    /** 更新浮窗选项 */
+    updateWindowOptions(id: string, options: Partial<FloatWindowOptions>): Promise<void>;
+}
+/**
+ * 保存对话框选项
+ * 简化版，仅包含插件开发常用的选项
+ */
+export interface SaveDialogOptions {
+    /** 对话框标题 */
+    title?: string;
+    /** 默认保存路径 */
+    defaultPath?: string;
+    /** 文件过滤器，如 [{ name: 'Text', extensions: ['txt'] }] */
+    filters?: Array<{
+        name: string;
+        extensions: string[];
+    }>;
+    /** 是否不显示文件扩展名选择框 */
+    dontAddToRecent?: boolean;
+}
+/**
+ * 打开对话框选项
+ * 简化版，仅包含插件开发常用的选项
+ */
+export interface OpenDialogOptions {
+    /** 对话框标题 */
+    title?: string;
+    /** 默认打开路径 */
+    defaultPath?: string;
+    /** 文件过滤器，如 [{ name: 'Images', extensions: ['jpg', 'png'] }] */
+    filters?: Array<{
+        name: string;
+        extensions: string[];
+    }>;
+    /** 对话框属性，如 ['openFile', 'multiSelections'] */
+    properties?: Array<'openFile' | 'openDirectory' | 'multiSelections' | 'showHiddenFiles'>;
+    /** 是否不显示文件扩展名选择框 */
+    dontAddToRecent?: boolean;
+}
+/**
+ * 对话框返回结果（保存/打开通用）
+ */
+export interface DialogReturnValue {
+    /** 用户是否取消了对话框 */
+    canceled: boolean;
+    /** 保存对话框返回：选择的文件路径 */
+    filePath?: string;
+    /** 打开对话框返回：选择的文件路径数组 */
+    filePaths?: string[];
+}
+/**
+ * 对话框 API
+ * 提供原生的文件选择对话框功能
+ */
+export interface DialogAPI extends Omit<GeneratedDialogAPI, 'showSaveDialog' | 'showOpenDialog'> {
+    /**
+     * 显示保存文件对话框
+     * @param options 对话框配置选项
+     * @returns 返回 Promise，包含文件路径信息
+     * @example
+     * const result = await sdk.dialog.showSaveDialog({
+     *   title: '保存文件',
+     *   defaultPath: 'my-file.txt',
+     *   filters: [{ name: 'Text', extensions: ['txt'] }]
+     * });
+     * if (!result.canceled) {
+     *   console.log('保存路径:', result.filePath);
+     * }
+     */
+    showSaveDialog(options: SaveDialogOptions): Promise<DialogReturnValue>;
+    /**
+     * 显示打开文件对话框
+     * @param options 对话框配置选项
+     * @returns 返回 Promise，包含选中的文件路径信息
+     * @example
+     * const result = await sdk.dialog.showOpenDialog({
+     *   title: '选择文件',
+     *   properties: ['openFile', 'multiSelections'],
+     *   filters: [{ name: 'Images', extensions: ['jpg', 'png'] }]
+     * });
+     * if (!result.canceled) {
+     *   console.log('选中文件:', result.filePaths);
+     * }
+     */
+    showOpenDialog(options: OpenDialogOptions): Promise<DialogReturnValue>;
+}
+export interface ArticlesAPI extends GeneratedArticlesAPI {
+}
+export interface LocalAiAPI extends GeneratedLocalAiAPI {
+}
+export interface UserAPI extends GeneratedUserAPI {
+    setUser(user: {
+        id: string;
+        name: string;
+    }): Promise<void>;
+    getUser(): Promise<{
+        id: string;
+        name: string;
+    } | null>;
+    setLoggedIn(loggedIn: boolean): Promise<void>;
+    isLoggedIn(): Promise<boolean>;
+    onChange(cb: (payload: {
+        loggedIn: boolean;
+        user: {
+            id: string;
+            name: string;
+        } | null;
+    }) => void): () => void;
+}
+export interface PublishAPI extends GeneratedPublishAPI {
+}
+export interface ExecCommandOptions {
+    command: string;
+    args?: string[];
+    cwd?: string;
+    env?: Record<string, string>;
+    timeoutMs?: number;
+    shell?: boolean;
+    streamEventName?: string;
+    sessionId?: string;
+    resolveOnSilenceMs?: number;
+    sudo?: boolean;
+}
+export interface ExecCommandResult {
+    code: number;
+    stdout: string;
+    stderr: string;
+    signal: string | null;
+    resolvedEarly?: boolean;
+}
+/**
+ * 系统 API
+ * 提供系统级功能，如主题获取、通知显示、执行系统命令等
+ */
+export interface SystemAPI extends Omit<GeneratedSystemAPI, 'getTheme' | 'showNotification' | 'openUrl' | 'openExternal' | 'execCommand' | 'waitCommand' | 'createDesktopShortcut' | 'setTrayMenu' | 'registerGlobalShortcut' | 'unregisterGlobalShortcut'> {
+    /**
+     * 获取当前系统主题
+     * @returns 返回 'light' 或 'dark'
+     * @example
+     * const theme = await sdk.system.getTheme();
+     * if (theme === 'dark') {
+     *   // 应用暗色主题样式
+     * }
+     */
+    getTheme(): Promise<'light' | 'dark'>;
+    /**
+     * 获取当前宿主应用的 OEM 信息（如应用名称、API网关等）
+     */
+    getAppInfo(): Promise<{
+        appName: string;
+        oemId: string;
+        apiGateway: string;
+        logoPath?: string;
+    }>;
+    /**
+     * 显示系统通知
+     * @param options 通知选项，包含标题、正文、是否静音
+     * @example
+     * await sdk.system.showNotification({
+     *   title: '任务完成',
+     *   body: '文件已成功处理',
+     *   silent: false
+     * });
+     */
+    showNotification(options: {
+        title: string;
+        body: string;
+        silent?: boolean;
+    }): Promise<void>;
+    /**
+     * 在 BerryTrace 内部浏览器中打开 URL
+     * @param url 要打开的 URL
+     * @param options 打开选项
+     * @example
+     * await sdk.system.openUrl('https://example.com', {
+     *   internal: true,
+     *   width: 800,
+     *   height: 600
+     * });
+     */
+    openUrl(url: string, options?: {
+        internal?: boolean;
+        width?: number;
+        height?: number;
+        alwaysOnTop?: boolean;
+    }): Promise<void>;
+    /**
+     * 在系统默认浏览器中打开 URL
+     * @param url 要打开的 URL
+     * @example
+     * await sdk.system.openExternal('https://example.com');
+     */
+    openExternal(url: string): Promise<void>;
+    /**
+     * 执行系统命令
+     * @param options 命令选项，包含命令、参数、工作目录、超时等
+     * @returns 返回执行结果，包含退出码、stdout、stderr 等
+     * @example
+     * // 执行简单命令
+     * const result = await sdk.system.execCommand({
+     *   command: 'ls',
+     *   args: ['-la'],
+     *   cwd: '/path/to/dir',
+     *   timeoutMs: 5000
+     * });
+     * console.log(result.stdout);
+     *
+     * @example
+     * // 流式获取输出
+     * await sdk.system.execCommand({
+     *   command: 'tail',
+     *   args: ['-f', '/var/log/system.log'],
+     *   streamEventName: 'my-plugin:log-stream'
+     * });
+     * // 在别处监听
+     * sdk.events.on('my-plugin:log-stream', (data) => {
+     *   console.log(data.stream, data.chunk);
+     * });
+     */
+    execCommand(options: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        timeoutMs?: number;
+        shell?: boolean;
+        streamEventName?: string;
+        sessionId?: string;
+        resolveOnSilenceMs?: number;
+    }): Promise<{
+        code: number;
+        stdout: string;
+        stderr: string;
+        signal: string | null;
+        resolvedEarly?: boolean;
+    }>;
+    /**
+     * 等待后台命令完成
+     * @param options 包含 sessionId 的选项
+     * @returns 返回执行结果
+     * @example
+     * // 启动长时间运行的命令
+     * await sdk.system.execCommand({
+     *   command: 'npm',
+     *   args: ['install'],
+     *   sessionId: 'my-session'
+     * });
+     * // 在别处等待完成
+     * const result = await sdk.system.waitCommand({ sessionId: 'my-session' });
+     */
+    waitCommand(options: {
+        sessionId: string;
+    }): Promise<{
+        code: number;
+        stdout: string;
+        stderr: string;
+        signal: string | null;
+    }>;
+    /** 动态为当前插件在桌面创建快捷方式 */
+    createDesktopShortcut(options: {
+        name: string;
+        icon?: string;
+        description?: string;
+    }): Promise<boolean>;
+    /** 注册系统托盘菜单 */
+    setTrayMenu(menuTemplate: Array<{
+        label: string;
+        type?: 'normal' | 'separator' | 'checkbox';
+        checked?: boolean;
+        clickCommand: string;
+    }>): Promise<void>;
+    /** 动态注册全局系统热键 */
+    registerGlobalShortcut(accelerator: string, commandId: string): Promise<boolean>;
+    /** 取消注册全局系统热键 */
+    unregisterGlobalShortcut(accelerator: string): Promise<void>;
+    /** 注册快捷键动作（供用户在设置中绑定到手势） */
+    registerShortcutAction(options: {
+        id: string;
+        label: string;
+        icon?: string;
+    }): Promise<void>;
+    /** 注销快捷键动作 */
+    unregisterShortcutAction(id: string): Promise<void>;
+    /** 获取所有已注册的快捷键动作 */
+    listShortcutActions(): Promise<Array<{
+        id: string;
+        label: string;
+        icon: string;
+        pluginId: string;
+    }>>;
+    /** 获取当前获得焦点的输入框信息 */
+    getFocusedInputInfo(): Promise<{
+        selection: string;
+        value: string;
+        role: string;
+    }>;
+    /** 在当前获得焦点的输入框光标处插入/替换文本 */
+    insertText(options: {
+        text: string;
+    }): Promise<boolean>;
+    /**
+     * 检测当前系统光标是否处于可编辑输入区域。
+     * 适用于 AI 填充前的前置检查：若 isInput=false 则提示用户先点击一个输入框。
+     *
+     * @returns isInput    — 是否为任何可输入区域（含 contenteditable 的网页输入框）
+     * @returns isEditable — 是否明确可编辑（AX editable 属性 = true 或 native input role）
+     * @returns role       — AX 角色字符串，如 "AXTextField" / "AXTextArea" / "AXWebArea"
+     *
+     * @example
+     * const { isInput } = await sdk.system.isFocusedInInputArea()
+     * if (!isInput) {
+     *   sdk.ui.showToast('请先点击一个输入框，再触发 AI 填充')
+     *   return
+     * }
+     * await sdk.system.insertText({ text: aiResult })
+     */
+    isFocusedInInputArea(): Promise<{
+        isInput: boolean;
+        isEditable: boolean;
+        role: string;
+    }>;
+}
+export interface FolderContextMenuItem {
+    id: string;
+    label: string;
+    onClick: (folderPath: string) => void;
+    pluginId?: string;
+}
+/**
+ * 打开工作区标签页的参数（统一为命名接口，易扩展）
+ */
+export interface OpenTabOptions {
+    /** 文件路径（与 pluginId 至少提供其一） */
+    filePath?: string;
+    /** 插件 ID（与 filePath 至少提供其一） */
+    pluginId?: string;
+    /** 文件扩展名 */
+    extension?: string;
+    /** 文章 ID */
+    articleId?: string;
+    /** 会话 ID */
+    sessionId?: string;
+    /** 是否替换当前活动标签页 */
+    replaceActiveTab?: boolean;
+    /** 标签页标题 */
+    title?: string;
+    /** 行号（自动跳转到指定行） */
+    line?: number;
+    /** 自定义业务参数字典（打开 Tab 时可附带任意数据，后续可通过 getActiveTabConfig() 获取） */
+    customParams?: Record<string, unknown>;
+}
+/**
+ * 工作区 API
+ * 用于操作 BerryTrace 的工作区，如注册视图、操作标签、注册功能区图标等
+ */
+/**
+ * 声明一个 View 被渲染到系统的哪个位置，以及该位置所需的元信息。
+ * 与 RegisterViewConfig.placement 配合使用。
+ */
+export type ViewPlacement =
+/** 工作区 Tab（主编辑视图，通过 fileAssociations 路由或直接打开） */
+{
+    type: 'workspace';
+}
+/** 设置面板的一级 Tab */
+ | {
+    type: 'settings';
+    /** Tab 显示名称 */
+    label: string;
+    /** Tab 图标（SVG 字符串，可选） */
+    icon?: string;
+    /** 排序权重，数字越小越靠前，默认 100 */
+    order?: number;
+}
+/** Quick Panel 嵌入视图 */
+ | {
+    type: 'quickPanel';
+}
+/** 划词菜单内嵌视图 */
+ | {
+    type: 'selectionMenu';
+    label: string;
+    icon?: string;
+};
+/**
+ * 统一注册视图配置（推荐写法）
+ * 将 ViewClass 注册与渲染位置声明合并为一次调用，消除 viewType 字符串的外部耦合。
+ *
+ * @example
+ * // 注册到设置面板
+ * sdk.workspace.registerView({
+ *   viewType: 'com.xxx:settings',
+ *   viewClass: MySettingsView,
+ *   placement: { type: 'settings', label: '插件设置', order: 90 },
+ * });
+ *
+ * @example
+ * // 注册到工作区 Tab（无需 placement 元信息）
+ * sdk.workspace.registerView({
+ *   viewType: 'com.xxx:workspace',
+ *   viewClass: MyEditorView,
+ *   placement: { type: 'workspace' },
+ * });
+ */
+export interface RegisterViewConfig {
+    /** 视图唯一标识，如 'com.berrytrace.plugin.xxx:workspace' */
+    viewType: string;
+    /** View 类（需继承 View 基类），接受 (container, sdk) 构造参数 */
+    viewClass: new (container: HTMLElement, app: unknown) => unknown;
+    /** 声明此 View 渲染在哪里以及对应的元信息 */
+    placement: ViewPlacement;
+}
+export interface TabCreateMenuItem {
+    id: string;
+    pluginId?: string;
+    label: string;
+    description?: string;
+    category: 'system' | 'ssh' | 'agent' | string;
+    iconName?: string;
+    keywords?: string[];
+    enabled?: boolean;
+    order?: number;
+    onSelect: (context: {
+        tabsetId?: string;
+        worktreeId?: string;
+    }) => void | Promise<void>;
+}
+export interface WorkspaceAPI extends Omit<GeneratedWorkspaceAPI, 'getPath' | 'getMetadata' | 'openWorkspaceTab'> {
+    registerTabMenuItem(item: TabCreateMenuItem): () => void;
+    unregisterTabMenuItem(id: string): void;
+    /**
+     * @deprecated 请使用顶层方法 `sdk.registerView()` 代替。
+     * 向后兼容别名，内部委托到 `sdk.registerView`。
+     */
+    registerView(config: RegisterViewConfig): void;
+    /** @deprecated 请使用 `sdk.registerView()` */
+    registerView(viewType: string, viewClass: unknown): void;
+    /**
+     * @deprecated 请使用顶层方法 `sdk.unregisterView()` 代替。
+     * @param viewType 视图类型唯一标识符
+     */
+    unregisterView(viewType: string): void;
+    /**
+     * 获取当前工作区路径
+     * @returns 工作区目录的绝对路径，如果无工作区则返回 null
+     */
+    getPath(): Promise<string>;
+    /**
+     * 获取当前工作区元数据
+     * @returns 包含 path、name、calendarUuid 等的对象
+     */
+    getMetadata(): Promise<unknown>;
+    /**
+     * 设置大纲（用于 AI 对话上下文）
+     * @param sessionId 会话 ID
+     * @param outline 大纲数据
+     */
+    setOutline(sessionId: string, outline: unknown[]): void;
+    /**
+     * 设置会话属性
+     * @param sessionId 会话 ID
+     * @param properties 属性对象
+     */
+    setProperties(sessionId: string, properties: Record<string, unknown>): void;
+    /**
+     * 获取会话属性
+     * @param sessionId 会话 ID
+     * @returns 属性对象或 undefined
+     */
+    getProperties(sessionId: string): Record<string, unknown> | undefined;
+    /**
+     * 获取会话指定属性
+     * @param sessionId 会话 ID
+     * @param key 属性键名
+     */
+    getProperty(sessionId: string, key: string): Promise<unknown>;
+    /**
+     * 设置会话指定属性
+     * @param sessionId 会话 ID
+     * @param key 属性键名
+     * @param value 属性值
+     */
+    setProperty(sessionId: string, key: string, value: unknown): Promise<void>;
+    /**
+     * 注册面板（用于 AI 对话界面）
+     * @param sessionId 会话 ID
+     * @param panels 面板配置数组
+     */
+    registerPanels(sessionId: string, panels: unknown[]): void;
+    /**
+     * 获取当前活动标签页 ID
+     * @returns 活动标签页 ID 或 null
+     */
+    getActiveTabId(): string | null;
+    /**
+     * 获取当前活动标签页的配置（如文件路径、扩展名、标题等）
+     */
+    getActiveTabConfig(): {
+        filePath?: string;
+        extension?: string;
+        pluginId?: string;
+        title?: string;
+        customParams?: Record<string, unknown>;
+    } | null;
+    /**
+     * 注册功能区图标（侧边栏图标）
+     * @param id 图标唯一标识符
+     * @param icon 图标：静态字符串 | 动态函数 | React 元素 | 返回 React 元素的函数
+     * @param title 悬停提示文字
+     * @param onClick 点击回调函数
+     * @param pluginId 插件 ID（可选，默认当前插件）
+     * @param onContextMenu 右键点击回调函数（可选）
+     * @example
+     * // 静态 SVG
+     * sdk.workspace.registerRibbonIcon('id', '<svg>...</svg>', 'Title', onClick);
+     *
+     * // 动态 SVG（进度环）
+     * sdk.workspace.registerRibbonIcon('id', () => `<svg>...${progress}%</svg>`, 'Title', onClick);
+     *
+     * // React 组件（带 Canvas 动画、hover 效果等）
+     * sdk.workspace.registerRibbonIcon('id',
+     *   () => React.createElement(AnimatedIcon, { active: true, progress: 45 }),
+     *   'Title', onClick);
+     */
+    registerRibbonIcon(id: string, icon: string | (() => string) | React.ReactElement | (() => React.ReactElement), title: string, onClick: () => void, pluginId?: string, onContextMenu?: (event: MouseEvent) => void): void;
+    /**
+     * 取消注册功能区图标
+     * @param id 图标唯一标识符
+     */
+    unregisterRibbonIcon(id: string): void;
+    /**
+     * 注册文件夹右键菜单项
+     * @param item 菜单项配置
+     */
+    registerFolderContextMenuItem(item: FolderContextMenuItem): void;
+    /**
+     * 取消注册文件夹右键菜单项
+     * @param id 菜单项唯一标识符
+     */
+    unregisterFolderContextMenuItem(id: string): void;
+    /**
+     * 注册链接（侧边栏链接）
+     * @param id 链接唯一标识符
+     * @param title 显示标题
+     * @param url 链接 URL
+     */
+    registerLink(id: string, title: string, url: string): void;
+    /**
+     * 取消注册链接
+     * @param id 链接唯一标识符
+     */
+    unregisterLink(id: string): void;
+    /**
+     * 在工作区打开标签页
+     * @param options 标签页配置，详见 OpenTabOptions
+     * @example
+     * sdk.workspace.openWorkspaceTab({
+     *   filePath: '/path/to/doc.md',
+     *   pluginId: 'com.example.plugin',
+     *   customParams: { mode: 'presentation' }
+     * });
+     */
+    openWorkspaceTab(options: OpenTabOptions): void;
+    splitActiveTab(direction: 'right' | 'bottom'): void;
+    updateActiveTabInfo(name: string, newConfig: Record<string, unknown>): void;
+    /**
+     * 设置标签页的修改状态（脏标记）
+     * @param tabId 标签页 ID
+     * @param isModified 是否已修改
+     */
+    setTabModified(tabId: string, isModified: boolean): void;
+    /**
+     * 注册工作区操作（显示在标签页"更多操作"下拉菜单中）
+     * @param config 操作配置
+     */
+    registerWorkspaceAction(config: WorkspaceActionConfig): void;
+    /**
+     * 取消注册工作区操作
+     * @param id 操作唯一标识符
+     */
+    unregisterWorkspaceAction(id: string): void;
+    /**
+     * 注册自定义 Diff 渲染处理器
+     */
+    registerDiffHandler(registration: {
+        id: string;
+        canHandle: (toolName: string, toolArgs: any) => boolean;
+        component: React.ComponentType<{
+            toolName: string;
+            toolArgs: any;
+            observation: string;
+            onClose: () => void;
+        }>;
+    }): () => void;
+    /**
+     * 取消注册自定义 Diff 渲染处理器
+     */
+    unregisterDiffHandler(id: string): void;
+    /**
+     * 注册语音转文字处理器
+     */
+    registerVoiceHandler(registration: {
+        id: string;
+        priority: number;
+        startSpeechToText: (options?: {
+            onStateChange?: (state: 'recording' | 'transcribing' | 'idle', error?: string) => void;
+        }) => Promise<string>;
+        stopSpeechToText: () => void;
+        cancelSpeechToText: () => void;
+    }): () => void;
+    /**
+     * 取消注册语音转文字处理器
+     */
+    unregisterVoiceHandler(id: string): void;
+}
+/**
+ * 工作区操作配置（注册到标签页"更多操作"下拉菜单）
+ */
+export interface WorkspaceActionConfig {
+    /** 操作唯一标识符 */
+    id: string;
+    /** 所属插件 ID */
+    pluginId: string;
+    /** 显示标签 */
+    label: string;
+    /** 图标（可选） */
+    icon?: string;
+    /** 是否显示在工具栏（可选） */
+    showInToolbar?: boolean;
+    /** 适用的视图类型列表（可选，为空则对所有视图适用） */
+    viewTypes?: string[];
+    /** 适用的文件扩展名列表（可选） */
+    extensions?: string[];
+    /** 在操作之前或之后渲染分割线，用于分组 */
+    divider?: 'before' | 'after';
+    /** 点击回调 */
+    onClick: (params: {
+        tabId: string;
+        filePath?: string;
+        articleId?: string;
+        sessionId?: string;
+    }) => void;
+    /** 判断操作是否为激活状态（可选） */
+    isActive?: (params: {
+        tabId: string;
+        filePath?: string;
+        articleId?: string;
+        sessionId?: string;
+    }) => boolean;
+    /** 判断操作是否可用（可选） */
+    isEnabled?: (params: {
+        tabId: string;
+        filePath?: string;
+        articleId?: string;
+        sessionId?: string;
+    }) => boolean;
+}
+export type PluginLifecycleAction = 'initial-load' | 'enable' | 'disable' | 'uninstall' | 'reload' | 'install' | 'normal';
+export type PluginLoadMode = 'setup' | 'normal';
+export interface PluginLifecycleContext {
+    action: PluginLifecycleAction;
+    loadMode: PluginLoadMode;
+    updatedAt: string;
+    trigger?: {
+        eventName: string;
+        payload: any;
+    };
+}
+/**
+ * 工作区上下文变更载荷。
+ * 当用户切换工作区时，所有已加载的 workspace-scoped 插件会收到此通知。
+ * 插件应在此钩子中更新内部缓存的 workspacePath，而不是依赖 onload 时的快照。
+ */
+export interface WorkspaceContextChangedPayload {
+    /** 旧工作区路径 */
+    oldWorkspacePath: string | null;
+    /** 新工作区路径 */
+    newWorkspacePath: string | null;
+}
+export declare abstract class Plugin {
+    app: BerryTraceSDK;
+    manifest: unknown;
+    constructor(app: BerryTraceSDK, manifest: unknown);
+    abstract onload(context?: PluginLifecycleContext): Promise<void> | void;
+    abstract onunload(context?: PluginLifecycleContext): Promise<void> | void;
+    /**
+     * 工作区上下文变更钩子（可选实现）。
+     *
+     * 当用户切换工作区时调用。插件应在此方法中：
+     * 1. 更新内部缓存的 workspacePath（不要依赖 onload 时的快照）
+     * 2. 重新绑定文件监听、定时器等与工作区路径相关的资源
+     * 3. 刷新视图数据
+     *
+     * 注意：此钩子不会在 onload 后立即调用，仅在实际工作区切换时触发。
+     * 如果插件在 onload 中缓存了 workspacePath，必须实现此钩子以避免交叉引用错误。
+     *
+     * @param payload 包含新旧工作区路径
+     */
+    onWorkspaceContextChanged?(payload: WorkspaceContextChangedPayload): Promise<void> | void;
+}
+export declare abstract class View {
+    container: HTMLElement;
+    app: BerryTraceSDK;
+    constructor(container: HTMLElement, app: BerryTraceSDK);
+    abstract getViewType(): string;
+    abstract getDisplayText(): string;
+    abstract onOpen(params: Record<string, string>): Promise<void> | void;
+    abstract onClose(): Promise<void> | void;
+    /**
+     * Tab 关闭前调用。
+     * @returns true — 允许关闭；false — 阻止关闭；string — 弹出确认框，确认后关闭
+     */
+    beforeClose(): Promise<boolean | string>;
+}
+/**
+ * 调度器注册选项
+ * 用于注册定时或周期性执行的任务
+ */
+export interface SchedulerRegisterOptions {
+    /** 任务唯一标识符 */
+    id: string;
+    /** Cron 表达式（如 '0 * * * *' 表示每小时整点执行） */
+    cron?: string;
+    /** 执行间隔（毫秒），与 cron 二选一 */
+    intervalMs?: number;
+    /** 是否仅执行一次 */
+    once?: boolean;
+    /** 指定的单次执行时间戳（毫秒） */
+    executeAt?: number;
+    /** 要执行的命令 */
+    command?: string;
+    /** 命令参数 */
+    args?: string[];
+    /** 命令执行的工作目录 */
+    cwd?: string;
+}
+/**
+ * 调度器 API
+ * 允许插件注册定时或周期性执行的任务
+ */
+export interface SchedulerAPI extends Omit<GeneratedSchedulerAPI, 'register' | 'unregister' | 'list'> {
+    /**
+     * 注册调度任务
+     * @param options 调度选项
+     * @example
+     * // 每 5 分钟执行一次
+     * await sdk.scheduler.register({
+     *   id: 'my-plugin:sync',
+     *   intervalMs: 5 * 60 * 1000,
+     *   command: 'node',
+     *   args: ['sync.js']
+     * });
+     *
+     * @example
+     * // 使用 cron 表达式，每天早上 9 点执行
+     * await sdk.scheduler.register({
+     *   id: 'my-plugin:daily',
+     *   cron: '0 9 * * *',
+     *   command: 'node',
+     *   args: ['daily.js']
+     * });
+     */
+    register(options: SchedulerRegisterOptions): Promise<void>;
+    /**
+     * 取消注册调度任务
+     * @param id 任务唯一标识符
+     */
+    unregister(id: string): Promise<void>;
+    /**
+     * 列出当前插件注册的所有调度任务
+     * @returns 任务配置数组
+     */
+    list(): Promise<unknown[]>;
+}
+/**
+ * 划词菜单注册项
+ * 插件可通过 selectionMenu API 注册按钮到划词菜单
+ */
+export interface SelectionMenuItem {
+    /** 唯一标识，如 'save-to-diary' */
+    id: string;
+    /** 显示文本，如 '保存到日记' */
+    label: string;
+    /** SVG 字符串图标，如 '<svg viewBox="0 0 24 24">...</svg>' */
+    icon?: string;
+    /** ViewClass 类型（用于嵌入模式），如 'com.berrytrace.plugin.diary:selection-view' */
+    viewType?: string;
+    /** 所属插件 ID */
+    pluginId?: string;
+    /** 钮说明/title */
+    description?: string;
+}
+/**
+ * 划词菜单 API
+ * 允许插件注册按钮到系统划词菜单
+ */
+export interface SelectionMenuAPI extends Omit<GeneratedSelectionMenuAPI, 'registerItem' | 'unregisterItem'> {
+    /**
+     * 注册划词菜单按钮
+     * @param item 注册项配置
+     * @example
+     * sdk.selectionMenu.registerItem({
+     *   id: 'save-to-diary',
+     *   label: '保存到日记',
+     *   icon: '<svg ...>...</svg>',
+     *   viewType: 'com.berrytrace.plugin.diary:selection-view'
+     * });
+     */
+    registerItem(item: SelectionMenuItem): Promise<void>;
+    /**
+     * 取消注册划词菜单按钮
+     * @param id 注册项 ID
+     */
+    unregisterItem(id: string): Promise<void>;
+}
+/**
+ * 跨插件 Hooks API
+ * 允许任意插件注册回调，其他插件通过名称调用。
+ * 返回值经 Electron IPC 结构化克隆，支持任意可序列化类型。
+ * 注册不存在/超时 → 返回 null，不阻断调用方。
+ */
+export interface HookAPI {
+    register(name: string, handler: (...args: unknown[]) => Promise<unknown>, priority?: number): void;
+    unregister(name: string): void;
+    call<T = unknown>(name: string, args?: unknown[], opts?: {
+        merge?: boolean;
+        timeoutMs?: number;
+    }): Promise<T | null>;
+}
+/**
+ * BerryTrace SDK 主接口
+ * 这是插件开发者最直接使用的接口，通过全局对象 `berrytrace` 访问
+ *
+ * @example
+ * // 获取 SDK 实例
+ * const sdk = window.berrytrace;
+ *
+ * // 使用各个 API 模块
+ * await sdk.plugin.getInfo();
+ * await sdk.log.info('Hello BerryTrace');
+ * await sdk.system.showNotification({ title: '提示', body: '操作完成' });
+ */
+export interface NoteSearchResult {
+    note_id: number;
+    title: string;
+    snip: string;
+    rank: number;
+}
+export interface FileSearchResult {
+    file_path: string;
+    file_name: string;
+    snip: string;
+    rank: number;
+    line_number?: number;
+}
+/**
+ * 搜索 API
+ * 提供全文检索功能
+ */
+export interface SearchAPI extends Omit<GeneratedSearchAPI, 'searchNotes' | 'searchFiles'> {
+    /**
+     * 搜索笔记
+     */
+    searchNotes(query: string, calendarUuid: number): Promise<NoteSearchResult[]>;
+    /**
+     * 搜索文件
+     */
+    searchFiles(query: string, workspacePath: string): Promise<FileSearchResult[]>;
+}
+export interface BerryTraceSDK {
+    /**
+     * 通用 API 调用方法（高级用法）
+     */
+    callApi(apiName: string, methodName: string, args?: unknown[]): Promise<unknown>;
+    /**
+     * 基于 token 的异步 API 调用，支持超时控制。
+     * 通过 token 匹配请求-响应，避免阻塞 invoke 通道，适合耗时操作（如 HTTP 请求）。
+     */
+    callApiResult(apiName: string, methodName: string, args?: unknown[], timeoutMs?: number): Promise<unknown>;
+    /** 搜索 API - 提供全文检索功能 */
+    search: SearchAPI;
+    /** 插件信息 API - 获取当前插件的元数据 */
+    plugin: PluginInfoAPI;
+    /** 日志 API - 记录插件运行日志 */
+    log: LogAPI;
+    /** AI 功能 API - 调用 AI 对话、Agent 任务等 */
+    ai: AIApi;
+    /** 上下文 API - 获取用户当前选中的内容或活动应用 */
+    context: ContextAPI;
+    /** Workflow 编排 API - 注册与硬执行工作流 */
+    workflow: WorkflowAPI;
+    /** MCP (Model Context Protocol) API - 注册和管理 MCP 工具 */
+    mcp: McpAPI;
+    /** 命令 API - 注册和执行命令 */
+    commands: CommandAPI;
+    /** 事件 API - 插件间广播通知通信 */
+    events: EventAPI;
+    /**
+     * 宿主命令 API - 订阅宿主下发的命令（仅 background / main 插件有意义）
+     * 语义：宿主请你做某事 vs events 的某事已发生通知各方
+     */
+    host: HostCommandAPI;
+    /** 窗口 API - 操作当前的/新建的窗口（关闭、最小化、创建浮窗等） */
+    window: WindowAPI;
+    /** 浮动窗口创建 API（已合并到 window.create） */
+    createWindow: WindowAPI;
+    /** 存储 API - 键值对存储和简易数据库 */
+    storage: StorageAPI;
+    /** 文件系统 API - 读写文件、管理目录 */
+    filesystem: FileSystemAPI;
+    /** 系统 API - 主题、通知、执行命令等系统功能 */
+    system: SystemAPI;
+    /** 对话框 API - 显示原生文件选择对话框 */
+    dialog: DialogAPI;
+    /** 工作区 API - 操作工作区视图、标签页等 */
+    workspace: WorkspaceAPI;
+    /** 设置 API - 注册设置面板的一级 Tab */
+    settings: SettingsAPI;
+    /** 调度器 API - 注册定时或周期性执行的任务 */
+    scheduler: SchedulerAPI;
+    /** 临时发布 API - 将文档发布为临时网页分享 */
+    publish: PublishAPI;
+    /** 划词菜单 API - 注册按钮到系统划词菜单 */
+    selectionMenu: SelectionMenuAPI;
+    /** 跨插件 Hooks API - 插件间协作回调 */
+    hooks: HookAPI;
+    /**
+     * 统一注册一个 View 到 BerryTrace 系统（全局唯一入口）
+     *
+     * 不属于任何子模块，通过 `placement` 声明这个 View 渲染到哪里。
+     *
+     * @example 注册设置面板 Tab
+     * sdk.registerView({
+     *   viewType: 'com.xxx:settings',
+     *   viewClass: MySettingsView,
+     *   placement: { type: 'settings', label: '插件设置', icon: '<svg...>', order: 90 },
+     * });
+     *
+     * @example 注册工作区编辑视图
+     * sdk.registerView({
+     *   viewType: 'com.xxx:workspace',
+     *   viewClass: MyEditorView,
+     *   placement: { type: 'workspace' },
+     * });
+     */
+    registerView(config: RegisterViewConfig): void;
+    /**
+     * 注销一个已注册的 View。
+     * 若该 View 通过 `RegisterViewConfig` 注册，同时自动清理对应的次级注册。
+     */
+    unregisterView(viewType: string): void;
+}
+/**
+ * 设置面板 Tab 注册配置
+ */
+export interface SettingsTabConfig {
+    /** Tab 唯一标识，如 'npx-tools:management' */
+    id: string;
+    /** Tab 显示标签 */
+    label: string;
+    /** Tab 图标（可选 SVG 字符串） */
+    icon?: string;
+    /** 已注册的视图类型标识（需先通过 workspace.registerView 注册） */
+    viewType: string;
+    /** 排序权重，数字越小越靠前，默认 100 */
+    order?: number;
+    /** 插件 ID，用于获取插件实例（提供 SDK） */
+    pluginId?: string;
+}
+/**
+ * 设置面板 Section 注册配置
+ *
+ * 与 SettingsTab 不同，Section 注入到已有 Tab 的内部（如「AI Agent」Tab 底部），
+ * 而非作为独立的一级 Tab。
+ *
+ * @example plugin.json
+ * "contributes": {
+ *   "settingsSections": [{
+ *     "id": "agent-scanner:status",
+ *     "targetTab": "agent",
+ *     "label": "Agent 检测状态",
+ *     "viewClassName": "AgentSettingsView",
+ *     "order": 200
+ *   }]
+ * }
+ */
+export interface SettingsSectionConfig {
+    /** Section 唯一标识 */
+    id: string;
+    /** 目标 Tab ID，如 "agent" / "general" / "system" */
+    targetTab: string;
+    /** Section 显示标签（可选，用于折叠标题） */
+    label?: string;
+    /** View 类名（插件模块中导出的类名） */
+    viewClassName: string;
+    /** 排序权重，数字越小越靠前，默认 100 */
+    order?: number;
+    /** 所属插件 ID */
+    pluginId: string;
+}
+/**
+ * 设置面板 API
+ * 允许插件将自定义管理面板注册到宿主设置页面的**一级 Tab** 入口。
+ */
+export interface SettingsAPI {
+    /**
+     * 注册设置面板 Tab
+     * @param config Tab 配置
+     * @example
+     * sdk.settings.registerTab({
+     *   id: 'npx-tools:management',
+     *   label: '工具与 Skills',
+     *   viewType: 'com.berrytrace.plugin.npx-tools:settings',
+     *   pluginId: 'com.berrytrace.plugin.npx-tools',
+     *   order: 90,
+     * });
+     */
+    registerTab(config: SettingsTabConfig): void;
+    /**
+     * 取消注册设置面板 Tab
+     * @param id Tab 唯一标识
+     */
+    unregisterTab(id: string): void;
+    /**
+     * 获取所有已注册的 Tab 列表
+     */
+    getRegisteredTabs(): SettingsTabConfig[];
+    /**
+     * 声明式注册 Section（注入到已有 Tab 内部，如「AI Agent」Tab 底部）
+     * 由 PluginRegistry 根据 plugin.json contributes.settingsSections 自动调用
+     * @param config Section 配置
+     */
+    registerSection(config: SettingsSectionConfig): void;
+    /**
+     * 取消注册 Section
+     * @param id Section 唯一标识
+     */
+    unregisterSection(id: string): void;
+    /**
+     * 获取指定 Tab 下的所有注册 Section
+     * @param tabId 目标 Tab ID，如 "agent"
+     */
+    getSectionsForTab(tabId: string): SettingsSectionConfig[];
+}
+/**
+ * Lifecycle API
+ */
+export interface LifecycleAPI {
+    /**
+     * 插件自检后主动请求从进程池卸载，释放内存。
+     * 适用于：启动时加载 → 检查状态 → 发现无需运行 → 主动退出。
+     * 池化插件调用此方法后，Host 会执行 deactivate() 并从池中移除。
+     */
+    requestUnload(): Promise<void>;
+    /**
+     * 声明当前插件进程处于“忙碌”或“空闲”状态。
+     * 忙碌状态下的插件一律豁免空闲自动卸载机制，用于保障长任务及交互流程不被误杀。
+     */
+    setBusy(busy: boolean, reason?: string): Promise<void>;
+}
+/**
+ * ai Namespace API (Generated)
+ */
+export interface GeneratedAIApi {
+    /**
+       * 取消指定会话的 Agent 任务。
+       * @param sessionId runAgentTask 返回的 sessionId
+       */
+    cancelAgentTask(sessionId: string): Promise<null>;
+    /**
+       * 调用 AI 聊天（非流式）。自动路由到 Agent 内核插件。
+       * @param options messages — 消息数组，sessionId — 会话 ID（可选）
+       * @example
+       * await callApi("ai", "chat", [{ messages: [{ role: "user", content: "你好" }] }]);
+       */
+    chat(options: {
+        messages?: {
+            role: 'system' | 'user' | 'assistant';
+            content: string;
+        }[];
+        sessionId?: string;
+        [key: string]: unknown;
+    }): Promise<unknown>;
+    /**
+       * 调用 AI 聊天（流式）。通过 onChunk 回调接收增量文本。
+       * @param options messages — 消息数组，sessionId — 会话 ID（可选）
+       * @example
+       * await callApi("ai", "chatStream", [{ messages: [{ role: "user", content: "写一首诗" }] }]);
+       */
+    chatStream(options: {
+        messages?: {
+            role: 'system' | 'user' | 'assistant';
+            content: string;
+        }[];
+        sessionId?: string;
+        [key: string]: unknown;
+    }): Promise<unknown>;
+    /**
+       * 查询 Agent 内核状态。
+       * @returns { isRunning, pluginId, activeSessions }
+       */
+    getAgentKernelStatus(): Promise<unknown>;
+    /**
+       * 获取所有已注册的 AI 服务商及其模型列表。
+       */
+    getAiServers(): Promise<unknown>;
+    /**
+       * 获取按能力分配的服务商与模型映射（供 cline-agent 等插件读取当前 capability→{serverId, model} 配置）
+       */
+    getCapabilityModels(): Promise<unknown>;
+    getServerLlmConfig(options: string | {
+        serverId: string;
+    }): Promise<unknown>;
+    /**
+       * 获取渲染进程中的 Voice Settings
+       */
+    getVoiceSettings(): Promise<unknown>;
+    /**
+       * 启动 AI Agent 任务。自动获取 LLM 配置，找到可用的 Agent 内核插件，发送任务到后台进程异步执行。
+       * @param options sessionId — 会话 ID（可选），task — 任务描述，history — 历史对话，workDir — 工作目录，activeDocument — 当前文档信息，llmConfig — LLM 配置（可选），maxSteps — 最大步数，systemPrompt — 系统提示词，skipDefaultSystemPrompt — 跳过默认提示词
+       * @returns { sessionId, kernelPluginId, accepted: true }
+       * @example
+       * await callApi("ai", "runAgentTask", [{ task: "找出项目中所有未使用的 import", workDir: "/path/to/project", maxSteps: 20 }]);
+       */
+    runAgentTask(options: {
+        sessionId?: string;
+        task: string;
+        history?: Array<{
+            role: 'user' | 'assistant';
+            content: string;
+        }>;
+        workDir?: string;
+        activeDocument?: {
+            tabId: string;
+            title: string;
+            path?: string;
+            extension?: string;
+            pluginId?: string;
+            isUntitled?: boolean;
+        };
+        llmConfig?: {
+            provider: 'aliyun' | 'ollama' | 'berrytrace' | 'custom';
+            model: string;
+            apiKey?: string;
+            baseUrl?: string;
+        };
+        maxSteps?: number;
+        systemPrompt?: string;
+        skipDefaultSystemPrompt?: boolean;
+    }): Promise<unknown>;
+}
+/**
+ * articles Namespace API (Generated)
+ */
+export interface GeneratedArticlesAPI {
+    /**
+       * 读取文章内容。
+       * @param articleId 文章 ID
+       */
+    get(articleId: string): Promise<unknown>;
+    /**
+       * 更新文章标题和内容。
+       * @param articleId 文章 ID
+       * @param title 新标题
+       * @param content 新内容
+       */
+    update(articleId: string, title: string, content: string): Promise<null>;
+}
+/**
+ * context Namespace API (Generated)
+ */
+export interface GeneratedContextAPI {
+    /**
+       * 获取当前活动应用信息。
+       * @returns { name, title, path, pid }
+       */
+    getActiveApp(): Promise<unknown>;
+    /**
+       * 获取当前选中文本及来源应用。
+       * @returns { text, appSource } 或 null
+       */
+    getSelection(): Promise<unknown>;
+}
+/**
+ * dialog Namespace API (Generated)
+ */
+export interface GeneratedDialogAPI {
+    /**
+       * 打开原生文件/目录选择对话框。
+       * @param options Electron OpenDialogOptions
+       * @example
+       * await callApi("dialog", "showOpenDialog", [{ properties: ["openFile", "multiSelections"] }]);
+       */
+    showOpenDialog(options: OpenDialogOptions): Promise<unknown>;
+    /**
+       * 打开原生文件保存对话框。
+       * @param options Electron SaveDialogOptions
+       * @returns { filePath, canceled }
+       * @example
+       * await callApi("dialog", "showSaveDialog", [{ defaultPath: "/path/to/file.md" }]);
+       */
+    showSaveDialog(options: SaveDialogOptions): Promise<unknown>;
+}
+/**
+ * filesystem Namespace API (Generated)
+ */
+export interface GeneratedFileSystemAPI {
+    /**
+       * 递归复制目录。
+       * @param srcPath 源目录路径
+       * @param dstPath 目标目录路径
+       */
+    copyDir(srcPath: string, dstPath: string): Promise<null>;
+    /**
+       * 删除文件。
+       * @param path 文件路径
+       */
+    deleteFile(path: string): Promise<null>;
+    /**
+       * 下载文件到本地。自动创建目标目录。
+       * @param url 下载 URL
+       * @param destPath 目标文件路径
+       */
+    downloadFile(url: string, destPath: string): Promise<null>;
+    /**
+       * 解压 zip 文件到目标目录。内置 Zip Slip 安全检查。
+       * @param zipPath zip 文件路径
+       * @param destDir 目标目录
+       * @param overwrite 是否覆盖已有文件，默认 true
+       */
+    extractZip(zipPath: string, destDir: string, overwrite?: boolean): Promise<null>;
+    /**
+       * 获取指定文件/程序的原生 OS 图标（Base64 PNG data URL）。
+       */
+    getFileIcon(filePath: string): Promise<string>;
+    /**
+       * 获取系统安全路径。仅允许 userData / documents / desktop / temp。
+       * @param name 路径名：'userData' | 'documents' | 'desktop' | 'temp'
+       */
+    getSafePath(name: string): Promise<string>;
+    /**
+       * 计算文件的哈希值。
+       * @param filePath 文件路径
+       * @param algorithm 哈希算法，默认 'sha256'
+       * @returns 十六进制哈希字符串
+       */
+    hashFile(filePath: string, algorithm?: string): Promise<string>;
+    /**
+       * 递归创建目录。
+       * @param path 目录路径
+       */
+    mkdir(path: string): Promise<null>;
+    /**
+       * 按需切片读取文件。只读取指定 offset 和 length 范围的 Buffer，绝不全量装载超大文件。
+       */
+    readChunk(filePath: string, offset: any, length: any, encoding: any): Promise<string>;
+    /**
+       * 列出目录下的文件和子目录。
+       * @param path 目录路径
+       * @returns 文件/目录列表，每项包含 name、isDirectory、isFile
+       */
+    readDir(path: string): Promise<Array<{
+        name: string;
+        isDirectory: boolean;
+        isFile: boolean;
+    }>>;
+    /**
+       * 读取文件内容。
+       * @param path 文件路径
+       * @param encoding 编码，默认 'utf-8'，可选 'base64'
+       */
+    readFile(path: string, encoding?: string): Promise<string>;
+    /**
+       * 递归删除目录。
+       * @param dirPath 目录路径
+       */
+    removeDir(dirPath: string): Promise<null>;
+    /**
+       * 重命名/移动文件。
+       * @param oldPath 原路径
+       * @param newPath 新路径
+       */
+    renameFile(oldPath: string, newPath: string): Promise<null>;
+    /**
+       * 在系统文件管理器中显示文件。
+       * @param path 文件路径
+       */
+    showItemInFolder(path: string): Promise<null>;
+    /**
+       * 获取文件或目录的元信息。
+       * @param path 路径
+       * @returns isFile、isDirectory、size（字节）、mtimeMs（修改时间毫秒戳）
+       */
+    stat(path: string): Promise<{
+        isFile: boolean;
+        isDirectory: boolean;
+        size: number;
+        mtimeMs: number;
+    }>;
+    /**
+       * 写入文件内容（覆盖已有文件）。
+       * @param path 文件路径
+       * @param content 文件内容（字符串或 Buffer）
+       */
+    writeFile(path: string, content: string | Buffer): Promise<null>;
+}
+/**
+ * local-ai Namespace API (Generated)
+ */
+export interface GeneratedLocalAiAPI {
+    /**
+       * 获取文本嵌入向量（与 getEmbedding 相同）。
+       * @param text 文本
+       */
+    embedding(text: string): Promise<unknown>;
+    /**
+       * 返回宿主 app 目录（用于插件定位 node_modules/@huggingface/transformers）。
+       * 插件通过此路径使用 file:// URL 动态 import transformers，
+       * 绕过 Electron 主进程的原生模块限制（在独立系统 Node.js 进程中加载）。
+       */
+    getAppPath(): Promise<string>;
+    /**
+       * 获取文本嵌入向量。
+       * @param text 文本
+       */
+    getEmbedding(text: string): Promise<unknown>;
+    /**
+       * 返回宿主模型存储目录，提供给插件获取下载/扫描本地模型的根路径。
+       */
+    getModelDir(): Promise<string>;
+    /**
+       * 对所有 Skill 建立 FTS5 全文索引。
+       */
+    indexAllSkills(): Promise<boolean>;
+    /**
+       * 索引工具库到全文搜索引擎。
+       * 注意：此方法立即返回 true，实际的索引工作（含向量 embedding 生成）在后台异步执行，
+       * 避免阻塞渲染进程的插件 onload 流程（embedding 生成可能需要数十秒）。
+       * @param tools 工具数组
+       */
+    indexToolsLibrary(tools: any[]): Promise<boolean>;
+    /**
+       * @deprecated 已废弃：LLM 推理已移至插件自身 spawn 的 llm-server.mjs 子进程。
+       * 保留仅为兼容旧版插件。
+       */
+    llmGenerate(opts: {
+        prompt: string;
+        modelDir?: string;
+        maxNewTokens?: number;
+        temperature?: number;
+    }): Promise<{
+        text: string;
+    }>;
+    /**
+       * @deprecated 已废弃：LLM 推理已移至插件自身 spawn 的 llm-server.mjs 子进程。
+       * 保留仅为兼容旧版插件。
+       */
+    llmLoad(opts: {
+        modelDir: string;
+    }): Promise<{
+        ok: boolean;
+        error?: string;
+    }>;
+    /**
+       * 对图片执行 OCR 文字识别（与 runOCR 相同）。
+       * @param imagePath 图片路径
+       */
+    ocr(imagePath: string): Promise<unknown>;
+    /**
+       * 全量重建所有索引（Tools + Skills + Files 的 FTS5 全文索引 + 向量索引）。
+       * 此操作可能耗时较长，在后台异步执行。调用方不需要等待结果。
+       */
+    rebuildAllIndices(): Promise<boolean>;
+    /**
+       * 对图片执行 OCR 文字识别。
+       * @param imagePath 图片路径
+       */
+    runOCR(imagePath: string): Promise<unknown>;
+    /**
+       * 搜索 Agent 能力（混合检索：FTS5 全文 + 向量 RRF 融合）。
+       * @param query 搜索查询
+       */
+    searchAgentCapabilities(query: string): Promise<unknown>;
+    /**
+       * 查询本地 AI 服务状态。
+       * @returns { modelId, embeddingDimension }
+       */
+    status(): Promise<unknown>;
+}
+/**
+ * log Namespace API (Generated)
+ */
+export interface GeneratedLogAPI {
+    /**
+       * 记录 debug 级别日志（仅开发模式可见）。
+       * @param message 日志消息
+       */
+    debug(message: string): Promise<null>;
+    /**
+       * 记录 error 级别日志。
+       * @param message 日志消息
+       */
+    error(message: string): Promise<null>;
+    /**
+       * 记录 info 级别日志，输出到宿主应用统一日志系统。
+       * @param message 日志消息
+       * @example
+       * await callApi("log", "info", ["插件已启动"]);
+       */
+    info(message: string): Promise<null>;
+    /**
+       * 记录 warn 级别日志。
+       * @param message 日志消息
+       */
+    warn(message: string): Promise<null>;
+}
+/**
+ * mcp Namespace API (Generated)
+ */
+export interface GeneratedMcpAPI {
+    /**
+       * 调用指定的 MCP 工具。
+       * @param toolName 工具名
+       * @param toolArgs 工具参数
+       * @returns { content: [{ type, text }] }，失败时返回 { isError: true, content: [...] }
+       * @example
+       * await callApi("mcp", "callTool", [{ toolName: "search_tool", toolArgs: { query: "ffmpeg" } }]);
+       */
+    callTool(toolName: string, toolArgs: Record<string, unknown>): Promise<unknown>;
+    deleteProfile(id: string): Promise<boolean>;
+    listProfiles(): Promise<unknown[]>;
+    /**
+       * 列出所有已注册的系统提示词。
+       */
+    listSystemPrompts(): Promise<unknown>;
+    /**
+       * 列出所有已注册的 MCP 工具。
+       */
+    listTools(): Promise<unknown>;
+    listTools(): Promise<unknown[]>;
+    /**
+       * 动态注册 MCP 工具（运行时注册，非 plugin.json 声明）。
+       * @param callerPluginId 调用插件 ID
+       * @param toolSpec { name, description, inputSchema }
+       */
+    registerDynamicTool(callerPluginId: string, toolSpec: {
+        name: string;
+        description: string;
+        inputSchema: Record<string, unknown>;
+    }): Promise<null>;
+    /**
+       * 注册系统提示词（注入到 AI Agent 的 system prompt 中）。
+       * @param callerPluginId 调用插件 ID
+       * @param options { promptId, promptText }
+       */
+    registerSystemPrompt(callerPluginId: string, options: {
+        promptId: string;
+        promptText: string;
+    }): Promise<null>;
+    saveProfile(profile: any): Promise<unknown>;
+    /**
+       * 注销动态 MCP 工具。
+       * @param callerPluginId 调用插件 ID
+       * @param toolName 工具名
+       */
+    unregisterDynamicTool(callerPluginId: string, toolName: string): Promise<null>;
+    /**
+       * 注销系统提示词。
+       * @param callerPluginId 调用插件 ID
+       * @param promptId 提示词 ID
+       */
+    unregisterSystemPrompt(callerPluginId: string, promptId: string): Promise<null>;
+    updateScopeToken(params: {
+        token: string;
+        allowedTools?: string[];
+        allowedPlugins?: string[];
+    }): Promise<boolean>;
+}
+/**
+ * plugin Namespace API (Generated)
+ */
+export interface GeneratedPluginInfoAPI {
+    /**
+       * 获取当前插件元信息。
+       * @returns { id, name, version, path }
+       */
+    getInfo(): Promise<unknown>;
+    /**
+       * 获取当前插件生命周期上下文。
+       */
+    getLifecycleContext(): Promise<unknown>;
+}
+/**
+ * publish Namespace API (Generated)
+ */
+export interface GeneratedPublishAPI {
+    /**
+       * 添加或更新本地分享记录。
+       * @param args filePath — 文件路径，workspacePath — 工作区路径，record — 分享记录
+       */
+    addOrUpdateShare(args: {
+        filePath: string;
+        workspacePath: string;
+        record: Record<string, unknown>;
+    }): Promise<any>;
+    /**
+       * 创建分享链接。需先登录。
+       * @param args title — 标题，content — 内容（Markdown），expire — 过期时间（1h/1d/7d/30d），password — 密码（可选），perm_mode — 权限模式（可选），content_json — Tiptap JSON（可选），is_nsfw — 敏感内容标记（可选）
+       * @returns { share_id, url, expire_at, collab_url?, perm_mode?, share_url? }
+       */
+    createShare(args: CreateShareArgs): Promise<CreateShareData>;
+    /**
+       * 删除分享链接。
+       * @param args share_id — 分享 ID
+       */
+    deleteShare(args: DeleteShareArgs): Promise<{
+        success: boolean;
+    }>;
+    /**
+       * 根据文件路径获取本地分享记录。
+       * @param args filePath — 文件路径，workspacePath — 工作区路径
+       */
+    getShareByPath(args: {
+        filePath: string;
+        workspacePath: string;
+    }): Promise<any>;
+    /**
+       * 列出当前用户所有分享。
+       * @returns { shares: [{ share_id, title, url, created_at, expire_at, views }], total }
+       */
+    listShares(_args: unknown): Promise<ListShareData>;
+    /**
+       * 删除本地分享记录。
+       * @param args filePath — 文件路径，workspacePath — 工作区路径
+       */
+    removeShare(args: {
+        filePath: string;
+        workspacePath: string;
+    }): Promise<any>;
+    /**
+       * 更新分享链接内容。
+       * @param args share_id — 分享 ID，content — 新内容，title — 新标题（可选），expire — 过期时间（可选），perm_mode — 权限模式（可选），content_json — Tiptap JSON（可选）
+       */
+    updateShare(args: UpdateShareArgs): Promise<CreateShareData>;
+}
+/**
+ * scheduler Namespace API (Generated)
+ */
+export interface GeneratedSchedulerAPI {
+    /**
+       * 列出当前插件所有定时任务。
+       */
+    list(): Promise<unknown[]>;
+    /**
+       * 注册定时任务（cron 或 interval）。必须在后台进程注册。
+       * @param options id — 任务 ID，cron — cron 表达式，intervalMs — 间隔毫秒，command — 执行命令（可选），args — 命令参数（可选）
+       * @example
+       * await callApi("scheduler", "register", [{ id: "daily-sync", cron: "0 9 * * *" }]);
+       */
+    register(options: {
+        id: string;
+        cron?: string;
+        intervalMs?: number;
+        command?: string;
+        args?: string[];
+        cwd?: string;
+    }): Promise<null>;
+    /**
+       * 注销定时任务。
+       * @param id 任务 ID
+       */
+    unregister(id: string): Promise<null>;
+}
+/**
+ * search Namespace API (Generated)
+ */
+export interface GeneratedSearchAPI {
+    /**
+       * 全文搜索工作区文件。
+       * @param query 搜索词
+       * @param workspacePath 工作区路径
+       * @returns [{ filePath, fileName, snippet, lineNumber, rank }]
+       */
+    searchFiles(query: string, workspacePath: string): Promise<unknown>;
+    /**
+       * 全文搜索笔记。
+       * @param query 搜索词
+       * @param calendarUuid 日历 UUID
+       */
+    searchNotes(query: string, calendarUuid: number): Promise<unknown>;
+}
+/**
+ * selectionMenu Namespace API (Generated)
+ */
+export interface GeneratedSelectionMenuAPI {
+    /**
+       * 注册划词菜单项。
+       * @param item 菜单项定义（id, label, icon, onClick 等）
+       */
+    registerItem(item: SelectionMenuItem): Promise<null>;
+    /**
+       * 注销划词菜单项。
+       * @param id 菜单项 ID
+       */
+    unregisterItem(id: string): Promise<null>;
+}
+/**
+ * storage Namespace API (Generated)
+ */
+export interface GeneratedStorageAPI {
+    db: {
+        /**
+           * 执行 SQL 语句。SELECT / PRAGMA 返回查询结果数组，其他语句返回 lastInsertRowid 和 changes。
+           * @param sql SQL 语句
+           * @param params 参数化查询的参数数组
+           */
+        execute(sql: string, params: unknown[]): Promise<unknown>;
+        /**
+           * 执行 SQL 语句（别名，与 execute 行为一致）。
+           * @param sql SQL 语句
+           * @param params 参数化查询的参数数组
+           */
+        run(sql: string, params: unknown[]): Promise<unknown>;
+    };
+    kv: {
+        /**
+           * 清空当前插件所有键值对数据。
+           */
+        clear(): Promise<null>;
+        /**
+           * 删除指定键值对。
+           * @param key 键名
+           */
+        delete(key: string): Promise<null>;
+        /**
+           * 读取键值对数据。
+           * @param key 键名
+           * @param defaultValue 键不存在时返回的默认值
+           */
+        get(key: string, defaultValue: unknown): Promise<unknown>;
+        /**
+           * 写入键值对数据，会覆盖已有值。
+           * @param key 键名
+           * @param value 值（任意 JSON 可序列化类型）
+           */
+        set(key: string, value: unknown): Promise<null>;
+    };
+}
+/**
+ * system Namespace API (Generated)
+ */
+export interface GeneratedSystemAPI {
+    /**
+       * 截取指定 ID 窗口的屏幕缓冲。支持局部裁剪与图像压缩质量设置。
+       */
+    captureWindow(options: {
+        windowId: number;
+        quality?: 'low' | 'medium' | 'high';
+        crop?: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+        };
+    }): Promise<string>;
+    /**
+       * 向系统剪贴板写入文本。
+       * @param text 文本内容
+       */
+    clipboardWriteText(text: string): Promise<null>;
+    /**
+       * 强制关闭指定令牌的捕获窗口。
+       * @param token 捕获令牌
+       */
+    closeCaptureWindow(token: string): Promise<boolean>;
+    /**
+       * 在桌面创建插件快捷方式（Windows .lnk / macOS .webloc / Linux .desktop）。
+       * @param options name — 名称，icon — 图标路径（可选），description — 描述（可选）
+       * @returns 创建成功返回 true
+       * @example
+       * await callApi("system", "createDesktopShortcut", [{ name: "我的插件" }]);
+       */
+    createDesktopShortcut(options: {
+        name: string;
+        icon?: string;
+        description?: string;
+    }): Promise<boolean>;
+    /**
+       * 执行系统命令。支持 shell 命令、超时控制、流式输出、sudo 提权。
+       * @param options command — 命令字符串，args — 参数数组，cwd — 工作目录，timeoutMs — 超时毫秒，streamEventName — 流事件名，sessionId — 会话 ID，sudo — 是否提权
+       * @returns code — 退出码，stdout — 标准输出，stderr — 标准错误，signal — 终止信号
+       * @example
+       * await callApi('system', 'execCommand', [{ command: 'ls', args: ['-la'], cwd: '/tmp', timeoutMs: 10000 }]);
+       */
+    execCommand(options: ExecCommandOptions): Promise<ExecCommandResult>;
+    /**
+       * 获取宿主应用的 OEM 基础信息（如软件名称）
+       */
+    getAppInfo(): Promise<{
+        appName: string;
+        oemId: string;
+        apiGateway: string;
+        logoPath?: string;
+        browserPolicy?: Record<string, unknown>;
+    }>;
+    /**
+       * 获取可用于屏幕捕获的源列表（屏幕/窗口）。
+       * @param options types — 捕获类型：'screen' 或 'window'
+       * @returns 源列表，每项包含 id 和 name
+       */
+    getDesktopCapturerSources(options: {
+        types: Array<'screen' | 'window'>;
+    }): Promise<Array<{
+        id: string;
+        name: string;
+    }>>;
+    /**
+       * 获取当前系统的屏幕布局信息。
+       */
+    getDisplays(): Promise<Array<{
+        id: number;
+        bounds: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+        };
+        scaleFactor: number;
+        isPrimary: boolean;
+    }>>;
+    /**
+       * 获取当前系统焦点元素的输入信息（选中文本、输入值、角色）。
+       * @returns selection — 选中文本，value — 输入值，role — AX 角色
+       * @example
+       * await callApi('system', 'getFocusedInputInfo', []);
+       */
+    getFocusedInputInfo(): Promise<{
+        selection: string;
+        value: string;
+        role: string;
+    }>;
+    /**
+       * 自动读取解析用户主目录 ~/.ssh/config 配置文件与密钥列表
+       */
+    getSSHConfigProfiles(_options: unknown): Promise<{
+        profiles: SSHHostProfile[];
+        keys: string[];
+        configExists: boolean;
+    }>;
+    /**
+       * 获取所有当前已启用插件声明的子代理（SubAgent）规格列表。
+       */
+    getSubagentsList(): Promise<unknown[]>;
+    /**
+       * 获取当前系统主题。
+       * @returns 返回 'dark' 或 'light'
+       */
+    getTheme(): Promise<string>;
+    /**
+       * 向当前焦点输入框插入文本。自动检测输入区域类型，按优先级尝试：
+       * 1. IPC 直发（同应用窗口）2. 模拟键盘输入 3. Accessibility API 注入 4. 剪贴板粘贴。
+       * 插入前会自动恢复之前缓存的活动应用焦点。失败时将文本写入剪贴板作为安全备份。
+       * @param options text — 要插入的文本
+       * @returns 是否插入成功
+       * @example
+       * await callApi('system', 'insertText', [{ text: 'Hello World' }]);
+       */
+    insertText(options: {
+        text: string;
+    }): Promise<boolean>;
+    /**
+       * 检测当前系统焦点元素是否处于可编辑的输入区域。
+       * 业务层可在触发 AI 填充前调用此接口，如果返回 isInput=false
+       * 则提示用户将光标移入输入框后再执行。
+       *
+       * 返回值：
+       *   isInput    — 是否为任何可输入区域（含 contenteditable）
+       *   isEditable — 是否明确可编辑（AXEditable=true 或 native role）
+       *   role       — AX Role 字符串，如 "AXTextField" / "AXWebArea"
+       */
+    isFocusedInInputArea(): Promise<{
+        isInput: boolean;
+        isEditable: boolean;
+        role: string;
+    }>;
+    /**
+       * 终止指定 Session 会话下的所有运行中子进程（终端、脚本）
+       */
+    killSessionProcesses(sessionId: string): Promise<boolean>;
+    /**
+       * 启动一个应用程序（如果已运行则将其激活置前）。
+       * appName: 应用名称（如 "微信"、"WeChat"、"Google Chrome"）或 bundle ID（如 "com.tencent.xinWeChat"）。
+       * waitMs: 启动后等待的毫秒数（默认 1500ms，给应用加载时间）。
+       */
+    launchApp(options: {
+        appName: string;
+        waitMs?: number;
+    }): Promise<{
+        launched: boolean;
+        windowCount: number;
+    }>;
+    /**
+       * 列出所有已注册的快捷动作。
+       */
+    listShortcutActions(): Promise<Array<{
+        id: string;
+        label: string;
+        icon: string;
+        pluginId: string;
+    }>>;
+    /**
+       * 列出当前系统的所有打开窗口。
+       */
+    listWindows(): Promise<Array<{
+        id: number;
+        title: string;
+        appName: string;
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        isMinimized: boolean;
+    }>>;
+    /**
+       * 打开捕获窗口用于网页截屏/数据抓取。headless=true 时不可见，等待页面加载后返回。
+       * @param url 要加载的 URL
+       * @param token 捕获令牌（用于后续 triggerCapture / closeCaptureWindow）
+       * @param headless 是否无头模式，默认 false
+       */
+    openCaptureWindow(url: string, token: string, headless?: boolean): Promise<boolean>;
+    /**
+       * 在系统默认浏览器中打开 URL。
+       * @param targetUrl 目标 URL
+       * @example
+       * await callApi('system', 'openExternal', ['https://example.com']);
+       */
+    openExternal(targetUrl: string): Promise<null>;
+    /**
+       * 打开 URL。internal=true 时在应用内嵌浏览器打开，否则在系统浏览器打开。
+       * @param targetUrl 目标 URL
+       * @param options internal — 是否内嵌打开，width/height — 内嵌窗口尺寸，alwaysOnTop — 是否置顶
+       * @example
+       * await callApi('system', 'openUrl', [{ targetUrl: 'https://example.com', internal: true, width: 1024, height: 768 }]);
+       */
+    openUrl(targetUrl: string, options?: {
+        internal?: boolean;
+        width?: number;
+        height?: number;
+        alwaysOnTop?: boolean;
+    }): Promise<null>;
+    /**
+       * Stub implementation of queryElementBounds to prevent plugin calls from crashing.
+       * Currently returns null so client plugins fall back to visual matching naturally.
+       */
+    queryElementBounds(selector: string): Promise<null>;
+    /**
+       * Stub implementation of querySelectorAtCoordinate to prevent plugin calls from crashing.
+       * Currently returns null so client plugins fall back to visual matching naturally.
+       */
+    querySelectorAtCoordinate(options: {
+        x: number;
+        y: number;
+    }): Promise<null>;
+    /**
+       * 注册全局快捷键，按下时自动执行指定的 commandId。
+       * @param accelerator 快捷键（如 "CmdOrCtrl+Shift+K"）
+       * @param commandId 触发时执行的命令 ID
+       * @returns 注册成功返回 true
+       */
+    registerGlobalShortcut(accelerator: string, commandId: string): Promise<boolean>;
+    /**
+       * 注册快捷动作（显示在快捷键列表 UI 中）。必须在后台进程注册。
+       * @param options id — 唯一 ID，label — 显示名称，icon — 图标（可选）
+       */
+    registerShortcutAction(options: {
+        id: string;
+        label: string;
+        icon?: string;
+    }): Promise<void>;
+    /**
+       * 提前终止指定会话的 execCommand，不等进程退出即返回已有输出。
+       * @param options sessionId — execCommand 时传入的会话 ID
+       * @example
+       * await callApi('system', 'resolveCommandEarly', [{ sessionId: 'my-session' }]);
+       */
+    resolveCommandEarly(options: {
+        sessionId: string;
+    }): Promise<boolean>;
+    /**
+       * 解析内置 npm CLI 路径，用于插件中的 npm 操作。
+       * @returns { npmCli, npxCli } 或 null
+       */
+    resolveNpmCli(): Promise<unknown>;
+    /**
+       * 设置窗口鼠标事件穿透（用于桌面特效等场景）。
+       * @param ignore 是否忽略鼠标事件
+       * @param options forward — 是否将事件转发到下层窗口
+       */
+    setIgnoreMouseEvents(ignore: boolean, options: {
+        forward: boolean;
+    } | undefined): Promise<null>;
+    /**
+       * 设置插件的系统托盘菜单。首次调用自动创建托盘图标。
+       * @param menuTemplate 菜单项数组，每项包含 label、type（normal/separator/checkbox）、clickCommand
+       * @example
+       * await callApi("system", "setTrayMenu", [{ menuTemplate: [{ label: "打开", clickCommand: "open" }] }]);
+       */
+    setTrayMenu(menuTemplate: Array<{
+        label: string;
+        type?: 'normal' | 'separator' | 'checkbox';
+        checked?: boolean;
+        clickCommand: string;
+    }>): Promise<boolean>;
+    /**
+       * 发送系统原生通知。点击通知会恢复并聚焦主窗口。
+       * @param options title — 通知标题，body — 通知正文，silent — 是否静默（默认 false）
+       * @example
+       * await callApi('system', 'showNotification', [{ title: '任务完成', body: '构建成功' }]);
+       */
+    showNotification(options: {
+        title: string;
+        body: string;
+        silent?: boolean;
+    }): Promise<null>;
+    /**
+       * 模拟鼠标移动并点击指定物理屏幕坐标。
+       */
+    simulateClick(options: {
+        x: number;
+        y: number;
+        button: 'left' | 'right' | 'middle';
+        doubleClick?: boolean;
+    }): Promise<boolean>;
+    /**
+       * 模拟鼠标拖拽（从起点拖拽到终点，常用于滑块验证码）。
+       */
+    simulateDrag(options: {
+        startX: number;
+        startY: number;
+        endX: number;
+        endY: number;
+    }): Promise<boolean>;
+    /**
+       * 模拟键盘按键及组合快捷键。
+       */
+    simulateKeyPress(options: {
+        keys: string[];
+    }): Promise<boolean>;
+    /**
+       * 模拟键盘打字输入文本。
+       */
+    simulateType(options: {
+        text: string;
+    }): Promise<boolean>;
+    /**
+       * 切换快速面板（语音助手面板）的显示/隐藏。
+       */
+    toggleQuickPanel(): Promise<null>;
+    /**
+       * 触发捕获窗口截取页面 HTML 并关闭窗口。
+       * @param token 捕获令牌
+       * @returns 页面完整 HTML
+       */
+    triggerCapture(token: string): Promise<string>;
+    /**
+       * 注销全局快捷键。
+       * @param accelerator 快捷键
+       */
+    unregisterGlobalShortcut(accelerator: string): Promise<null>;
+    /**
+       * 注销快捷动作。
+       * @param id 快捷动作 ID
+       */
+    unregisterShortcutAction(id: string): Promise<void>;
+    /**
+       * 等待指定会话的 execCommand 完成，阻塞直到进程退出。
+       * @param options sessionId — execCommand 时传入的会话 ID
+       * @example
+       * await callApi('system', 'waitCommand', [{ sessionId: 'my-session' }]);
+       */
+    waitCommand(options: {
+        sessionId: string;
+    }): Promise<ExecCommandResult>;
+    /**
+       * 向正在运行的 execCommand 进程的 stdin 写入文本。
+       * @param options sessionId — 会话 ID，text — 写入文本
+       * @example
+       * await callApi('system', 'writeStdin', [{ sessionId: 'my-session', text: 'y\\n' }]);
+       */
+    writeStdin(options: {
+        sessionId: string;
+        text: string;
+    }): Promise<boolean>;
+}
+/**
+ * user Namespace API (Generated)
+ */
+export interface GeneratedUserAPI {
+    /**
+       * 查询当前用户会员状态。
+       * @returns { isVip, points }
+       */
+    getMembershipStatus(): Promise<unknown>;
+    getUser(): Promise<{
+        id: string;
+        name: string;
+    } | null>;
+    isLoggedIn(): Promise<boolean>;
+    setLoggedIn(loggedIn: boolean): Promise<void>;
+    setUser(user: {
+        id: string;
+        name: string;
+    }): Promise<void>;
+}
+/**
+ * window Namespace API (Generated)
+ */
+export interface GeneratedWindowAPI {
+    /**
+       * 关闭窗口。不传 floatId 关闭当前窗口，传 floatId 关闭指定浮动窗口。
+       * @param floatId 浮动窗口 ID（从 window_create 获取，可选）
+       */
+    close(floatId?: string): Promise<null>;
+    /**
+       * 创建浮动窗口。支持 url / blob: / file: 协议，自动注入 winId 参数。
+       * @param opts url — 页面 URL，width/height — 尺寸（默认 800x600），alwaysOnTop — 置顶，transparent — 透明，frame — 标题栏，ignoreMouseEvents — 鼠标穿透
+       * @returns 窗口 ID（用于后续 show/hide/close/getState）
+       * @example
+       * const winId = await callApi("window", "create", [{ url: "popup.html", width: 600, height: 400, alwaysOnTop: true }]);
+       */
+    
+
+[... 文件过长，已截断 ...]

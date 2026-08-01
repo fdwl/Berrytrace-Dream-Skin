@@ -1,0 +1,108 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+index 45ab3ee..9be47d6 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+@@ -1,7 +1,7 @@
+ ---
+ name: plugin-creator
+ description: BerryTrace 插件开发指南。创建、修改、调试 BerryTrace 插件，或将现有的 GitHub 代码库、NPM 命令行工具包包装/封装为可供 AI 调用的本地插件与 MCP 工具。
+-last_synced_git: 000633f55d75e7e21f60f31432faa6db6e8ff0c8
++last_synced_git: 73e0e5451d2676e00efe027fa18bb5ccdf6c621d
+ ---
+ 
+ # BerryTrace 插件开发指南
+@@ -64,6 +64,7 @@ UI 注册、命令、菜单、激活条件全部在 `plugin.json` 声明，不
+ | **API 映射** | [api-map.json](./api-map.json) |
+ | **错误码** | [error-map.json](./error-map.json) |
+ | **本地小型 LLM 调试与调用** | [23-local-llm.md](./references/23-local-llm.md) |
++| **🐛 高频奇葩问题 FAQ** | [99-known-tricky-bugs.md](./references/99-known-tricky-bugs.md) |
+ 
+ ---
+ 
+@@ -99,31 +100,75 @@ UI 注册、命令、菜单、激活条件全部在 `plugin.json` 声明，不
+ 8. 事件驱动加载 — `contributes.events.listens` 声明的事件会自动唤醒未运行的插件，注意控制声明范围
+ 9. 事件声明规范 — `listens` 声明监听的事件，`emits` 声明发射的事件，未声明的事件不会推送给该插件
+ 10. OEM 内置插件 — 在 `oem.config.json` 的 `builtinPlugins` 白名单中的插件始终启用，用户无法禁用
+-11. view 构建使用全局 shim — `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand` 从 `window` 全局变量读取，无需 external
++11. view 构建使用全局 shim — `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand`、`lucide-react` 均从 `window` 全局变量读取，无需 external；新增宿主全局变量时需同步更新 `plugins-sdk/cli.js` 的 shim 列表（参见代码注释）
+ 12. 进程隔离 — `required`/`recommended` 独立进程，`optional` 共享池，不做运行时动态切换
++13. View 容器隔离与 createRoot 生命周期 — 编写 `View` 视图子类时，严禁直接对 `this.container` 调用 `createRoot`。必须创建内部 `subContainer = document.createElement('div')` 追加到 `this.container` 后对其调用 `createRoot`，并在 `onClose` 时解绑移除 `subContainer`，防止重载或重复打开时抛出 "passed to createRoot() before" 错误。
++14. **遇到反复出现的 Bug 必须先查 FAQ** — 如果遇到 React warning（如 key、createRoot）、插件不激活、事件丢失、环境 URL 错误等问题，**必须优先查阅 [99-known-tricky-bugs.md](./references/99-known-tricky-bugs.md)**，这些问题已有归档根因和修复方案，禁止重复"盲猜+补丁"。
+ 
+ ---
+ 
+-## 开发工具（MCP Host Tools）
++## 构建、安装与热重载 (SDK CLI & Local Server)
+ 
+-AI 在 BerryTrace 宿主中可调用以下工具完成开发流程：
++在插件开发过程中，**无需依赖宿主 MCP 链接**，也**无需在宿主代码库中运行 npm 命令**。可以直接使用 `berrytrace-sdk` (`berrytrace-cli`) 本地构建，并自动通过宿主的 Local Server HTTP 接口完成实时热重载与解包插件加载。
++
++### 1. 统一构建与自动重载指令 (CLI 零配置)
++
++在插件根目录或指定插件路径下直接运行：
++
++```bash
++# 使用 SDK 自动构建插件，并在构建成功后自动通知宿主 LocalServer 热重载
++npx berrytrace-plugin-sdk build [path] --reload
++
++# 或单独通知宿主进行插件热重载/解包载入
++npx berrytrace-plugin-sdk reload [path|pluginId]
++```
++
++> **工作原理**：
++> 1. `berrytrace-cli build` 使用内置的零配置 esbuild 引擎自动将 `src/` 入口编译为 `dist/`。
++> 2. 构建成功后，CLI 会读取 `~/.berrytrace/local_server.json` 中的访问 Token。
++> 3. 向宿主 LocalServer (`http://127.0.0.1:31828`) 发送 `/reload-plugin?id=<pluginId>` 请求；若插件尚未加载过，则自动发起 `/load-unpacked-plugin?path=<absolutePath>` 请求，实现开箱即用的插件热重载。
++
++### 2. 宿主 MCP 开发辅助工具 (可选/在宿主集成模式下)
++
++若 Agent 已经集成链接在 BerryTrace 宿主内部环境，也可配合调用以下 Host MCP 工具：
+ 
+ | 工具 | 用途 |
+ |------|------|
+-| `plugin_manager_load_unpacked` | 首次加载插件<br>`{ path: "plugins-dev/xxx" }` |
++| `plugin_manager_load_unpacked` | 首次解包加载插件<br>`{ path: "plugins-dev/xxx" }` |
+ | `plugin_manager_reload` | 构建后热重载<br>`{ pluginId: "..." }` |
+-| `plugin_manager_get_logs` | 查看插件日志<br>`{ pluginId: "...", limit: 30 }` |
+-| `plugin_manager_list_tools` | 查看插件注册的 MCP 工具列表<br>`{ pluginId: "..." }` |
+-| `plugin_manager_get_tool` | 查询单个 MCP 工具状态和 schema<br>`{ pluginId: "...", toolName: "..." }` |
+-| `plugin_manager_enable_plugin` | 启用插件<br>`{ pluginId: "..." }` |
+-| `plugin_manager_disable_plugin` | 禁用插件<br>`{ pluginId: "..." }` |
+-| `capability_search` | 搜索 Agent 能力（MCP 工具 + Skill）<br>`{ query: "..." }` |
++| `plugin_manager_get_logs` | 查看插件运行日志<br>`{ pluginId: "...", limit: 30 }` |
+ 
+-**完整开发循环**：
++**标准极简开发循环**：
+ 
+ ```
+-改代码 → npm run build → plugin_manager_reload → plugin_manager_get_logs
++改代码 → npx berrytrace-plugin-sdk build --reload → 宿主实时应用变更
++```
++
++---
++
++## 日志查看与 AI 实时调试通道 (Logging & Diagnostics)
++
++AI Agent 在开发或调试插件时，可通过以下三种途径无缝获取宿主与插件的运行日志：
++
++### 1. SDK CLI 一键获取日志 (推荐 AI 使用)
++
++```bash
++# 获取当前插件或全局宿主最近的 50 条运行日志
++npx berrytrace-plugin-sdk logs [pluginId|path] [--limit 50]
+ ```
++> CLI 会优先请求 LocalServer (`http://127.0.0.1:31828/get-logs`) 获取实时内存日志；若宿主未连接，会自动降级读取本地磁盘 `app.log` 日志文件。
++
++### 2. HTTP LocalServer REST API
++宿主默认在 `http://127.0.0.1:31828` 运行（Token 位于 `~/.berrytrace/local_server.json`）：
++- `GET /get-logs?pluginId=<id>&limit=50`
++- 请求头：`Authorization: Bearer <token>`
++
++### 3. 磁盘物理日志文件路径
++若宿主离线或需要分析全量堆栈历史，AI 可直接读取磁盘日志文件：
++- **开发环境/项目目录**：`<project_root>/logs/app.log`
++- **macOS User Data 目录**：`~/Library/Application Support/berrytrace-dev/logs/app.log` （生产版为 `berrytrace`）
++- **Windows User Data 目录**：`%APPDATA%/berrytrace/logs/app.log`
++- **Linux User Data 目录**：`~/.config/berrytrace/logs/app.log`
+ 
+ ---

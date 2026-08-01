@@ -1,0 +1,298 @@
+/**
+ * Plugin Pool Host Runner
+ *
+ * 运行在共享进程（utilityProcess）内，承载多个 processIsolation:'optional' 插件。
+ * 职责：
+ * 1. 拥有唯一的 parentPort 监听权，按 targetPluginId 路由消息到目标插件的 SDK 实例
+ * 2. 动态 import() 插件模块（插件末尾自调用 activate()，SDK 自动注册到 poolRouter）
+ * 3. 统一发送一份心跳代表整个池（附带所有插件 ID 列表）
+ * 4. 插件 deactivate 时清理其 SDK 回调，避免内存泄漏
+ *
+ * @see docs/plugin-process-isolation-analysis.md 6.2.1 进程池 C 池
+ */
+
+// 本文件被 utilityProcess.fork() 加载，因 package.json type:module 而以 ESM 模式运行。
+// 使用 createRequire 桥接 require() 调用（path/url 模块及 require.cache 清理）。
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+
+const parentPort = process.parentPort;
+const childProcess = process.send ? process : null;
+
+if (!parentPort && !childProcess) {
+  console.error('[PoolHost] No parentPort or process.send — not running in a forked process');
+  process.exit(1);
+}
+
+// ─── 通信抽象 ──────────────────────────────────────────────────────────────
+
+function sendToMain(msg) {
+  if (parentPort) {
+    parentPort.postMessage(msg);
+  } else if (childProcess) {
+    childProcess.send(msg);
+  }
+}
+
+function onMessageFromMain(handler) {
+  if (parentPort) {
+    parentPort.on('message', (event) => {
+      handler({
+        data: event.data,
+        ports: event.ports || []
+      });
+    });
+  } else if (childProcess) {
+    childProcess.on('message', (msg, sendHandle) => {
+      handler({
+        data: msg,
+        ports: sendHandle ? [sendHandle] : []
+      });
+    });
+  }
+}
+
+// ─── 插件注册表 ────────────────────────────────────────────────────────────
+// Map<pluginId, { messageHandlers: Set<handler>, module, deactivated }>
+
+const loadedPlugins = new Map();
+
+// ─── Pool Router（暴露给 SDK 的 createPluginSDK 使用）────────────────────────
+// SDK 检测 globalThis.__pluginPoolRouter 存在时，不直接监听 parentPort，
+// 而是委托给此 router。router 负责按 targetPluginId 路由入站消息。
+
+const poolRouter = {
+  /**
+   * SDK 的 sendToHost 调用此方法发送出站消息。
+   * 消息已附带 sourcePluginId（由 SDK 打标签），直接转发到主进程。
+   */
+  send(msg) {
+    sendToMain(msg);
+  },
+
+  /**
+   * SDK 的 createPluginSDK 调用此方法注册入站消息处理器。
+   * Host Runner 在收到主进程消息时，按 targetPluginId 分发到对应插件的 handler。
+   */
+  register(pluginId, handler) {
+    let entry = loadedPlugins.get(pluginId);
+    if (!entry) {
+      entry = { messageHandlers: new Set(), module: null, deactivated: false, pluginPath: null };
+      loadedPlugins.set(pluginId, entry);
+    }
+    entry.messageHandlers.add(handler);
+    console.debug(`[PoolHost] SDK registered for "${pluginId}" (${entry.messageHandlers.size} handlers)`);
+  },
+};
+
+globalThis.__pluginPoolRouter = poolRouter;
+
+// ─── 主进程消息路由 ─────────────────────────────────────────────────────────
+// 收到主进程消息后，按 targetPluginId 分发到目标插件的所有 handler。
+// 无 targetPluginId 的消息（如池管理指令）由 Host Runner 自身处理。
+
+onMessageFromMain(async (event) => {
+  const msg = event.data;
+  if (!msg) return;
+
+  // ── 诊断：记录消息接收时间戳（用于追踪消息处理延迟）───────────────────
+  const msgReceiveTime = Date.now();
+  // 对 mcp:call-tool 类型消息做专项输出
+  if (msg.type === 'mcp:call-tool') {
+    console.log(`[PoolHost:diag] received mcp:call-tool: tool=${msg.toolName}, token=${msg.token}, target=${msg.targetPluginId}`);
+  }
+  // 对 sdk:callApi:response 类型消息记录摘要（避免日志洪泛）
+  if (msg.type === 'sdk:callApi:response' && msg.token !== undefined) {
+    console.log(`[PoolHost:diag] recv response token=${msg.token} target=${msg.targetPluginId || 'broadcast'} type=${msg.type} success=${msg.success}`);
+  }
+
+  // ── 池管理指令 ─────────────────────────────────────────────────────────
+  if (msg.type === 'pool:load') {
+    await loadPlugin(msg.pluginId, msg.pluginPath, msg.mainFile);
+    return;
+  }
+  if (msg.type === 'pool:unload') {
+    await unloadPlugin(msg.pluginId);
+    return;
+  }
+  if (msg.type === 'pool:ping') {
+    sendToMain({ type: 'pool:pong', pluginIds: Array.from(loadedPlugins.keys()) });
+    return;
+  }
+  // 插件自检后主动请求卸载（如：Snowflake 发现用户未开启飘雪 → 释放内存）
+  if (msg.type === 'pool:request-unload') {
+    const pluginId = msg.pluginId || msg.sourcePluginId;
+    if (pluginId && loadedPlugins.has(pluginId)) {
+      console.log(`[PoolHost] Plugin "${pluginId}" requested self-unload`);
+      await unloadPlugin(pluginId);
+      sendToMain({ type: 'pool:self-unloaded', pluginId });
+    }
+    return;
+  }
+
+  // ── 插件定向消息（有 targetPluginId）──────────────────────────────────
+  if (msg.targetPluginId) {
+    const entry = loadedPlugins.get(msg.targetPluginId);
+    if (entry) {
+      if (msg.type === 'mcp:call-tool') {
+        console.log(`[PoolHost:diag] routing mcp:call-tool to targetPluginId=${msg.targetPluginId} (${entry.messageHandlers.size} handlers registered)`);
+      }
+      for (const handler of entry.messageHandlers) {
+        try {
+          const handlerStart = Date.now();
+          await handler(event);
+          const elapsed = Date.now() - handlerStart;
+          // 诊断：记录 handler 执行时间，超过 1s 发出警告
+          if (elapsed > 1000) {
+            console.warn(`[PoolHost:diag] SLOW handler for "${msg.targetPluginId}" msgType="${msg.type}" elapsed=${elapsed}ms`);
+          }
+        } catch (err) {
+          console.error(`[PoolHost] Handler error for "${msg.targetPluginId}":`, err);
+        }
+      }
+    } else {
+      console.warn(`[PoolHost:diag] No loaded entry for targetPluginId="${msg.targetPluginId}", msgType="${msg.type}"`);
+    }
+    return;
+  }
+
+  // ── 广播消息（无 targetPluginId，如 sdk:events:on）────────────────────
+  // 并行分发给所有已加载插件的 handler，避免一个慢插件阻塞其余插件响应。
+  const broadcastStart = Date.now();
+  const broadcastPromises = [];
+  for (const [pid, entry] of loadedPlugins) {
+    for (const handler of entry.messageHandlers) {
+      broadcastPromises.push(
+        Promise.resolve().then(() => handler(event)).catch(err => {
+          console.error(`[PoolHost] Broadcast handler error for "${pid}":`, err);
+        })
+      );
+    }
+  }
+  await Promise.all(broadcastPromises);
+  const broadcastElapsed = Date.now() - broadcastStart;
+  if (broadcastElapsed > 2000) {
+    console.warn(`[PoolHost:diag] SLOW broadcast processing: msgType="${msg.type}" handlers=${broadcastPromises.length} elapsed=${broadcastElapsed}ms (may have delayed API responses)`);
+  }
+});
+
+// ─── 插件加载/卸载 ──────────────────────────────────────────────────────────
+
+async function loadPlugin(pluginId, pluginPath, mainFile) {
+  if (loadedPlugins.has(pluginId) && loadedPlugins.get(pluginId).module) {
+    console.log(`[PoolHost] Plugin "${pluginId}" already loaded, skipping`);
+    sendToMain({ type: 'pool:loaded', pluginId, success: true, alreadyLoaded: true });
+    return;
+  }
+
+  // 确保注册表条目存在（SDK register 可能先于 loadPlugin 被调用）
+  if (!loadedPlugins.has(pluginId)) {
+    loadedPlugins.set(pluginId, { messageHandlers: new Set(), module: null, deactivated: false, pluginPath: null });
+  }
+  // 记录插件路径，供 unloadPlugin 清理 require.cache 使用（解决原 pluginPath 不在作用域内的 bug）
+  loadedPlugins.get(pluginId).pluginPath = pluginPath;
+
+  const fullPath = require('path').join(pluginPath, mainFile || 'dist/index.js');
+  console.debug(`[PoolHost] Loading plugin "${pluginId}" from ${fullPath}`);
+
+  try {
+    // import() 触发插件模块执行：
+    // 1. createPluginSDK(pluginId) → 检测 __pluginPoolRouter → 委托注册
+    // 2. 末尾 activate().catch(...) → 立即激活
+    const fileUrl = require('url').pathToFileURL(fullPath).href + `?t=${Date.now()}`;
+    const mod = await import(fileUrl);
+    const entry = loadedPlugins.get(pluginId);
+    entry.module = mod;
+    console.debug(`[PoolHost] Plugin "${pluginId}" loaded and activated (${entry.messageHandlers.size} SDK handlers)`);
+    sendToMain({ type: 'pool:loaded', pluginId, success: true });
+  } catch (err) {
+    console.error(`[PoolHost] Failed to load plugin "${pluginId}":`, err);
+    sendToMain({ type: 'pool:loaded', pluginId, success: false, error: err.message || String(err) });
+  }
+}
+
+async function unloadPlugin(pluginId) {
+  const entry = loadedPlugins.get(pluginId);
+  if (!entry) {
+    sendToMain({ type: 'pool:unloaded', pluginId, success: true, notFound: true });
+    return;
+  }
+
+  // 调用插件的 deactivate()
+  try {
+    if (entry.module && typeof entry.module.deactivate === 'function') {
+      await entry.module.deactivate();
+    }
+  } catch (err) {
+    console.error(`[PoolHost] deactivate error for "${pluginId}":`, err);
+  }
+
+  // 清理 SDK 回调
+  entry.messageHandlers.clear();
+  entry.deactivated = true;
+  loadedPlugins.delete(pluginId);
+
+  // 清理 require.cache 中该插件路径下的模块（减少 module cache 污染）
+  // pluginPath 在 loadPlugin 时存入 entry，确保此处可正确匹配插件文件前缀。
+  // 注意：ESM（import()）模块不受 require.cache 管辖，此处仅清理 CJS 模块；
+  // 插件主入口为 ESM 时由 import cache 隔离，无需此清理。
+  const pluginPath = entry.pluginPath;
+  if (pluginPath) {
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(pluginPath)) {
+        delete require.cache[key];
+      }
+    }
+  }
+
+  console.log(`[PoolHost] Plugin "${pluginId}" unloaded`);
+  sendToMain({ type: 'pool:unloaded', pluginId, success: true });
+}
+
+// ─── 统一心跳（代表整个池）──────────────────────────────────────────────────
+// 每 5s 发送一份心跳，附带池内所有插件 ID。
+// 主进程 PluginWatchdog 收到后对每个 pluginId 更新心跳记录（它们共享同一 PID）。
+
+const heartbeatTimer = setInterval(() => {
+  try {
+    const mem = process.memoryUsage();
+    const cpu = process.cpuUsage();
+    const pluginIds = Array.from(loadedPlugins.keys());
+    if (pluginIds.length === 0) return; // 池空时不发心跳
+    const heapLimit = require('v8').getHeapStatistics().heap_size_limit;
+    sendToMain({
+      type: 'sdk:heartbeat',
+      timestamp: Date.now(),
+      poolPluginIds: pluginIds,
+      metrics: {
+        timestamp: Date.now(),
+        heapUsed: mem.heapUsed,
+        heapTotal: mem.heapTotal,
+        heapLimit,
+        cpuUser: cpu.user,
+        cpuSystem: cpu.system,
+      },
+    });
+  } catch (_err) {
+    // 忽略心跳发送失败
+  }
+}, 5000);
+if (heartbeatTimer.unref) heartbeatTimer.unref();
+
+// ─── 未捕获异常处理（防止单插件错误杀死整个池）──────────────────────────────
+process.on('uncaughtException', (err) => {
+  console.error('[PoolHost] Uncaught exception (pool may be unstable):', err);
+  sendToMain({
+    type: 'pool:error',
+    error: err.message || String(err),
+    stack: err.stack,
+    pluginIds: Array.from(loadedPlugins.keys()),
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[PoolHost] Unhandled rejection:', reason);
+});
+
+console.log('[PoolHost] Ready, waiting for pool:load commands');
+sendToMain({ type: 'pool:ready' });

@@ -1,0 +1,480 @@
+diff --git a/src/views/plugins/workspace/FlexWorkspace.tsx b/src/views/plugins/workspace/FlexWorkspace.tsx
+index a8e2e54..866da66 100644
+--- a/src/views/plugins/workspace/FlexWorkspace.tsx
++++ b/src/views/plugins/workspace/FlexWorkspace.tsx
+@@ -1,12 +1,14 @@
+-import React, { useEffect, useState, useRef } from 'react';
++import React, { useCallback, useEffect, useRef, useState } from 'react';
+ import { createPortal } from 'react-dom';
+ import { useNavigate } from 'react-router-dom';
+-import { Actions, Layout, Model, TabNode, type Action } from 'flexlayout-react';
++import { ChevronLeft, ChevronRight } from 'lucide-react';
++import { Actions, Layout, Model, type Action, type TabSetNode, type BorderNode, type ITabSetRenderValues } from 'flexlayout-react';
+ import { useWorkspaceStore } from '../../../stores/workspace';
+ import { useAppStore } from '../../../stores/app';
+ import { useAgentStore } from '../../../stores/agent';
+ import WorkspaceTabPanel from './WorkspaceTabPanel';
+ import BrowserTabPanel from './BrowserTabPanel';
++import { TabCreateMenuDropdown } from './components/TabCreateMenuDropdown';
+ import { isElectron, isMac } from '../../../utils/platform';
+ import { useShortcut } from '../../../hooks/useShortcut';
+ 
+@@ -16,8 +18,66 @@ import './globals.css';
+ import WorkspaceHome from './WorkspaceHome';
+ import SidebarPanel from './SidebarPanel';
+ import WorkspaceTabBar from '../../../layouts/components/WorkspaceTabBar';
+-import { type RecentDocItem } from './WorkspaceHome';
+-import type { IJsonModel } from 'flexlayout-react';
++import type { RecentDocItem } from './WorkspaceHome';
++import type { IJsonModel , TabNode} from 'flexlayout-react';
++
++/**
++ * Absolute-positioned scroll arrow overlays inside .flexlayout__tabset_tabbar_outer_top.
++ * Left arrow at the left edge; right arrow just before the toolbar (right: 95px).
++ * Neither takes any space when not needed — matches orca’s one-arrow-per-side layout.
++ */
++function TabScrollOverlay({ container }: { container: HTMLElement }): React.JSX.Element {
++  const [canLeft, setCanLeft] = useState(false);
++  const [canRight, setCanRight] = useState(false);
++
++  const getInner = useCallback((): HTMLElement | null =>
++    (container.querySelector('.flexlayout__tabset_tabbar_inner') as HTMLElement) ?? null
++  , [container]);
++
++  const refresh = useCallback(() => {
++    const el = getInner(); if (!el) return;
++    const max = el.scrollWidth - el.clientWidth;
++    setCanLeft(el.scrollLeft > 2);
++    setCanRight(max > 2 && el.scrollLeft < max - 2);
++  }, [getInner]);
++
++  useEffect(() => {
++    const el = getInner(); if (!el) return;
++    el.addEventListener('scroll', refresh, { passive: true });
++    const ro = new ResizeObserver(refresh);
++    ro.observe(el); refresh();
++    return () => { el.removeEventListener('scroll', refresh); ro.disconnect(); };
++  }, [getInner, refresh]);
++
++  const scrollBy = (dir: 'left' | 'right') => {
++    const el = getInner(); if (!el) return;
++    el.scrollBy({ left: (dir === 'left' ? -1 : 1) * Math.max(120, el.clientWidth * 0.75), behavior: 'smooth' });
++  };
++
++  const base: React.CSSProperties = {
++    position: 'absolute', top: 0, bottom: 0, zIndex: 15,
++    display: 'flex', alignItems: 'center',
++    background: 'none', border: 'none', cursor: 'pointer',
++    padding: '0 3px', color: 'var(--text-tertiary, #888)',
++  };
++
++  return (
++    <>
++      {canLeft && (
++        <button style={{ ...base, left: 0, width: 22 }}
++          onMouseDown={(e) => { e.preventDefault(); scrollBy('left'); }} title="左滚 Tab">
++          <ChevronLeft size={13} />
++        </button>
++      )}
++      {canRight && (
++        <button style={{ ...base, right: 95, width: 22 }}
++          onMouseDown={(e) => { e.preventDefault(); scrollBy('right'); }} title="右滚 Tab">
++          <ChevronRight size={13} />
++        </button>
++      )}
++    </>
++  );
++}
+ 
+ /** 布局节点接口 - 用于类型安全的布局树遍历 */
+ interface LayoutNode {
+@@ -178,7 +238,7 @@ function FlexWorkspace() {
+     if (!isElectron || !window.electronAPI?.main?.onCreateNewDocument) return;
+ 
+     const unsubscribe = window.electronAPI.main.onCreateNewDocument(() => {
+-      console.log('[FlexWorkspace] Received main:create-new-document message');
++      console.debug('[FlexWorkspace] Received main:create-new-document message');
+ 
+       // 1. 隐藏左右侧边栏，提供沉浸式体验
+       const store = useWorkspaceStore.getState();
+@@ -215,7 +275,7 @@ function FlexWorkspace() {
+     if (!isElectron || !window.electronAPI?.main?.onShowSidebars) return;
+ 
+     const unsubscribe = window.electronAPI.main.onShowSidebars(() => {
+-      console.log('[FlexWorkspace] Received main:show-sidebars message');
++      console.debug('[FlexWorkspace] Received main:show-sidebars message');
+       // 重新打开左右侧边栏
+       const store = useWorkspaceStore.getState();
+       store.setLeftSidebar(true);
+@@ -282,14 +342,41 @@ function FlexWorkspace() {
+     return () => window.removeEventListener('click', handleClose);
+   }, []);
+ 
+-  const [tabbarElements, setTabbarElements] = useState<Element[]>([]);
++  const onRenderTabSet = useCallback((tabSetNode: TabSetNode | BorderNode, renderValues: ITabSetRenderValues) => {
++    renderValues.stickyButtons.push(
++      <button
++        key="add-tab-btn"
++        onClick={(e) => handlePlusClick(e, tabSetNode.getId())}
++        className="flexlayout__tab_button_add no-drag hover:bg-[rgba(255,255,255,0.08)] text-[var(--text-secondary)] hover:text-white transition-colors duration-150 cursor-pointer flex items-center justify-center"
++        title="新建标签页"
++        style={{
++          border: 'none',
++          background: 'transparent',
++          alignSelf: 'center',
++          height: '22px',
++          width: '22px',
++          borderRadius: '4px',
++          marginLeft: '4px',
++          marginRight: '4px',
++          flexShrink: 0
++        }}
++      >
++        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
++          <line x1="12" y1="5" x2="12" y2="19" />
++          <line x1="5" y1="12" x2="19" y2="12" />
++        </svg>
++      </button>
++    );
++  }, []);
++
++  const [tabbarOuterTops, setTabbarOuterTops] = useState<Element[]>([]);
+ 
+   useEffect(() => {
+     if (!layoutLoaded) return;
+ 
+     const updateTabbars = () => {
+-      const elements = Array.from(document.querySelectorAll('.flexlayout__tabset_tabbar_inner'));
+-      setTabbarElements(elements);
++      const outerTops = Array.from(document.querySelectorAll('.flexlayout__tabset_tabbar_outer_top'));
++      setTabbarOuterTops(outerTops);
+     };
+ 
+     updateTabbars();
+@@ -325,14 +412,14 @@ function FlexWorkspace() {
+ 
+     const loadLayout = async () => {
+       const t_layout_start = performance.now();
+-      console.log(`[FlexWorkspace] [Perf] loadLayout starts...`);
++      console.debug(`[FlexWorkspace] [Perf] loadLayout starts...`);
+       let workspacePath: string | null = null;
+       let savedMetadata: any = null;
+       try {
+         if (window.electronAPI?.workspace?.getPath) {
+           const t_getPath = performance.now();
+           workspacePath = await window.electronAPI.workspace.getPath();
+-          console.log(`[FlexWorkspace] [Perf] getPath took ${(performance.now() - t_getPath).toFixed(2)}ms, path: ${workspacePath}`);
++          console.debug(`[FlexWorkspace] [Perf] getPath took ${(performance.now() - t_getPath).toFixed(2)}ms, path: ${workspacePath}`);
+         }
+       } catch (e) {
+         console.warn('[FlexWorkspace] Failed to get workspace path:', e);
+@@ -346,7 +433,7 @@ function FlexWorkspace() {
+       if (currentActiveSessionId) {
+         const session = useAgentStore.getState().sessions[currentActiveSessionId];
+         if (session?.workspaceLayout?.layoutJson && getLayoutTabs(session.workspaceLayout.layoutJson).length > 0) {
+-          console.log('[FlexWorkspace] Restoring saved layout from session:', currentActiveSessionId);
++          console.debug('[FlexWorkspace] Restoring saved layout from session:', currentActiveSessionId);
+           useWorkspaceStore.setState({
+             layoutJson: session.workspaceLayout.layoutJson,
+             activeTabId: session.workspaceLayout.activeTabId || null,
+@@ -366,18 +453,13 @@ function FlexWorkspace() {
+           console.warn('[FlexWorkspace] Failed to get workspace path/metadata:', e);
+         }
+ 
+-        const currentTabs = getLayoutTabs(useWorkspaceStore.getState().layoutJson);
+         if (savedMetadata?.layoutJson && getLayoutTabs(savedMetadata.layoutJson).length > 0) {
+-          if (currentTabs.length > 0) {
+-            console.log('[FlexWorkspace] Skipping saved layout restore — store already has tabs (likely from pending open)');
+-          } else {
+-            console.log('[FlexWorkspace] Restoring saved layout, activeTabId:', savedMetadata.activeTabId);
+-            useWorkspaceStore.setState({
+-              layoutJson: savedMetadata.layoutJson,
+-              activeTabId: savedMetadata.activeTabId || null,
+-              tabHistories: savedMetadata.tabHistories || {}
+-            });
+-          }
++          console.debug('[FlexWorkspace] Restoring saved layout from workspace metadata, activeTabId:', savedMetadata.activeTabId);
++          useWorkspaceStore.setState({
++            layoutJson: savedMetadata.layoutJson,
++            activeTabId: savedMetadata.activeTabId || null,
++            tabHistories: savedMetadata.tabHistories || {}
++          });
+           restored = true;
+         }
+       }
+@@ -386,13 +468,13 @@ function FlexWorkspace() {
+       if (!restored) {
+         const currentTabs = getLayoutTabs(useWorkspaceStore.getState().layoutJson);
+         if (currentTabs.length === 0) {
+-          console.log('[FlexWorkspace] No saved layout found or empty, resetting workspace');
++          console.debug('[FlexWorkspace] No saved layout found or empty, resetting workspace');
+           useWorkspaceStore.getState().resetWorkspace();
+         }
+       }
+ 
+       useWorkspaceStore.setState({ layoutLoaded: true });
+-      console.log(`[FlexWorkspace] [Perf] loadLayout completed in ${(performance.now() - t_layout_start).toFixed(2)}ms, layoutLoaded set to true`);
++      console.debug(`[FlexWorkspace] [Perf] loadLayout completed in ${(performance.now() - t_layout_start).toFixed(2)}ms, layoutLoaded set to true`);
+ 
+       // 布局初始化完成后，消费 pending 的文件打开请求（解决首次从侧边栏点击文件不打开的竞态问题）
+       const pending = useWorkspaceStore.getState().consumePendingOpenFile();
+@@ -441,6 +523,27 @@ function FlexWorkspace() {
+   useEffect(() => {
+     if (!layoutLoaded) return;
+ 
++    const doFlushSave = () => {
++      const state = useWorkspaceStore.getState();
++      const currentActiveSessionId = useAgentStore.getState().activeSessionId;
++      if (currentActiveSessionId) {
++        useAgentStore.getState().updateSessionLayout(currentActiveSessionId, {
++          layoutJson: state.layoutJson,
++          activeTabId: state.activeTabId,
++          tabHistories: state.tabHistories
++        });
++      }
++      if (window.electronAPI?.workspace?.updateMetadata && workspacePathRef.current) {
++        window.electronAPI.workspace.updateMetadata({
++          layoutJson: state.layoutJson,
++          activeTabId: state.activeTabId,
++          tabHistories: state.tabHistories
++        }).catch((err: unknown) => {
++          console.warn('[FlexWorkspace] Failed to flush save workspace metadata:', err);
++        });
++      }
++    };
++
+     let timeoutId: NodeJS.Timeout;
+     const unsubscribe = useWorkspaceStore.subscribe((state, prevState) => {
+       // 仅在关键状态发生改变时写入
+@@ -454,32 +557,19 @@ function FlexWorkspace() {
+ 
+       clearTimeout(timeoutId);
+       timeoutId = setTimeout(() => {
+-        const currentActiveSessionId = useAgentStore.getState().activeSessionId;
+-        if (currentActiveSessionId) {
+-          // 保存到 active session 的 SQLite DB & store
+-          useAgentStore.getState().updateSessionLayout(currentActiveSessionId, {
+-            layoutJson: state.layoutJson,
+-            activeTabId: state.activeTabId,
+-            tabHistories: state.tabHistories
+-          });
+-        } else {
+-          // 否则退避保存到项目的 metadata.json
+-          if (window.electronAPI?.workspace?.updateMetadata && workspacePathRef.current) {
+-            window.electronAPI.workspace.updateMetadata({
+-              layoutJson: state.layoutJson,
+-              activeTabId: state.activeTabId,
+-              tabHistories: state.tabHistories
+-            }).catch((err: unknown) => {
+-              console.warn('[FlexWorkspace] Failed to auto-save workspace metadata:', err);
+-            });
+-          }
+-        }
++        doFlushSave();
+       }, 500);
+     });
+ 
++    const handleBeforeUnload = () => {
++      doFlushSave();
++    };
++    window.addEventListener('beforeunload', handleBeforeUnload);
++
+     return () => {
+       unsubscribe();
+       clearTimeout(timeoutId);
++      window.removeEventListener('beforeunload', handleBeforeUnload);
+     };
+   }, [layoutLoaded]);
+   // ─────────────────────────────────────────────────────────────────────────────
+@@ -613,7 +703,7 @@ function FlexWorkspace() {
+   useEffect(() => {
+     if (modelState.jsonStr === currentJsonString) return;
+ 
+-    console.log('[FlexWorkspace] useEffect sync triggered. prev len:', modelState.jsonStr.length, 'curr len:', currentJsonString.length);
++    console.debug('[FlexWorkspace] useEffect sync triggered. prev len:', modelState.jsonStr.length, 'curr len:', currentJsonString.length);
+     try {
+       const prevJson = JSON.parse(modelState.jsonStr);
+       const currJson = JSON.parse(currentJsonString);
+@@ -636,22 +726,22 @@ function FlexWorkspace() {
+       if (hasStructuralChange) {
+         const removed = [...prevIds].filter(id => !currIds.has(id));
+         const added   = [...currIds].filter(id => !prevIds.has(id));
+-        let model = modelState.model;
++        const model = modelState.model;
+ 
+         if (removed.length > 0 && added.length === 0) {
+-          console.log('[FlexWorkspace] Structural deletion, removing in-place:', removed);
++          console.debug('[FlexWorkspace] Structural deletion, removing in-place:', removed);
+           for (const id of removed) {
+             if (model.getNodeById(id)) model.doAction(Actions.deleteTab(id));
+           }
+           setModelState({ model, jsonStr: currentJsonString });
+         } else {
+-          console.log('[FlexWorkspace] Structural change (add/split), rebuilding model. prev:', prevIds.size, 'curr:', currIds.size);
++          console.debug('[FlexWorkspace] Structural change (add/split), rebuilding model. prev:', prevIds.size, 'curr:', currIds.size);
+           const newModel = Model.fromJson(ensureGlobalLayoutOptions(layoutJson));
+           setModelState({ model: newModel, jsonStr: currentJsonString });
+         }
+       } else {
+         // 仅属性变化（name/config 更新），增量更新避免闪屏
+-        let model = modelState.model;
++        const model = modelState.model;
+ 
+         const syncNode = (prev: any, curr: any) => {
+           if (!prev || !curr) return;
+@@ -744,7 +834,7 @@ function FlexWorkspace() {
+   const tabCount = getTabCount(modelState.model);
+ 
+   const onModelChange = (layoutModel: Model) => {
+-    console.log('[FlexWorkspace] onModelChange called (flexlayout internal change)');
++    console.debug('[FlexWorkspace] onModelChange called (flexlayout internal change)');
+     const nextJson = layoutModel.toJson();
+     const nextJsonStr = JSON.stringify(nextJson);
+     setModelState({
+@@ -752,8 +842,26 @@ function FlexWorkspace() {
+       jsonStr: nextJsonStr
+     });
+     updateLayoutJson(nextJson);
++    // Notify terminals to re-fit after splitter drag / layout change.
++    // TerminalTabPanel listens to this event to update PTY cols/rows.
++    window.dispatchEvent(new Event('berrytrace:layout-resize'));
+   };
+ 
++  // Convert vertical wheel to horizontal scroll on tab strips (trackpad & mouse wheel).
++  // Mirrors orca’s onWheel handler in useTabStripOverflowNavigation.
++  useEffect(() => {
++    const onWheel = (e: WheelEvent) => {
++      const inner = (e.target as Element).closest?.('.flexlayout__tabset_tabbar_inner') as HTMLElement | null;
++      if (!inner) return;
++      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
++        e.preventDefault();
++        inner.scrollLeft += e.deltaY;
++      }
++    };
++    document.addEventListener('wheel', onWheel, { passive: false });
++    return () => document.removeEventListener('wheel', onWheel);
++  }, []);
++
+   const onAction = (action: Action): Action | undefined => {
+     if (action.type === Actions.DELETE_TAB) {
+       const nodeId = action.data?.node as string;
+@@ -963,34 +1071,13 @@ function FlexWorkspace() {
+               onExternalDrag={onExternalDrag}
+               onAction={onAction}
+               onContextMenu={handleContextMenu}
++              onRenderTabSet={onRenderTabSet}
+             />
+-            {tabbarElements.map((el, index) => {
+-              return createPortal(
+-                <button
+-                  key={`add-tab-btn-${index}`}
+-                  onClick={(e) => handlePlusClick(e, 'default')}
+-                  className="flexlayout__tab_button_add no-drag hover:bg-[rgba(255,255,255,0.08)] text-[var(--text-secondary)] hover:text-white transition-colors duration-150 cursor-pointer flex items-center justify-center"
+-                  title="新建标签页"
+-                  style={{
+-                    border: 'none',
+-                    background: 'transparent',
+-                    alignSelf: 'center',
+-                    height: '22px',
+-                    width: '22px',
+-                    borderRadius: '4px',
+-                    marginLeft: '6px',
+-                    marginRight: '6px',
+-                    flexShrink: 0
+-                  }}
+-                >
+-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round">
+-                    <line x1="12" y1="5" x2="12" y2="19" />
+-                    <line x1="5" y1="12" x2="19" y2="12" />
+-                  </svg>
+-                </button>,
+-                el
+-              );
+-            })}
++            {/* Scroll arrow overlays portaled into each outer_top (position:relative) */}
++            {tabbarOuterTops.map((el, index) => createPortal(
++              <TabScrollOverlay key={index} container={el as HTMLElement} />,
++              el
++            ))}
+           {/* {activePanels.length > 0 && !showRightSidebar && !zenMode && (
+             <button
+               className={`absolute z-[110] w-7 h-7 flex items-center justify-center rounded cursor-pointer transition-all duration-200 text-[var(--text-tertiary,#cccccc)] hover:text-[var(--text-primary,#ffffff)] hover:bg-[rgba(255,255,255,0.08)] ${
+@@ -1015,72 +1102,12 @@ function FlexWorkspace() {
+ 
+       {/* ── plusMenu Dropdown Menu ── */}
+       {plusMenu && (
+-        <div
+-          className="fixed flex flex-col gap-px p-1 rounded-lg backdrop-blur-md no-drag"
+-          style={{
+-            top: plusMenu.y,
+-            left: plusMenu.x,
+-            zIndex: 10000,
+-            width: '120px',
+-            backgroundColor: 'var(--bg-card, rgba(30,30,30,0.85))',
+-            border: '1px solid var(--border-light, rgba(255,255,255,0.08))',
+-            boxShadow: '0 10px 30px rgba(0,0,0,0.3)',
+-          }}
+-          onClick={(e) => e.stopPropagation()}
+-        >
+-          <div
+-            className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+-            onClick={() => {
+-              setPlusMenu(null);
+-              const sessionId = `blank_${Date.now()}`;
+-              useWorkspaceStore.getState().openWorkspaceTab(
+-                undefined,
+-                'system.workspace-blank',
+-                undefined,
+-                undefined,
+-                sessionId
+-              );
+-            }}
+-          >
+-            文件
+-          </div>
+-          <div
+-            className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+-            onClick={() => {
+-              setPlusMenu(null);
+-              const sessionId = `terminal_${Date.now()}`;
+-              useWorkspaceStore.getState().openWorkspaceTab(
+-                undefined,
+-                'system.terminal',
+-                undefined,
+-                undefined,
+-                sessionId,
+-                false,
+-                '终端'
+-              );
+-            }}
+-          >
+-            终端
+-          </div>
+-          <div
+-            className="px-3 py-1.5 text-[12px] rounded-md cursor-pointer transition-all duration-120 text-[var(--text-secondary,#cccccc)] hover:bg-[var(--bg-hover,rgba(255,255,255,0.08))] hover:text-white"
+-            onClick={() => {
+-              setPlusMenu(null);
+-              const sessionId = `browser_${Date.now()}`;
+-              useWorkspaceStore.getState().openWorkspaceTab(
+-                undefined,
+-                'system.browser',
+-                undefined,
+-                undefined,
+-                sessionId,
+-                false,
+-                '浏览器'
+-              );
+-            }}
+-          >
+-            浏览器
+-          </div>
+-        </div>
++        <TabCreateMenuDropdown
++          x={plusMenu.x}
++          y={plusMenu.y}
++          tabsetId={plusMenu.tabsetId}
++          onClose={() => setPlusMenu(null)}
++        />
+       )}
+ 
+       {contextMenu && (

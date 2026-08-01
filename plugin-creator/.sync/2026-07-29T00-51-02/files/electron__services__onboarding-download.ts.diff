@@ -1,0 +1,86 @@
+diff --git a/electron/services/onboarding-download.ts b/electron/services/onboarding-download.ts
+index 20b79f1..aa29756 100644
+--- a/electron/services/onboarding-download.ts
++++ b/electron/services/onboarding-download.ts
+@@ -23,6 +23,7 @@ class OnboardingDownloadManager {
+   private static instance: OnboardingDownloadManager | null = null;
+   private items: DownloadItem[] = [];
+   private isDownloading = false;
++  private hasFetched = false;
+ 
+   private constructor() {
+     this.cleanStaleFiles();
+@@ -88,7 +89,9 @@ class OnboardingDownloadManager {
+           if (file.endsWith('.btp') || file.endsWith('.tmp') || file.endsWith('.part')) {
+             try {
+               fs.unlinkSync(path.join(tempDir, file));
+-            } catch (e) {}
++            } catch (e) {
++              // ignore
++            }
+           }
+         }
+       }
+@@ -100,7 +103,9 @@ class OnboardingDownloadManager {
+           if (dir.endsWith('.new') || dir.endsWith('.old')) {
+             try {
+               fs.rmSync(path.join(PLUGINS_DIR, dir), { recursive: true, force: true });
+-            } catch (e) {}
++            } catch (e) {
++              // ignore
++            }
+           }
+         }
+       }
+@@ -117,7 +122,9 @@ class OnboardingDownloadManager {
+           } else if (entry.name.endsWith('.tmp') || entry.name.endsWith('.part')) {
+             try {
+               fs.unlinkSync(fullPath);
+-            } catch (e) {}
++            } catch (e) {
++              // ignore
++            }
+           }
+         }
+       };
+@@ -133,6 +140,9 @@ class OnboardingDownloadManager {
+   }
+ 
+   public isFinished(): boolean {
++    if (this.hasFetched && this.items.length === 0) {
++      return true;
++    }
+     // 'failed' 也算终态：允许用户在失败的情况下继续进入主面板，而不是永久卡死
+     return this.items.length > 0 && this.items.every(item =>
+       item.status === 'completed' || item.status === 'failed'
+@@ -214,6 +224,8 @@ class OnboardingDownloadManager {
+       }
+     } catch (err) {
+       console.error('[OnboardingDownload:startSilentDownloads] Error fetching install_required API:', err);
++    } finally {
++      this.hasFetched = true;
+     }
+ 
+     // Restore state from cache
+@@ -349,7 +361,9 @@ class OnboardingDownloadManager {
+         packageInfo.manifest.id,
+         packageInfo.signature
+       );
+-      try { fs.unlinkSync(tempPkgPath); } catch {}
++      try { fs.unlinkSync(tempPkgPath); } catch {
++        // ignore
++      }
+       if (success) {
+         item.status = 'completed';
+         item.progress = 100;
+@@ -399,7 +413,9 @@ class OnboardingDownloadManager {
+             console.log(`[OnboardingDownload] Server returned 200. Downloading full file: ${contentLength}`);
+           } else if (response.statusCode === 416) {
+             console.warn(`[OnboardingDownload] Range 416 for ${item.id}. Clearing temp file and restarting.`);
+-            try { fs.unlinkSync(tempDest); } catch {}
++            try { fs.unlinkSync(tempDest); } catch {
++              // ignore
++            }
+             if (retriesLeft <= 0) {
+               reject(new Error('Server returned 416 Range Not Satisfiable repeatedly'));
+               return;

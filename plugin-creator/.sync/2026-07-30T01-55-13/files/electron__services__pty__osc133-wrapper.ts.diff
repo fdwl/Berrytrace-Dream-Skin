@@ -1,0 +1,19 @@
+diff --git a/electron/services/pty/osc133-wrapper.ts b/electron/services/pty/osc133-wrapper.ts
+index 28b0698..5bfaee1 100644
+--- a/electron/services/pty/osc133-wrapper.ts
++++ b/electron/services/pty/osc133-wrapper.ts
+@@ -40,6 +40,7 @@ export class OSC133Wrapper extends EventEmitter {
+       this.emit('command-output-start');
+     }
+ 
++    // eslint-disable-next-line no-control-regex
+     const matchD = chunk.match(/\x1b\]133;D;?(\d+)?\x07/);
+     if (matchD) {
+       const exitCode = matchD[1] ? parseInt(matchD[1], 10) : 0;
+@@ -51,6 +52,7 @@ export class OSC133Wrapper extends EventEmitter {
+     }
+ 
+     // Clean OSC 133 control sequences for clean UI display if needed
++    // eslint-disable-next-line no-control-regex
+     return chunk.replace(/\x1b\]133;[A-D](?:;\d+)?\x07/g, '');
+   }

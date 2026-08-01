@@ -1,0 +1,143 @@
+diff --git a/electron/services/fulltext-index-manager.ts b/electron/services/fulltext-index-manager.ts
+index b6a005b..3eafcbb 100644
+--- a/electron/services/fulltext-index-manager.ts
++++ b/electron/services/fulltext-index-manager.ts
+@@ -332,15 +332,11 @@ export class FullTextIndexManager {
+       return
+     }
+ 
+-    // 检查工作区文件总数（防止意外索引大目录）
++    // 检查工作区文件总数（防止意外索引大目录）：复用 ripgrep 枚举，尊重 .gitignore，避免全量 readdir
+     try {
+-      const allFiles = await fs.promises.readdir(workspacePath, { recursive: true, withFileTypes: true });
+-      let fileCount = 0;
+-      for (const entry of allFiles) {
+-        if (entry.isFile() && !entry.name.startsWith('.')) {
+-          fileCount++;
+-        }
+-      }
++      const { RipgrepService } = await import('./ripgrep-service.js')
++      const allFiles = await RipgrepService.getInstance().getFilesList(workspacePath)
++      const fileCount = allFiles.length
+ 
+       if (fileCount > FullTextIndexManager.MAX_FILES_FOR_INDEXING) {
+         console.warn(`[FullTextIndex] Workspace has ${fileCount} files, exceeding threshold (${FullTextIndexManager.MAX_FILES_FOR_INDEXING}). Skipping incremental update.`);
+@@ -410,7 +406,7 @@ export class FullTextIndexManager {
+ 
+         // 文件被修改或新增，更新索引
+         console.log(`[FullTextIndex] Extracting content from: ${filePath}`)
+-        
++
+         let mtime = new Date().toISOString()
+         try {
+           const stats = fs.statSync(filePath)
+@@ -1533,36 +1529,19 @@ export class FullTextIndexManager {
+     // 2. 第一阶段：SQLite FTS5 + 向量检索 (仅涉及文档) — 极其迅速
+     try {
+       const wsFilter = 'AND workspace_path = ?'
+-      const hasAdvancedSyntax = /( AND | OR | NOT |"-|"[^"]+")/.test(query)
+-
+-      let sql: string
+-      let params: (string | number)[]
+-
+-      if (hasAdvancedSyntax) {
+-        const parser = new QueryParser()
+-        const parsed = parser.parse(query)
+-        const ftsQuery = parser.toFtsQuery(parsed)
+-
+-        sql = `
+-          SELECT file_path, file_name, content, snippet(FtsFileIndex, 2, '[', ']', '...', 30) as snip, rank
+-          FROM FtsFileIndex
+-          WHERE FtsFileIndex MATCH ?
+-            ${wsFilter}
+-          ORDER BY rank
+-          LIMIT 100
+-        `
+-        params = [ftsQuery, activePath]
+-      } else {
+-        sql = `
+-          SELECT file_path, file_name, content, snippet(FtsFileIndex, 2, '[', ']', '...', 30) as snip, rank
+-          FROM FtsFileIndex
+-          WHERE FtsFileIndex MATCH simple_query(?)
+-            ${wsFilter}
+-          ORDER BY rank
+-          LIMIT 100
+-        `
+-        params = [query, activePath]
+-      }
++      const parser = new QueryParser()
++      const parsed = parser.parse(query)
++      const ftsQuery = parser.toFtsQuery(parsed) || query
++
++      const sql = `
++        SELECT file_path, file_name, content, snippet(FtsFileIndex, 2, '[', ']', '...', 30) as snip, rank
++        FROM FtsFileIndex
++        WHERE FtsFileIndex MATCH ?
++          ${wsFilter}
++        ORDER BY rank
++        LIMIT 100
++      `
++      const params = [ftsQuery, activePath]
+ 
+       const wsDb = DatabaseManager.getInstance().getWorkspaceDB(activePath)
+       const rawResults = wsDb.prepare(sql).all(...params) as unknown as (FileSearchResult & { content: string })[]
+@@ -1615,11 +1594,10 @@ export class FullTextIndexManager {
+   private async runRipgrepAndNotify(query: string, activePath: string, hybridDbResults: FileSearchResult[]) {
+     const { RipgrepService } = await import('./ripgrep-service.js')
+     const rgService = RipgrepService.getInstance()
+-    const codeExts = ['.js', '.ts', '.tsx', '.jsx', '.json', '.py', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.html', '.css', '.sh', '.yaml', '.yml', '.toml', '.sql']
+-    
++
+     console.log(`[FullTextIndex:runRipgrepAndNotify] Launching background Ripgrep search for query "${query}"`)
+-    const rgMatches = await rgService.searchContent(query, activePath, codeExts)
+-    
++    const rgMatches = await rgService.searchContent(query, activePath)
++
+     const rgResults: FileSearchResult[] = rgMatches.map((m, idx) => ({
+       file_path: m.filePath,
+       file_name: m.fileName,
+@@ -1907,7 +1885,23 @@ export class FullTextIndexManager {
+         const mergedTools = Array.from(allToolsMap.values());
+ 
+         // 3. Clear existing tools in FTS and Vector index
+-        db.prepare("DELETE FROM FtsAgentIndex WHERE entity_type = 'tool'").run()
++        try {
++          db.prepare("DELETE FROM FtsAgentIndex WHERE entity_type = 'tool'").run()
++        } catch (_err) {
++          try {
++            db.exec(`DROP TABLE IF EXISTS FtsAgentIndex`);
++            db.exec(`
++              CREATE VIRTUAL TABLE IF NOT EXISTS FtsAgentIndex USING fts5(
++                entity_id,
++                entity_type,
++                title,
++                content,
++                meta,
++                tokenize = 'unicode61'
++              )
++            `);
++          } catch (_e) { /* ignore */ }
++        }
+         try {
+           const existing = db.prepare("SELECT entity_id FROM FtsVectorIndex WHERE entity_type = 'tool'").all() as { entity_id: string }[]
+           const vectorEngine = VectorSearchEngine.getEngine(db, dbKey)
+@@ -2239,4 +2233,19 @@ export class FullTextIndexManager {
+     }
+     return result
+   }
++
++  public stop(): void {
++    if (this.monitorInterval) {
++      clearInterval(this.monitorInterval);
++      this.monitorInterval = null;
++    }
++    if (this.schedulingInterval) {
++      clearInterval(this.schedulingInterval);
++      this.schedulingInterval = null;
++    }
++    if (this.watcher) {
++      this.watcher.close().catch(() => {});
++      this.watcher = null;
++    }
++  }
+ }

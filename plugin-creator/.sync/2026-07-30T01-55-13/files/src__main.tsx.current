@@ -1,0 +1,152 @@
+import React, { StrictMode } from 'react'
+import * as LucideReact from 'lucide-react'
+import * as FramerMotion from 'framer-motion'
+import * as ReactDOMClient from 'react-dom/client'
+import { createRoot } from 'react-dom/client'
+import { flushSync } from 'react-dom'
+import './index.css'
+import App from './App.tsx'
+import { useAppStore } from './stores/app'
+import { PluginRegistry } from './plugins/PluginRegistry'
+import { isMac, isWindows } from './utils/platform'
+
+
+// 针对 Web 端 History 路径 /share/{id}，自动重定向到 Hash 路由 /#/share/{id}
+if (typeof window !== 'undefined' && window.location.pathname.startsWith('/share/')) {
+  const match = window.location.pathname.match(/^\/share\/([a-zA-Z0-9]+)$/);
+  if (match) {
+    window.location.replace('/#/share/' + match[1] + window.location.search);
+  }
+}
+
+import { useUserStore } from './stores/user'
+import { httpService } from './services/http'
+import event_bus from './services/event_bus'
+import * as Zustand from 'zustand'
+import { generateUniqueId } from './utils/generate'
+import { TypeName, ResponseType } from './utils/type_name'
+import { BaseModel, RespStatus, OpType } from './services/base_model'
+import * as publish_bridge from './services/publish_bridge'
+import { computeMenstruationWords, computeCalendarEventWords, splitWords } from './utils/words';
+import { Terminal } from 'xterm'
+import { FitAddon } from 'xterm-addon-fit'
+import { Tooltip as ReactTooltip } from 'react-tooltip'
+import 'react-tooltip/dist/react-tooltip.css'
+
+// 暴露 Vite 环境变量与核心工具给插件与全局使用
+if (typeof window !== 'undefined') {
+  (window as any).React = React;
+  (window as any).ReactDOM = { ...ReactDOMClient, flushSync };
+  (window as any).Zustand = Zustand;
+  // 供插件 renderer 使用的图标库（无打包工具的插件通过 window.__lucide 访问）
+  (window as any).__lucide = LucideReact;
+  (window as any).FramerMotion = FramerMotion;
+  (window as any).XTerm = { Terminal, FitAddon };
+  (window as any).ReactTooltip = ReactTooltip;
+
+  (window as any).__VITE_WEB_APP__ = import.meta.env.VITE_WEB_APP;
+  (window as any).__VITE_CONFIG__ = {
+    VITE_APP_SOCKET_URL: import.meta.env.VITE_APP_SOCKET_URL,
+    VITE_BASE_URL: import.meta.env.VITE_BASE_URL,
+    VITE_APP_API_URL: import.meta.env.VITE_APP_API_URL,
+    VITE_UPLOAD_URL: import.meta.env.VITE_UPLOAD_URL,
+    VITE_APP_USE_MOCK: import.meta.env.VITE_APP_USE_MOCK,
+    VITE_BERRYTRACE_MODEL: import.meta.env.VITE_BERRYTRACE_MODEL,
+    VITE_BERRYTRACE_ENDPOINT: import.meta.env.VITE_BERRYTRACE_ENDPOINT,
+    VITE_WEB_APP: import.meta.env.VITE_WEB_APP,
+    VITE_ENABLE_PHONE_LOGIN: import.meta.env.VITE_ENABLE_PHONE_LOGIN,
+    DEV: import.meta.env.DEV,
+  };
+  (window as any).isDev = import.meta.env.DEV;
+  (window as any).useUserStore = useUserStore;
+  (window as any).useAppStore = useAppStore;
+  (window as any).httpService = httpService;
+  (window as any).event_bus = event_bus;
+  (window as any).publish_bridge = publish_bridge;
+  (window as any).PluginRegistry = PluginRegistry;
+  (window as any).OpType = OpType;
+  (window as any).generateUniqueId = generateUniqueId;
+  (window as any).TypeName = TypeName;
+  (window as any).ResponseType = ResponseType;
+  (window as any).BaseModel = BaseModel;
+  (window as any).RespStatus = RespStatus;
+  (window as any).computeMenstruationWords = computeMenstruationWords;
+  (window as any).computeCalendarEventWords = computeCalendarEventWords;
+  (window as any).splitWords = splitWords;
+}
+
+
+if (typeof window !== 'undefined' && (window as any).electronAPI) {
+  (window as any).electronAPI.ipc.send('renderer-ready');
+}
+
+// 初始化客户端插件注册中心（动态加载启用插件）
+PluginRegistry.getInstance().init().catch(err => {
+  console.error('[PluginRegistry] Failed to initialize:', err)
+})
+
+// 从 localStorage 恢复主题并写入 DOM（在首屏渲染前执行，避免主题闪烁）
+useAppStore.getState().initTheme()
+
+// 注入当前平台 CSS 类名，便于全局 CSS 针对不同操作系统（如 Windows 和 Mac 的按钮位置）进行适配
+if (isMac) {
+  document.documentElement.classList.add('platform-mac')
+} else if (isWindows) {
+  document.documentElement.classList.add('platform-win')
+} else {
+  document.documentElement.classList.add('platform-linux')
+}
+
+if (useAppStore.getState().sidebarCollapsed) {
+  document.documentElement.classList.add('sidebar-collapsed')
+}
+
+// 全局绑定 textarea 的 Esc 快捷键以取消聚焦，除非含有 'not-bind' 类名（使用事件代理以支持动态 DOM 节点）
+document.addEventListener('keydown', (event) => {
+  const target = event.target as HTMLElement | null
+  if (target && target.tagName === 'TEXTAREA') {
+    if (target.classList.contains('not-bind')) {
+      return
+    }
+    if (event.key === 'Escape') {
+      target.blur()
+      event.preventDefault()
+      event.stopPropagation()
+    }
+  }
+}, true)
+
+
+import { ErrorBoundary } from './components/ErrorBoundary'
+
+// 防御性补丁：防止第三方 DOM 变动、翻译插件或浮层销毁时触发 "NotFoundError: Failed to execute 'removeChild' on 'Node'"
+if (typeof window !== 'undefined' && typeof Node !== 'undefined') {
+  const originalRemoveChild = Node.prototype.removeChild;
+  Node.prototype.removeChild = function <T extends Node>(child: T): T {
+    if (child && child.parentNode !== this) {
+      if (child.parentNode) {
+        return child.parentNode.removeChild(child) as T;
+      }
+      console.warn('[DOM Guard] Prevented removeChild error: Node is not a child of target parent node.', child);
+      return child;
+    }
+    return originalRemoveChild.call(this, child) as T;
+  };
+
+  const originalInsertBefore = Node.prototype.insertBefore;
+  Node.prototype.insertBefore = function <T extends Node>(newNode: T, referenceNode: Node | null): T {
+    if (referenceNode && referenceNode.parentNode !== this) {
+      console.warn('[DOM Guard] Prevented insertBefore error: Reference node is not a child of target parent node.');
+      return originalInsertBefore.call(this, newNode, null) as T;
+    }
+    return originalInsertBefore.call(this, newNode, referenceNode) as T;
+  };
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  </StrictMode>,
+)

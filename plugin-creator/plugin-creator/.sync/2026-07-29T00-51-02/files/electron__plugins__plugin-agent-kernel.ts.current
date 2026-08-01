@@ -1,0 +1,61 @@
+import type { IpcMainEvent } from 'electron';
+import { ipcMain } from 'electron';
+import type { PluginManager } from './plugin-manager';
+import { PluginLauncher } from './plugin-launcher';
+
+export function listAgentKernelPluginIds(pm: PluginManager, onlyEnabled: boolean): string[] {
+  return pm.getPluginsList()
+    .filter((plugin) => {
+      const isKernel = (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') && Boolean(plugin.manifest.agentKernel?.protocol);
+      if (!isKernel) return false;
+      return onlyEnabled ? pm.isPluginEnabled(plugin.manifest.id) : true;
+    })
+    .map((plugin) => plugin.manifest.id);
+}
+
+export function getAgentKernelPluginId(pm: PluginManager): string | null {
+  const enabledKernels = listAgentKernelPluginIds(pm, true);
+  const runningKernel = enabledKernels.find((id) => PluginLauncher.getInstance().isBackgroundPluginRunning(id));
+  if (runningKernel) return runningKernel;
+  return enabledKernels[0] || null;
+}
+
+export async function ensureAgentKernelRunning(pm: PluginManager, preferredPluginId?: string): Promise<string | null> {
+  // Make sure the main initialization is complete
+  await pm.init();
+  const enabledKernels = listAgentKernelPluginIds(pm, true);
+  if (enabledKernels.length === 0) return null;
+
+  const launcher = PluginLauncher.getInstance();
+  const kernelPluginId = preferredPluginId && enabledKernels.includes(preferredPluginId)
+    ? preferredPluginId
+    : (enabledKernels.find((id) => launcher.isBackgroundPluginRunning(id)) || enabledKernels[0]);
+
+  if (!launcher.isBackgroundPluginRunning(kernelPluginId)) {
+    const readyPromise = new Promise<void>((resolve) => {
+      interface KernelReadyPayload {
+        kernelId?: string;
+      }
+      const handler = (_event: IpcMainEvent, payload: unknown) => {
+        const typedPayload = payload as KernelReadyPayload;
+        if (typedPayload?.kernelId === kernelPluginId || !typedPayload?.kernelId) {
+          ipcMain.off('agent:kernel_ready', handler);
+          resolve();
+        }
+      };
+      ipcMain.on('agent:kernel_ready', handler);
+      setTimeout(() => {
+        ipcMain.off('agent:kernel_ready', handler);
+        resolve();
+      }, 8000);
+    });
+
+    if (pm.isPluginActive(kernelPluginId)) {
+      await pm.startBackgroundPlugin(kernelPluginId);
+    } else {
+      await pm.ensurePluginLoaded(kernelPluginId);
+    }
+    await readyPromise;
+  }
+  return launcher.isBackgroundPluginRunning(kernelPluginId) ? kernelPluginId : null;
+}

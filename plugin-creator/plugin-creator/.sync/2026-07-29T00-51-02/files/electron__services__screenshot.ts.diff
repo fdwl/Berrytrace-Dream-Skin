@@ -1,0 +1,11 @@
+diff --git a/electron/services/screenshot.ts b/electron/services/screenshot.ts
+index 668a086..15da040 100644
+--- a/electron/services/screenshot.ts
++++ b/electron/services/screenshot.ts
+@@ -1,4 +1,5 @@
+-import { app, BrowserWindow, systemPreferences, desktopCapturer, screen, Display, ipcMain } from 'electron'
++import type { Display} from 'electron';
++import { app, BrowserWindow, systemPreferences, desktopCapturer, screen, ipcMain } from 'electron'
+ import { join, dirname } from 'path'
+ import { promises as fsPromises } from 'fs'
+ import { execFile } from 'child_process'

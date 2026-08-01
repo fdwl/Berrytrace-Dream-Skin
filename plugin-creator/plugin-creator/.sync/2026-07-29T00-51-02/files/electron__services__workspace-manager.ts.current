@@ -1,0 +1,1459 @@
+import { app, dialog, ipcMain, BrowserWindow, shell } from 'electron'
+
+import * as fs from 'fs'
+import { join, basename, dirname, extname } from 'path'
+import { generateUniqueId } from '../../src/utils/generate'
+import { DatabaseManager } from './db-manager'
+import { ElectronAuthManager } from './auth-manager'
+import { ElectronMainWindow } from '../windows/main-window'
+import { WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME } from '../../src/config/constants'
+import { normalizePath } from '../utils/path-utils'
+
+const DEFAULT_WORKSPACE_NAME = 'berrytrace_workspace';
+
+/** 默认工作区路径：~/berrytrace_workspace/ — 始终存在，不可删除 */
+export function getDefaultWorkspacePath(): string {
+  return join(app.getPath('home'), DEFAULT_WORKSPACE_NAME);
+}
+
+export interface WorkspaceHistoryEntry {
+  path: string
+  name: string
+  calendarUuid: number
+  exists?: boolean
+  updatedAt?: string
+}
+
+export class WorkspaceManager {
+  private static instance: WorkspaceManager
+  private onWorkspaceInitializedCallback?: () => void
+  private windowPaths = new Map<number, string>()
+  private watchers = new Map<string, fs.FSWatcher>()
+  private debounceTimeouts = new Map<string, NodeJS.Timeout>()
+  private structureDebounceTimeouts = new Map<string, NodeJS.Timeout>()
+  private changedFilesMap = new Map<string, Set<string>>()
+  private lastTriggerTime = new Map<string, number>()
+  private fileChangeDebounceTimeouts = new Map<string, NodeJS.Timeout>()
+
+  private constructor() {}
+
+  public static getInstance(): WorkspaceManager {
+    if (!WorkspaceManager.instance) {
+      WorkspaceManager.instance = new WorkspaceManager()
+    }
+    return WorkspaceManager.instance
+  }
+
+  public setOnWorkspaceInitialized(callback: () => void) {
+    this.onWorkspaceInitializedCallback = callback
+  }
+
+  public getPath(win: BrowserWindow | null = null): string | null {
+    return this.getPathForWindow(win);
+  }
+
+  public getPathForWindow(win: BrowserWindow | null): string | null {
+    if (win && !win.isDestroyed()) {
+      if (this.windowPaths.has(win.id)) {
+        return this.windowPaths.get(win.id) || null
+      }
+      // If not found, try opener/parent window relationship
+      const parentWin = win.getParentWindow()
+      if (parentWin && !parentWin.isDestroyed()) {
+        return this.getPathForWindow(parentWin)
+      }
+    }
+    // Fallback to the primary main window
+    const mainWin = ElectronMainWindow.getInstance().getWindow()
+    if (mainWin && !mainWin.isDestroyed()) {
+      const mainPath = this.windowPaths.get(mainWin.id)
+      if (mainPath) return mainPath
+    }
+    // Fallback to the first path in windowPaths
+    if (this.windowPaths.size > 0) {
+      const firstPath = this.windowPaths.values().next().value
+      if (firstPath) return firstPath
+    }
+    // Fallback to history
+    const history = this.getHistory()
+    const activeEntry = history.find(e => e.exists && e.path)
+    if (activeEntry) return activeEntry.path
+    return null
+  }
+
+  public getPathForWebContents(webContents: Electron.WebContents | null): string | null {
+    if (!webContents) {
+      console.warn('[WorkspaceManager] getPathForWebContents: webContents is null')
+      return null
+    }
+    let win = BrowserWindow.fromWebContents(webContents)
+    if (!win) {
+      for (const w of BrowserWindow.getAllWindows()) {
+        if (!w.isDestroyed() && w.webContents === webContents) {
+          win = w
+          break
+        }
+      }
+    }
+    const path = this.getPathForWindow(win)
+    return path
+  }
+
+  private getHistoryFromCache(): WorkspaceHistoryEntry[] {
+    try {
+      const db = DatabaseManager.getInstance()
+      const rows = db.query("SELECT value FROM DbCache WHERE key = 'workspace_history'") as { value: string }[]
+      if (rows && rows.length > 0 && rows[0].value) {
+        return JSON.parse(rows[0].value) as WorkspaceHistoryEntry[]
+      }
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to read workspace history from cache:', err)
+    }
+    return []
+  }
+
+  private async saveHistoryToCache(history: WorkspaceHistoryEntry[]): Promise<void> {
+    try {
+      const dbPath = DatabaseManager.getInstance().getGlobalDBPath()
+      const { DatabaseWriter } = await import('./db-writer.js')
+      await DatabaseWriter.getInstance().execute(dbPath, "INSERT OR REPLACE INTO DbCache (key, value) VALUES ('workspace_history', ?)", [JSON.stringify(history)])
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to save workspace history to cache:', err)
+    }
+  }
+
+  private saveLastWorkspacePath(pathStr: string): void {
+    try {
+      const file = join(app.getPath('userData'), 'last-workspace.json')
+      fs.writeFileSync(file, JSON.stringify({ path: pathStr, timestamp: Date.now() }), 'utf8')
+      console.log(`[WorkspaceManager:saveLastWorkspacePath] Saved last workspace path: "${pathStr}"`)
+    } catch (err) {
+      console.warn('[WorkspaceManager:saveLastWorkspacePath] Failed to save last workspace path:', err)
+    }
+  }
+
+  private getLastWorkspacePath(): string | null {
+    try {
+      const file = join(app.getPath('userData'), 'last-workspace.json')
+      if (fs.existsSync(file)) {
+        const content = fs.readFileSync(file, 'utf8')
+        const data = JSON.parse(content)
+        if (data && data.path && fs.existsSync(data.path)) {
+          return data.path
+        }
+      }
+    } catch (err) {
+      console.warn('[WorkspaceManager:getLastWorkspacePath] Failed to get last workspace path:', err)
+    }
+    return null
+  }
+
+  /**
+   * 获取初始工作区路径。
+   * 优先恢复用户上一次关闭前使用的有效工作区路径。
+   */
+  public getInitialWorkspacePath(): string | null {
+    try {
+      // 1. 始终确保默认工作区存在
+      const defaultWorkspace = getDefaultWorkspacePath()
+      this.ensureDefaultWorkspace(defaultWorkspace)
+
+      // 2. 优先返回用户最后一次打开/使用的工作区
+      const lastPath = this.getLastWorkspacePath()
+      if (lastPath && fs.existsSync(lastPath)) {
+        console.log(`[WorkspaceManager] Restored last active workspace: "${lastPath}"`)
+        return lastPath
+      }
+
+      // 3. 若 DB 就绪，尝试从历史数组中查找有效工作区
+      const db = DatabaseManager.getInstance()
+      if (db.isReady()) {
+        const history = this.getHistory()
+        for (const entry of history) {
+          if (entry.exists && entry.path && fs.existsSync(entry.path)) {
+            console.log(`[WorkspaceManager] Found active workspace from history: "${entry.path}"`)
+            return entry.path
+          }
+        }
+      }
+
+      // 4. 无历史 → 返回默认工作区
+      console.log(`[WorkspaceManager] Falling back to default workspace: "${defaultWorkspace}"`)
+      return defaultWorkspace
+    } catch (err) {
+      console.error('🚨 [WorkspaceManager:ERROR] Failed to get initial workspace path:', err)
+    }
+    return getDefaultWorkspacePath()
+  }
+
+  /**
+   * 确保默认工作区在历史记录中（给 Dashboard 展示用）。
+   * 幂等操作，已存在则跳过。仅在 DB 就绪后调用。
+   */
+  private ensureDefaultWorkspaceInHistory(defaultWorkspace: string): void {
+    try {
+      const defaultNormalized = normalizePath(defaultWorkspace);
+      const alreadyInHistory = this.getHistory().some(e => normalizePath(e.path) === defaultNormalized);
+      if (!alreadyInHistory) {
+        this.addToHistory(defaultWorkspace);
+      }
+    } catch (err) {
+      console.warn('[WorkspaceManager] Failed to ensure default workspace in history:', err)
+    }
+  }
+
+  /** 确保默认工作区存在（初始化目录 + workspace.json 元数据） */
+  private ensureDefaultWorkspace(defaultPath: string): void {
+    if (!fs.existsSync(defaultPath)) {
+      fs.mkdirSync(defaultPath, { recursive: true });
+    }
+    const dotFolder = join(defaultPath, WORKSPACE_DIR_NAME);
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME);
+    if (!fs.existsSync(dotFolder)) {
+      fs.mkdirSync(dotFolder, { recursive: true });
+    }
+    if (!fs.existsSync(metaFile)) {
+      const calendarUuid = this.generateUuid();
+      fs.writeFileSync(metaFile, JSON.stringify({
+        calendarUuid,
+        name: '默认工作区'
+      }, null, 2), 'utf8');
+    }
+  }
+
+  public addToHistory(p: string): void {
+    if (!p) return
+    if (p.includes('.berrytrace/tmp') || p.includes('.berrytrace\\tmp')) {
+      return;
+    }
+    try {
+      const normalizedPath = normalizePath(p)
+      if (!normalizedPath) return
+
+      let name = basename(normalizedPath)
+      let calendarUuid = 0
+      const dotFolder = join(normalizedPath, WORKSPACE_DIR_NAME)
+      const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+      if (fs.existsSync(metaFile)) {
+        try {
+          const content = fs.readFileSync(metaFile, 'utf8')
+          const data = JSON.parse(content)
+          if (data.name) name = data.name
+          if (data.calendarUuid) calendarUuid = Number(data.calendarUuid)
+        } catch (_) {
+          // ignore parsing error
+        }
+      }
+
+      const history = this.getHistoryFromCache()
+      const filtered = history.filter(item => normalizePath(item.path) !== normalizedPath)
+      filtered.unshift({
+        path: normalizedPath,
+        name,
+        calendarUuid,
+        updatedAt: new Date().toISOString()
+      })
+      this.saveHistoryToCache(filtered.slice(0, 50))
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to add to history:', err)
+    }
+  }
+
+  public getHistory(): WorkspaceHistoryEntry[] {
+    const list = this.getHistoryFromCache()
+    const history: WorkspaceHistoryEntry[] = []
+    const seenPaths = new Set<string>()
+    for (const entry of list) {
+      const normalizedPath = normalizePath(entry.path)
+      if (normalizedPath && !seenPaths.has(normalizedPath)) {
+        seenPaths.add(normalizedPath)
+        history.push({
+          path: normalizedPath,
+          name: entry.name || basename(normalizedPath),
+          calendarUuid: entry.calendarUuid || 0,
+          exists: fs.existsSync(normalizedPath)
+        })
+      }
+    }
+    return history
+  }
+
+  public removeFromHistory(p: string): void {
+    try {
+      const normalizedPath = normalizePath(p)
+      if (!normalizedPath) return
+      // 默认工作区不可删除
+      if (normalizedPath === normalizePath(getDefaultWorkspacePath())) {
+        console.log(`[WorkspaceManager] 默认工作区不可删除: ${p}`)
+        return
+      }
+      const history = this.getHistoryFromCache()
+      const filtered = history.filter(item => normalizePath(item.path) !== normalizedPath)
+      this.saveHistoryToCache(filtered)
+      console.log(`[WorkspaceManager] Removed from history: ${p}`)
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to remove from history:', err)
+    }
+  }
+
+  public async createWorkspace(parentPath: string, name: string, win: BrowserWindow | null): Promise<{ success: boolean; path?: string; error?: string }> {
+    if (!parentPath || !name) {
+      throw new Error('参数不完整')
+    }
+    const targetPath = join(parentPath, name)
+    const dotFolder = join(targetPath, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+
+    // Check if the directory and the workspace.json metadata exist
+    if (fs.existsSync(metaFile)) {
+      let existingUuid: number | null = null
+      let existingName = name
+      try {
+        const content = fs.readFileSync(metaFile, 'utf8')
+        const data = JSON.parse(content)
+        existingUuid = Number(data.calendarUuid) || null
+        if (data.name) existingName = data.name
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to parse existing workspace.json:', err)
+      }
+
+      if (existingUuid) {
+        // Set path and load workspace
+        if (win) {
+          await this.setPathForWindow(win, targetPath)
+        }
+        return { success: true, path: targetPath }
+      }
+    }
+
+    // Case 4: Totally new workspace creation (workspace.json doesn't exist)
+    const calendarUuid = this.generateUuid()
+
+    if (!fs.existsSync(targetPath)) {
+      fs.mkdirSync(targetPath, { recursive: true })
+    }
+    if (!fs.existsSync(dotFolder)) {
+      fs.mkdirSync(dotFolder, { recursive: true })
+    }
+
+    const data = {
+      calendarUuid,
+      name
+    }
+    fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+
+    if (win) {
+      await this.setPathForWindow(win, targetPath)
+    }
+    return { success: true, path: targetPath }
+  }
+
+  // generateUniqueId 使用
+  private generateUuid(): number {
+    return generateUniqueId();
+  }
+
+  // ensureCalendarInDb and resetWorkspaceOwnership removed
+
+  public getMetadataForWindow(win: BrowserWindow): { path: string | null; name: string; calendarUuid: number; ribbonOrder?: string[]; recentDocuments?: Array<{ path: string; title: string; lastOpened: number }>; error?: string; [key: string]: any } {
+    const p = this.getPathForWindow(win)
+    if (!p || !fs.existsSync(p)) {
+      if (p) {
+        this.windowPaths.delete(win.id)
+      }
+      return { path: null, name: '', calendarUuid: 0 }
+    }
+
+    this.addToHistory(p)
+
+    const dotFolder = join(p, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+
+    try {
+      if (!fs.existsSync(dotFolder)) {
+        fs.mkdirSync(dotFolder, { recursive: true })
+      }
+
+      let data: any = {}
+      if (fs.existsSync(metaFile)) {
+        try {
+          const content = fs.readFileSync(metaFile, 'utf8')
+          data = JSON.parse(content)
+        } catch (_) {
+          // ignore
+        }
+      }
+
+      let calendarUuid = Number(data.calendarUuid) || null
+      const name = data.name || basename(p)
+
+      if (!calendarUuid) {
+        calendarUuid = this.generateUuid()
+        data.calendarUuid = calendarUuid
+        data.name = name
+        fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+      }
+
+      // Local workspace metadata loaded
+
+      return {
+        path: p,
+        name,
+        calendarUuid,
+        ribbonOrder: data.ribbonOrder || [],
+        recentDocuments: data.recentDocuments || [],
+        ...data
+      }
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to read/write workspace metadata:', err)
+      return {
+        path: p,
+        name: basename(p),
+        calendarUuid: 0,
+        ribbonOrder: []
+      }
+    }
+  }
+
+
+  /**
+   * 添加文档到最近打开列表
+   * @param win 浏览器窗口
+   * @param filePath 文件路径
+   * @param title 文件标题
+   */
+  public async addRecentDocument(win: BrowserWindow, filePath: string, title: string): Promise<void> {
+    const p = this.getPathForWindow(win)
+    if (!p) return
+
+    const dotFolder = join(p, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+
+    try {
+      let data: any = {}
+      if (fs.existsSync(metaFile)) {
+        const content = fs.readFileSync(metaFile, 'utf8')
+        data = JSON.parse(content)
+      }
+
+      // 初始化 recentDocuments 数组
+      if (!data.recentDocuments) {
+        data.recentDocuments = []
+      }
+
+      // 移除已存在的相同路径（去重）
+      data.recentDocuments = data.recentDocuments.filter(
+        (doc: { path: string }) => doc.path !== filePath
+      )
+
+      // 添加到开头
+      data.recentDocuments.unshift({
+        path: filePath,
+        title: title || basename(filePath),
+        lastOpened: Date.now()
+      })
+
+      // 限制最多 20 条
+      if (data.recentDocuments.length > 20) {
+        data.recentDocuments = data.recentDocuments.slice(0, 20)
+      }
+
+      // 写回文件
+      fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to add recent document:', err)
+    }
+  }
+
+  /**
+   * 获取最近打开的文档列表
+   * @param win 浏览器窗口
+   * @returns 最近文档列表，按时间降序排列
+   */
+  public getRecentDocuments(win: BrowserWindow): Array<{ path: string; title: string; lastOpened: number }> {
+    const metadata = this.getMetadataForWindow(win)
+    return metadata.recentDocuments || []
+  }
+
+
+  public async selectFolder(): Promise<string | null> {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory', 'createDirectory'],
+      title: '选择白板印记本地仓库目录',
+      buttonLabel: '选择目录'
+    })
+    if (result.canceled || result.filePaths.length === 0) {
+      return null
+    }
+    return result.filePaths[0]
+  }
+
+  public async setPathForWindow(win: BrowserWindow | null, path: string | null): Promise<boolean> {
+    const winId = win ? win.id : 0
+    // Normalize path to ensure absolute path format
+    const normalizedPath = path ? normalizePath(path) : null
+    const currentPath = win ? (this.windowPaths.get(winId) || null) : null
+    if (currentPath === normalizedPath) {
+      return true
+    }
+
+    // Phase 1: Delegate watcher lifecycle to WorkspaceContextManager.
+    // WorkspaceManager retains window-path mapping for getPathForWindow() compatibility,
+    // but watcher + change workflow now live in WorkspaceContext (主进程常驻，不依赖窗口).
+    const { WorkspaceContextManager } = await import('./workspace-context-manager')
+    const wcm = WorkspaceContextManager.getInstance()
+
+    if (win) {
+      if (normalizedPath) {
+        if (!this.windowPaths.has(winId)) {
+          win.once('closed', () => {
+            const p = this.windowPaths.get(winId)
+            console.log(`[WorkspaceManager] Window ${winId} closed. Current path associated: "${p}"`)
+            this.windowPaths.delete(winId)
+            wcm.unbindWindow(winId)
+          })
+        }
+        this.windowPaths.set(winId, normalizedPath)
+        wcm.bindWindow(win, normalizedPath)
+      } else {
+        this.windowPaths.delete(winId)
+        wcm.unbindWindow(winId)
+      }
+    }
+
+    if (currentPath && currentPath !== normalizedPath) {
+      // 窗口切换走了，但 Context 不销毁（保留常驻以便快速恢复）
+      // watcher 由 WorkspaceContext 管理，不在此处停止
+      console.log(`[WorkspaceManager] Window ${winId} context changed from "${currentPath}" to "${normalizedPath}". Context preserved.`)
+    }
+
+    if (path) {
+      this.addToHistory(path)
+      this.saveLastWorkspacePath(path)
+
+      const dotFolder = join(path, WORKSPACE_DIR_NAME)
+      const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+
+      // 确保该工作区的 WorkspaceContext 存在并激活（watcher 在 Context 内启动）
+      await wcm.ensureContext(path)
+      // 更新活跃 Context 指针（工作区切换 = 换指针，不触发插件 reload）
+      wcm.setActiveContext(path)
+
+      // Load workspace schedule
+      try {
+        // PluginScheduler.getInstance().loadWorkspaceSchedule(path)
+        //延迟 加载 workspaceSchedule
+        setTimeout(async () => {
+          const { PluginScheduler } = await import('../plugins/scheduler')
+          PluginScheduler.getInstance().loadWorkspaceSchedule(path)
+          const { WorkflowRunner } = await import('../plugins/workflow-runner')
+          WorkflowRunner.getInstance().loadWorkspaceWorkflows(path)
+        }, 5000)
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to load workspace schedule or workflows:', err)
+      }
+
+      // Trigger buffer window workspace changed
+      import('../windows/buffer-window').then(({ ElectronBufferWindow }) => {
+        ElectronBufferWindow.getInstance().onWorkspaceChanged()
+      }).catch(err => {
+        console.error('Failed to notify buffer window of workspace change:', err)
+      })
+
+      // Trigger background indexing check for the newly opened workspace
+      setTimeout(() => {
+        import('./fulltext-index-manager.js').then(({ FullTextIndexManager }) => {
+          FullTextIndexManager.getInstance().checkAndBuildFileIndexForWorkspace(path).catch(err => {
+            console.error('[WorkspaceManager] Failed to trigger background index check for workspace:', path, err)
+          })
+        }).catch(err => {
+          console.error('[WorkspaceManager] Failed to load FullTextIndexManager dynamically:', err)
+        })
+      }, 6000)
+
+      if (win) {
+        if (!currentPath) {
+          // First-time setup: let app know and trigger window creation
+          console.log(`[WorkspaceManager] Initialized workspace path at ${path} for window ${winId}`)
+          this.onWorkspaceInitializedCallback?.()
+        } else {
+          // Switching workspace: broadcast workspace:switched
+          // NOTE: workspace:switched is the new semantic event for actual workspace switches.
+          // workspace:changed is kept for backward compatibility but deprecated.
+          console.log(`[WorkspaceManager] Workspace switched from ${currentPath} to ${path} for window ${winId}`)
+          win.webContents.send('workspace:switched')
+          win.webContents.send('workspace:changed') // deprecated, kept for compatibility
+
+          // Phase 2: Broadcast workspace:context-changed to background plugins
+          // This allows background plugins (e.g. daily-chronicle) to update their
+          // internally cached workspacePath without being unloaded/reloaded.
+          try {
+            const { PluginManager } = await import('../plugins/plugin-manager')
+            PluginManager.getInstance().broadcastSystemEvent('workspace:context-changed', {
+              oldWorkspacePath: currentPath,
+              newWorkspacePath: path
+            })
+          } catch (err) {
+            console.warn('[WorkspaceManager] Failed to broadcast workspace:context-changed:', err)
+          }
+        }
+      }
+    }
+    return true
+  }
+
+  public relaunch(): void {
+    app.relaunch()
+    app.exit(0)
+  }
+
+  private isSafePath(filePath: string, wsPath: string | null): boolean {
+    const resolvedPath = join(filePath)
+    let safe = false
+    if (wsPath && resolvedPath.startsWith(join(wsPath))) {
+      safe = true
+    } else {
+      const history = this.getHistory()
+      safe = history.some(entry => entry.path && resolvedPath.startsWith(join(entry.path)))
+    }
+    console.log('[WorkspaceManager] isSafePath:', { filePath, wsPath, resolvedPath, safe })
+    return safe
+  }
+
+  public async readDir(dirPath?: string, wsPath?: string | null): Promise<unknown[]> {
+    const rootPath = dirPath || wsPath || null
+    if (!rootPath || !fs.existsSync(rootPath)) {
+      return []
+    }
+
+    const items: unknown[] = []
+    try {
+      const files = await fs.promises.readdir(rootPath, { withFileTypes: true })
+      for (const file of files) {
+        const name = file.name
+        if (
+          name === '.git' ||
+          name === 'node_modules' ||
+          name === WORKSPACE_DIR_NAME ||
+          name === '.DS_Store' ||
+          name.startsWith('.')
+        ) {
+          continue
+        }
+
+        const fullPath = join(rootPath, name)
+        let isFolder = file.isDirectory()
+        let mtime = 0
+        let size = 0
+
+        try {
+          const stats = fs.statSync(fullPath)
+          isFolder = stats.isDirectory()
+          mtime = stats.mtimeMs
+          size = stats.size
+        } catch (_) {
+          // ignore stat errors
+        }
+
+        items.push({
+          name,
+          path: fullPath,
+          isFolder,
+          mtime,
+          size: isFolder ? undefined : size
+        })
+      }
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to read directory:', rootPath, err)
+    }
+
+    return items
+  }
+
+  public async readDirRecursively(dirPath?: string, wsPath?: string | null): Promise<unknown[]> {
+    const rootPath = dirPath || wsPath || null
+    if (!rootPath || !fs.existsSync(rootPath)) {
+      return []
+    }
+
+    const items: unknown[] = []
+    try {
+      const files = await fs.promises.readdir(rootPath, { withFileTypes: true })
+      for (const file of files) {
+        const name = file.name
+        if (
+          name === '.git' ||
+          name === 'node_modules' ||
+          name === WORKSPACE_DIR_NAME ||
+          name === '.DS_Store' ||
+          name.startsWith('.')
+        ) {
+          continue
+        }
+
+        const fullPath = join(rootPath, name)
+        let isFolder = file.isDirectory()
+        let mtime = 0
+        let size = 0
+
+        try {
+          const stats = fs.statSync(fullPath)
+          isFolder = stats.isDirectory()
+          mtime = stats.mtimeMs
+          size = stats.size
+        } catch (_) {
+          // ignore stat errors
+        }
+
+        if (isFolder) {
+          const children = await this.readDirRecursively(fullPath, wsPath)
+          items.push({
+            name,
+            path: fullPath,
+            isFolder: true,
+            children,
+            mtime
+          })
+        } else {
+          items.push({
+            name,
+            path: fullPath,
+            isFolder: false,
+            mtime,
+            size
+          })
+        }
+      }
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to read directory:', rootPath, err)
+    }
+
+    return items
+  }
+
+  public async createFile(parentPath: string, name: string, wsPath: string | null, content?: string): Promise<string> {
+    const targetPath = join(parentPath, name)
+    if (!this.isSafePath(targetPath, wsPath)) {
+      throw new Error('Unauthorized workspace path for file creation')
+    }
+
+    let title = name
+    if (name.toLowerCase().endsWith('.md')) {
+      title = name.substring(0, name.length - 3)
+    }
+
+    const defaultContent = content !== undefined ? content : `# ${title}\n\n`
+    await fs.promises.writeFile(targetPath, defaultContent, 'utf8')
+    return targetPath
+  }
+
+  public async createDirectory(parentPath: string, name: string, wsPath: string | null): Promise<string> {
+    const targetPath = join(parentPath, name)
+    if (!this.isSafePath(targetPath, wsPath)) {
+      throw new Error('Unauthorized workspace path for directory creation')
+    }
+
+    await fs.promises.mkdir(targetPath, { recursive: true })
+    return targetPath
+  }
+
+  public async deleteItem(itemPath: string, wsPath: string | null): Promise<boolean> {
+    console.log('[WorkspaceManager] deleteItem called with:', { itemPath, wsPath })
+    if (!this.isSafePath(itemPath, wsPath)) {
+      console.error('[WorkspaceManager] deleteItem safety check failed for:', itemPath)
+      throw new Error('Unauthorized workspace path for deletion')
+    }
+
+    const exists = fs.existsSync(itemPath)
+    console.log('[WorkspaceManager] deleteItem file exists:', exists, 'for path:', itemPath)
+    if (exists) {
+      try {
+        console.log('[WorkspaceManager] deleteItem calling shell.trashItem for:', itemPath)
+        await shell.trashItem(itemPath)
+        console.log('[WorkspaceManager] Successfully trashed item:', itemPath)
+      } catch (trashErr: any) {
+        console.error('[WorkspaceManager] shell.trashItem failed for:', itemPath, 'Error:', trashErr)
+        throw trashErr
+      }
+      try {
+        const { PluginManager } = require('../plugins/plugin-manager')
+        const pm = PluginManager.getInstance()
+        const payload = { filePath: itemPath, timestamp: Date.now() }
+        pm.getPluginsList().forEach((p: any) => {
+          if (pm.isBackgroundPluginRunning(p.id)) {
+            pm.emitToBackgroundPlugin(p.id, 'workspace:file-deleted', payload)
+          }
+        })
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to emit workspace:file-deleted:', err)
+      }
+      return true
+    }
+    return false
+  }
+
+  public async renameItem(oldPath: string, newPath: string, wsPath: string | null): Promise<boolean> {
+    if (!this.isSafePath(oldPath, wsPath) || !this.isSafePath(newPath, wsPath)) {
+      throw new Error('Unauthorized workspace path for renaming')
+    }
+
+    if (fs.existsSync(oldPath)) {
+      // If the destination already exists, generate a unique name to avoid overwriting
+      let resolvedNewPath = newPath
+      if (fs.existsSync(newPath) && newPath !== oldPath) {
+        const dir = dirname(newPath)
+        const ext = extname(newPath)
+        const base = basename(newPath, ext)
+        let counter = 1
+        do {
+          resolvedNewPath = join(dir, `${base} ${counter}${ext}`)
+          counter++
+        } while (fs.existsSync(resolvedNewPath))
+      }
+      await fs.promises.rename(oldPath, resolvedNewPath)
+      try {
+        const { PluginManager } = require('../plugins/plugin-manager')
+        const pm = PluginManager.getInstance()
+        const payload = { oldPath, newPath: resolvedNewPath, timestamp: Date.now() }
+        pm.getPluginsList().forEach((p: any) => {
+          if (pm.isBackgroundPluginRunning(p.id)) {
+            pm.emitToBackgroundPlugin(p.id, 'workspace:file-renamed', payload)
+          }
+        })
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to emit workspace:file-renamed:', err)
+      }
+      return true
+    }
+    return false
+  }
+
+  public async duplicateItem(itemPath: string, wsPath: string | null): Promise<string> {
+    if (!this.isSafePath(itemPath, wsPath)) {
+      throw new Error('Unauthorized workspace path for duplicating')
+    }
+
+    if (!fs.existsSync(itemPath)) {
+      throw new Error('Item does not exist')
+    }
+
+    const dir = dirname(itemPath)
+    const ext = extname(itemPath)
+    const base = basename(itemPath, ext)
+
+    let newPath: string
+    let counter = 1
+    do {
+      newPath = join(dir, `${base} 副本${counter === 1 ? '' : counter}${ext}`)
+      counter++
+    } while (fs.existsSync(newPath))
+
+    const stat = fs.statSync(itemPath)
+    if (stat.isDirectory()) {
+      await fs.promises.cp(itemPath, newPath, { recursive: true })
+    } else {
+      await fs.promises.copyFile(itemPath, newPath)
+    }
+    return newPath
+  }
+
+  public async importItem(srcPath: string, targetPath: string, wsPath: string | null): Promise<string> {
+    if (!this.isSafePath(targetPath, wsPath)) {
+      throw new Error('Unauthorized workspace path for import destination')
+    }
+
+    if (!fs.existsSync(srcPath)) {
+      throw new Error('Source file or directory does not exist')
+    }
+
+    const ext = extname(srcPath)
+    const base = basename(srcPath, ext)
+    let destPath = join(targetPath, `${base}${ext}`)
+    let counter = 1
+    while (fs.existsSync(destPath)) {
+      destPath = join(targetPath, `${base} (${counter})${ext}`)
+      counter++
+    }
+
+    const stat = fs.statSync(srcPath)
+    if (stat.isDirectory()) {
+      await fs.promises.cp(srcPath, destPath, { recursive: true })
+    } else {
+      await fs.promises.copyFile(srcPath, destPath)
+    }
+    return destPath
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // DEPRECATED: 以下方法已迁移到 WorkspaceContext（方案 C Phase 1）
+  // 文件 watcher 和 change workflow 现在由 WorkspaceContext 管理，常驻主进程。
+  // 这些桩保留仅为向后兼容，不应再被调用。调用会输出警告日志。
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** @deprecated Use WorkspaceContext.activate() instead */
+  public startWatcherForPath(p: string): void {
+    console.warn('[WorkspaceManager] startWatcherForPath is deprecated. Use WorkspaceContext.activate() instead.')
+  }
+
+  /** @deprecated Use WorkspaceContext.deactivate() instead */
+  public stopWatcherForPath(p: string): void {
+    console.warn('[WorkspaceManager] stopWatcherForPath is deprecated. Use WorkspaceContext.deactivate() instead.')
+    // 清理旧的 debounce 定时器（如果存在）
+    const debounceTimeout = this.debounceTimeouts.get(p)
+    if (debounceTimeout) {
+      clearTimeout(debounceTimeout)
+      this.debounceTimeouts.delete(p)
+    }
+    const structureTimeout = this.structureDebounceTimeouts.get(p)
+    if (structureTimeout) {
+      clearTimeout(structureTimeout)
+      this.structureDebounceTimeouts.delete(p)
+    }
+    this.changedFilesMap.delete(p)
+    for (const [key, timeout] of this.fileChangeDebounceTimeouts.entries()) {
+      if (key.startsWith(`${p}:`)) {
+        clearTimeout(timeout)
+        this.fileChangeDebounceTimeouts.delete(key)
+      }
+    }
+  }
+
+  /** @deprecated Handled by WorkspaceContext internally */
+  private notifyWorkspaceStructureChanged(_p: string): void {
+    // No-op: migrated to WorkspaceContext
+  }
+
+  /** @deprecated Handled by WorkspaceContext internally */
+  private notifyWorkspaceContentChanged(_p: string): void {
+    // No-op: migrated to WorkspaceContext
+  }
+
+  /** @deprecated Handled by WorkspaceContext internally */
+  private globToRegex(_glob: string): RegExp {
+    return new RegExp('', 'i')
+  }
+
+  /** @deprecated Handled by WorkspaceContext internally */
+  private parseChangeMd(_content: string) {
+    return { watch: [] as string[], ignore: [] as string[], cooldown: 10, execute: '', ifStatus: '', prompt: '' }
+  }
+
+  /** @deprecated Handled by WorkspaceContext.runChangeWorkflow() instead */
+  private async runChangeWorkflow(_workDir: string): Promise<void> {
+    // No-op: migrated to WorkspaceContext
+  }
+
+  public getCalendarFolder(calendarUuid: number): { path: string | null; exists: boolean } {
+    try {
+      const checkPath = (wsPath: string): string | null => {
+        if (!wsPath || !fs.existsSync(wsPath)) return null
+        try {
+          const metaFile = join(wsPath, WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME)
+          if (fs.existsSync(metaFile)) {
+            const data = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+            if (Number(data.calendarUuid) === calendarUuid) {
+              return wsPath
+            }
+          }
+        } catch {
+          // ignore
+        }
+        return null
+      }
+
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = this.getPathForWindow(win)
+        if (wsPath) {
+          const matched = checkPath(wsPath)
+          if (matched) return { path: matched, exists: true }
+        }
+      }
+
+      const history = this.getHistory()
+      for (const entry of history) {
+        const matched = checkPath(entry.path)
+        if (matched) return { path: matched, exists: true }
+      }
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to get calendar folder:', err)
+    }
+    return { path: null, exists: false }
+  }
+
+  public async associateRemoteCalendar(calendarUuid: number, name: string, folderPath: string): Promise<{ success: boolean; error?: string }> {
+    if (!calendarUuid || !name || !folderPath) {
+      throw new Error('参数不完整')
+    }
+
+    const dotFolder = join(folderPath, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+
+    // Check if the metafile already exists and has a different uuid
+    if (fs.existsSync(metaFile)) {
+      try {
+        const content = fs.readFileSync(metaFile, 'utf8')
+        const data = JSON.parse(content)
+        const existingUuid = Number(data.calendarUuid)
+        if (existingUuid && existingUuid !== calendarUuid) {
+          const choice = dialog.showMessageBoxSync({
+            type: 'warning',
+            buttons: ['覆盖关联', '取消'],
+            defaultId: 1,
+            cancelId: 1,
+            title: '目录已被占用',
+            message: `所选文件夹已绑定了另一个本地仓库 (UUID: ${existingUuid})。`,
+            detail: '如果您继续，该目录将被重新绑定到当前选择的远程空间，原有本地空间关联将失效。是否确认覆盖？'
+          })
+          if (choice === 1) {
+            return { success: false, error: 'USER_CANCELLED' }
+          }
+        }
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to read existing workspace.json:', err)
+      }
+    }
+
+    // Ensure folder structure exists
+    if (!fs.existsSync(folderPath)) {
+      fs.mkdirSync(folderPath, { recursive: true })
+    }
+    if (!fs.existsSync(dotFolder)) {
+      fs.mkdirSync(dotFolder, { recursive: true })
+    }
+
+    // Write workspace.json
+    const data = {
+      calendarUuid,
+      name,
+      recentDocuments: []
+    }
+    fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+
+    // Associated remote calendar locally in workspace.json
+
+    return { success: true }
+  }
+
+  public async searchContent(wsPath: string | null, query: string): Promise<any[]> {
+    if (!wsPath || !fs.existsSync(wsPath) || !query) {
+      return []
+    }
+
+    const results: any[] = []
+    const cleanQuery = query.toLowerCase().trim()
+    if (!cleanQuery) return []
+
+    const traverse = async (dir: string) => {
+      if (results.length >= 100) return
+      const files = await fs.promises.readdir(dir, { withFileTypes: true })
+      for (const file of files) {
+        if (results.length >= 100) return
+        const name = file.name
+        if (
+          name === '.git' ||
+          name === 'node_modules' ||
+          name === WORKSPACE_DIR_NAME ||
+          name === '.DS_Store' ||
+          name.startsWith('.')
+        ) {
+          continue
+        }
+
+        const fullPath = join(dir, name)
+        if (file.isDirectory()) {
+          await traverse(fullPath)
+        } else {
+          const ext = extname(name).toLowerCase()
+          if (ext === '.md' || ext === '.txt') {
+            try {
+              const content = await fs.promises.readFile(fullPath, 'utf8')
+              const lowerContent = content.toLowerCase()
+
+              if (lowerContent.includes(cleanQuery)) {
+                const lines = content.split('\n')
+                for (let i = 0; i < lines.length; i++) {
+                  const line = lines[i]
+                  const lowerLine = line.toLowerCase()
+                  const index = lowerLine.indexOf(cleanQuery)
+                  if (index !== -1) {
+                    const start = Math.max(0, index - 20)
+                    const end = Math.min(line.length, index + cleanQuery.length + 30)
+                    let snippet = line.substring(start, end)
+                    if (start > 0) snippet = '...' + snippet
+                    if (end < line.length) snippet = snippet + '...'
+
+                    results.push({
+                      path: fullPath,
+                      fileName: name,
+                      line: i + 1,
+                      snippet: snippet.trim()
+                    })
+                    if (results.filter(r => r.path === fullPath).length >= 3) {
+                      break
+                    }
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn('[WorkspaceManager] Failed to read file for searchContent:', fullPath, err)
+            }
+          }
+        }
+      }
+    }
+
+    try {
+      await traverse(wsPath)
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to search content in:', wsPath, err)
+    }
+
+    return results
+  }
+
+  public async saveRibbonOrder(wsPath: string | null, ribbonOrder: string[]): Promise<boolean> {
+    if (!wsPath || !fs.existsSync(wsPath)) {
+      return false
+    }
+    const dotFolder = join(wsPath, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+    try {
+      if (!fs.existsSync(dotFolder)) {
+        fs.mkdirSync(dotFolder, { recursive: true })
+      }
+      let data: any = {}
+      if (fs.existsSync(metaFile)) {
+        try {
+          const content = fs.readFileSync(metaFile, 'utf8')
+          data = JSON.parse(content)
+        } catch (_) {
+          // ignore
+        }
+      }
+      data.ribbonOrder = ribbonOrder
+      fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+      return true
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to save ribbon order:', err)
+      return false
+    }
+  }
+
+  public async updateMetadata(wsPath: string | null, updates: Record<string, any>): Promise<boolean> {
+    if (!wsPath || !fs.existsSync(wsPath)) {
+      return false
+    }
+    const dotFolder = join(wsPath, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+    try {
+      if (!fs.existsSync(dotFolder)) {
+        fs.mkdirSync(dotFolder, { recursive: true })
+      }
+      let data: any = {}
+      if (fs.existsSync(metaFile)) {
+        try {
+          const content = fs.readFileSync(metaFile, 'utf8')
+          data = JSON.parse(content)
+        } catch (_) {
+          // ignore
+        }
+      }
+      data = { ...data, ...updates }
+      fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+      return true
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to update metadata:', err)
+      return false
+    }
+  }
+
+  // ─── Phase 3: per-workspace plugin overrides ───────────────────────
+
+  /** 获取工作区的插件 override 配置 */
+  public async getPluginOverrides(wsPath: string | null): Promise<Record<string, { enabled?: boolean; config?: Record<string, unknown> }>> {
+    if (!wsPath || !fs.existsSync(wsPath)) return {}
+    const metaFile = join(wsPath, WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME)
+    try {
+      if (!fs.existsSync(metaFile)) return {}
+      const content = fs.readFileSync(metaFile, 'utf8')
+      const data = JSON.parse(content)
+      return data.pluginOverrides || {}
+    } catch (err) {
+      console.error('[WorkspaceManager] Failed to get plugin overrides:', err)
+      return {}
+    }
+  }
+
+  /** 设置工作区中某个插件的 override */
+  public async setPluginOverride(wsPath: string | null, pluginId: string, enabled: boolean): Promise<boolean> {
+    console.log(`[WorkspaceManager] setPluginOverride called: wsPath=${wsPath}, pluginId=${pluginId}, enabled=${enabled}`)
+    if (!wsPath || !fs.existsSync(wsPath)) {
+      console.warn(`[WorkspaceManager] setPluginOverride: wsPath invalid or not exists: ${wsPath}`)
+      return false
+    }
+    const dotFolder = join(wsPath, WORKSPACE_DIR_NAME)
+    const metaFile = join(dotFolder, WORKSPACE_META_FILE_NAME)
+    console.log(`[WorkspaceManager] setPluginOverride: dotFolder=${dotFolder}, metaFile=${metaFile}`)
+    try {
+      if (!fs.existsSync(dotFolder)) {
+        console.log(`[WorkspaceManager] setPluginOverride: creating dotFolder`)
+        fs.mkdirSync(dotFolder, { recursive: true })
+      }
+      let data: any = {}
+      if (fs.existsSync(metaFile)) {
+        try {
+          const content = fs.readFileSync(metaFile, 'utf8')
+          data = JSON.parse(content)
+          console.log(`[WorkspaceManager] setPluginOverride: read existing meta, keys=${Object.keys(data).join(',')}`)
+        } catch (parseErr) {
+          console.warn(`[WorkspaceManager] setPluginOverride: failed to parse meta, using empty`, parseErr)
+        }
+      } else {
+        console.log(`[WorkspaceManager] setPluginOverride: metaFile does not exist, creating new`)
+      }
+      if (!data.pluginOverrides) {
+        data.pluginOverrides = {}
+      }
+      data.pluginOverrides[pluginId] = { ...data.pluginOverrides[pluginId], enabled }
+      fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+      console.log(`[WorkspaceManager] setPluginOverride: SUCCESS wrote ${pluginId}=${enabled} to ${metaFile}`)
+      return true
+    } catch (err) {
+      console.error('[WorkspaceManager] setPluginOverride: FAILED', err)
+      return false
+    }
+  }
+
+  /** 删除工作区中某个插件的 override（恢复为跟随全局） */
+  public async removePluginOverride(wsPath: string | null, pluginId: string): Promise<boolean> {
+    console.log(`[WorkspaceManager] removePluginOverride called: wsPath=${wsPath}, pluginId=${pluginId}`)
+    if (!wsPath || !fs.existsSync(wsPath)) {
+      console.warn(`[WorkspaceManager] removePluginOverride: wsPath invalid: ${wsPath}`)
+      return false
+    }
+    const metaFile = join(wsPath, WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME)
+    try {
+      if (!fs.existsSync(metaFile)) {
+        console.log(`[WorkspaceManager] removePluginOverride: metaFile does not exist`)
+        return false
+      }
+      const content = fs.readFileSync(metaFile, 'utf8')
+      const data = JSON.parse(content)
+      if (!data.pluginOverrides || !data.pluginOverrides[pluginId]) {
+        console.log(`[WorkspaceManager] removePluginOverride: no override for ${pluginId}`)
+        return false
+      }
+      delete data.pluginOverrides[pluginId]
+      if (Object.keys(data.pluginOverrides).length === 0) {
+        delete data.pluginOverrides
+      }
+      fs.writeFileSync(metaFile, JSON.stringify(data, null, 2), 'utf8')
+      console.log(`[WorkspaceManager] removePluginOverride: SUCCESS removed ${pluginId} from ${metaFile}`)
+      return true
+    } catch (err) {
+      console.error('[WorkspaceManager] removePluginOverride: FAILED', err)
+      return false
+    }
+  }
+
+  public registerIpcHandlers(): void {
+    ipcMain.handle('workspace:updateMetadata', async (event, updates: Record<string, any>) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.updateMetadata(wsPath, updates)
+    })
+
+    // Phase 1: Pull pending agent tasks for the current workspace
+    // 窗口在 workspace:switched 处理完成后主动拉取，避免推送丢失
+    ipcMain.handle('workspace:pullPendingTasks', async (event) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      if (!wsPath) return []
+      try {
+        const { WorkspaceContextManager } = await import('./workspace-context-manager')
+        const ctx = WorkspaceContextManager.getInstance().getContext(wsPath)
+        if (!ctx) return []
+        const tasks = ctx.drainPendingTasks()
+        if (tasks.length > 0) {
+          console.log(`[WorkspaceManager] Pulled ${tasks.length} pending tasks for ${wsPath}`)
+        }
+        return tasks
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to pull pending tasks:', err)
+        return []
+      }
+    })
+
+    ipcMain.handle('workspace:saveRibbonOrder', async (event, ribbonOrder: string[]) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.saveRibbonOrder(wsPath, ribbonOrder)
+    })
+
+    ipcMain.handle('workspace:searchContent', async (event, query: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.searchContent(wsPath, query)
+    })
+
+    ipcMain.handle('workspace:associateRemoteCalendar', async (_event, calendarUuid: number, name: string, folderPath: string) => {
+      return this.associateRemoteCalendar(calendarUuid, name, folderPath)
+    })
+
+    ipcMain.handle('workspace:getCalendarFolder', (_event, calendarUuid: number) => {
+      return this.getCalendarFolder(calendarUuid)
+    })
+
+    ipcMain.handle('workspace:getPath', (event) => {
+      return this.getPathForWebContents(event.sender)
+    })
+
+    ipcMain.handle('workspace:getMetadata', (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      if (!win) return { path: null, name: '', calendarUuid: 0 }
+      return this.getMetadataForWindow(win)
+    })
+
+    ipcMain.handle('workspace:selectFolder', async () => {
+      return this.selectFolder()
+    })
+
+    ipcMain.handle('workspace:setPath', async (event, path: string | null) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      if (!win) return false
+      return this.setPathForWindow(win, path)
+    })
+
+    ipcMain.handle('workspace:relaunch', () => {
+      this.relaunch()
+    })
+
+    ipcMain.handle('workspace:readDir', async (event, dirPath?: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.readDir(dirPath, wsPath)
+    })
+
+    ipcMain.handle('workspace:readDirRecursively', async (event, dirPath?: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.readDirRecursively(dirPath, wsPath)
+    })
+
+    ipcMain.handle('workspace:createFile', async (event, parentPath: string, name: string, content?: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.createFile(parentPath, name, wsPath, content)
+    })
+
+    ipcMain.handle('workspace:createDirectory', async (event, parentPath: string, name: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.createDirectory(parentPath, name, wsPath)
+    })
+
+    ipcMain.handle('workspace:deleteItem', async (event, itemPath: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.deleteItem(itemPath, wsPath)
+    })
+
+    ipcMain.handle('workspace:renameItem', async (event, oldPath: string, newPath: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.renameItem(oldPath, newPath, wsPath)
+    })
+
+    ipcMain.handle('workspace:duplicateItem', async (event, itemPath: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.duplicateItem(itemPath, wsPath)
+    })
+
+    ipcMain.handle('workspace:importItem', async (event, srcPath: string, targetPath: string) => {
+      const wsPath = this.getPathForWebContents(event.sender)
+      return this.importItem(srcPath, targetPath, wsPath)
+    })
+
+    ipcMain.handle('workspace:create', async (event, parentPath: string, name: string) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      return this.createWorkspace(parentPath, name, win)
+    })
+
+    ipcMain.handle('workspace:getHistory', () => {
+      return this.getHistory()
+    })
+
+    ipcMain.handle('workspace:removeFromHistory', (_event, path: string) => {
+      this.removeFromHistory(path)
+    })
+
+    // 搜索面板相关 IPC handlers
+    ipcMain.handle('workspace:getRecentDocuments', (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      if (!win) return []
+      return this.getRecentDocuments(win)
+    })
+
+    ipcMain.handle('workspace:addRecentDocument', async (event, filePath: string, title: string) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      if (!win) return
+      await this.addRecentDocument(win, filePath, title)
+    })
+
+    ipcMain.handle('workspace:searchDocuments', async (_event, { query, workspacePath }: { query: string; workspacePath: string }) => {
+      if (!workspacePath || !query) return []
+
+      try {
+        const { FullTextIndexManager } = await import('./fulltext-index-manager.js')
+        const rows = await FullTextIndexManager.getInstance().searchFiles(query, workspacePath)
+
+        return (rows || []).map((row: any) => ({
+          filePath: row.file_path,
+          fileName: row.file_name,
+          snippet: row.snip,
+          lineNumber: row.line_number,
+          rank: row.rank
+        }))
+      } catch (err) {
+        console.error('[WorkspaceManager] FTS search failed:', err)
+        return []
+      }
+    })
+
+    ipcMain.handle('workspace:getActiveTabOutline', async () => {
+      // 通过渲染进程获取当前激活 Tab 的大纲
+      const mainWindow = ElectronMainWindow.getInstance().getWindow()
+      if (!mainWindow || mainWindow.isDestroyed()) return null
+
+      return new Promise((resolve) => {
+        const token = Math.floor(Math.random() * 1000000)
+        const timeout = setTimeout(() => {
+          resolve(null)
+        }, 3000)
+
+        ipcMain.once(`workspace:get-active-tab-outline-response:${token}`, (_event, data) => {
+          clearTimeout(timeout)
+          resolve(data)
+        })
+
+        mainWindow.webContents.send('workspace:get-active-tab-outline-request', { token })
+      })
+    })
+
+    ipcMain.handle('workspace:notifyPluginNavigate', (_event, data: { pluginId: string; filePath: string; lineNumber?: number; headingText?: string }) => {
+      const mainWindow = ElectronMainWindow.getInstance().getWindow()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('plugin:navigate-to-position', data)
+      }
+      return null
+    })
+
+    // 获取支持某个文件扩展名的插件列表
+    ipcMain.handle('workspace:getPluginsByExtension', async (_event, ext: string) => {
+      try {
+        const { PluginManager } = await import('../plugins/plugin-manager')
+        const pm = PluginManager.getInstance()
+        const plugins = pm.getPluginsByExtension(ext)
+
+        return plugins.map(p => ({
+          id: p.manifest.id,
+          name: p.manifest.name,
+          fileAssociations: p.manifest.fileAssociations || []
+        }))
+      } catch (err) {
+        console.error('[WorkspaceManager] Failed to get plugins by extension:', err)
+        return []
+      }
+    })
+  }
+}

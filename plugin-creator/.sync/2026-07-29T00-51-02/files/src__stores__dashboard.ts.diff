@@ -1,0 +1,40 @@
+diff --git a/src/stores/dashboard.ts b/src/stores/dashboard.ts
+index 4a5d931..342da4d 100644
+--- a/src/stores/dashboard.ts
++++ b/src/stores/dashboard.ts
+@@ -7,10 +7,12 @@ import { create } from 'zustand';
+  * - 'plugins'    插件管理，替代 AgentChat 占据内容区
+  * - 'automation' 自动化（工作流中心），替代 plans + 工作流
+  * - 'settings'   系统设置（内联展示），左边栏变为设置 Tab 导航 + 右侧内容区
++ * - 'sessions'   会话管理，全局管理历史对话与搜索
++ * - 'knowledge'  知识库画廊（包含多路径文档检索与可视化分类管理）
+  *
+  * 所有视图均支持在右侧打开 Workspace 面板（Universal Workspace）。
+  */
+-export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation' | 'settings';
++export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation' | 'settings' | 'sessions' | 'knowledge';
+ 
+ interface DashboardState {
+   /** Workspace 面板是否可见 */
+@@ -37,6 +39,12 @@ interface DashboardState {
+   /** 当前在侧边栏中展开的项目路径字典 */
+   expandedProjects: Record<string, boolean>;
+ 
++  /** Workspace 面板是否最大化全屏展示（折叠隐藏 ContentArea） */
++  workspaceMaximized: boolean;
++
++  /** 切换 Workspace 最大化状态 */
++  setWorkspaceMaximized: (maximized: boolean) => void;
++
+   /** 切换 Workspace 显示/隐藏 */
+   toggleWorkspace: () => void;
+   /** 显示 Workspace */
+@@ -73,6 +81,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
+   settingsActiveTab: 'general',
+   selectedProjectPath: null,
+   expandedProjects: {},
++  workspaceMaximized: false,
++  setWorkspaceMaximized: (maximized) => set({ workspaceMaximized: maximized }),
+ 
+   toggleWorkspace: () => set((s) => {
+     const nextVal = !s.workspaceVisible;

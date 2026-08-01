@@ -1,0 +1,81 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07y-events.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07y-events.md
+index 8bef4d7..082d44b 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07y-events.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07y-events.md
+@@ -1,6 +1,7 @@
+ # 07y — 系统事件清单
+ 
+ > 此文件由 `scripts/generate-skill-docs.js` 自动生成，来源: `plugins-sdk/event-catalog.ts`
++> 补充了代码中实际使用但未在 event-catalog.ts 注册的内部事件。
+ 
+ ## 事件驱动的插件自动唤醒
+ 
+@@ -30,9 +31,26 @@
+ - `listens`：声明本插件监听的事件 → 事件触发时自动唤醒插件
+ - `emits`：声明本插件发射的事件 → 仅用于文档和工具链分析
+ 
+-## 广播通知事件
++## 事件分类说明
+ 
+-插件可订阅并广播到其他插件的通知事件。
++### 1. 注册事件（event-catalog.ts）
++
++在 `BerrytraceEventMap` 中注册的平台级事件，支持 `listens` 声明和跨进程广播。
++
++### 2. 内部事件（preload.ts 暴露）
++
++宿主内部使用的事件，通过 `preload.ts` 的 `workspace.on*` 方法暴露给 renderer 插件。
++这些事件 **不支持** `contributes.events.listens` 声明，仅 renderer 插件可通过 API 订阅。
++
++### 3. 命令事件（BerrytraceCommandMap）
++
++宿主 → 单个插件的单向指令，用 `sdk.host.onCommand` 订阅。
++
++---
++
++## 广播通知事件（注册事件）
++
++插件可订阅并广播到其他插件的平台级通知事件。
+ 
+ | 事件名 | payload | 后台广播 | 渲染广播 | 说明 |
+ |--------|---------|:---:|:---:|------|
+@@ -47,6 +65,34 @@
+ | `plugins:lifecycle` | `PluginsLifecyclePayload` | — | ✅ | 插件生命周期状态变更 |
+ | `plugins:on-demand-loaded` | `PluginsOnDemandLoadedPayload` | — | ✅ | 插件按需加载完成 |
+ 
++## Workspace 内部事件（preload.ts 暴露）
++
++以下事件在代码中实际使用，通过 `preload.ts` 暴露给 renderer 插件，但 **未在 event-catalog.ts 注册**。
++
++> 插件通过 `sdk.workspace.on*()` 方法订阅这些事件，不支持 `contributes.events.listens` 声明。
++
++| 事件名 | API 方法 | payload | 说明 |
++|--------|----------|---------|------|
++| `workspace:switched` | `onSwitched(cb)` | `void` | 实际工作区切换（仅新语义，替代 `workspace:changed`） |
++| `workspace:changed` | `onChanged(cb)` | `void` | 工作区变更（已废弃，保留向后兼容） |
++| `workspace:files-structure-changed` | `onFilesStructureChanged(cb)` | `void` | 文件结构变化（创建/删除/重命名），不触发插件 reload |
++| `workspace:pending-tasks-available` | `onPendingTasksAvailable(cb)` | `{ count: number; workDir: string }` | 工作区有待处理的 Agent 任务 |
++| `workspace:scan-batch` | `onScanBatch(cb)` | `{ files: FileInfo[]; scannedCount: number; isComplete: boolean }` | 文件扫描批次数据 |
++| `workspace:scan-complete` | `onScanComplete(cb)` | `{ totalCount: number; duration: number }` | 文件扫描完成 |
++| `workspace:scan-error` | `onScanError(cb)` | `{ error: string }` | 文件扫描错误 |
++
++**内部广播事件（renderer → background 插件）**：
++
++以下事件由宿主直接发送给 background 插件进程，不经过 preload 暴露。
++
++| 事件名 | 发送方 | payload | 说明 |
++|--------|--------|---------|------|
++| `workspace:file-deleted` | workspace-manager.ts | `{ path: string }` | 文件被删除，通知 background 插件更新缓存 |
++| `workspace:file-renamed` | workspace-manager.ts | `{ oldPath: string; newPath: string }` | 文件被重命名，通知 background 插件更新缓存 |
++| `workspace:trigger-agent-task` | workspace-context.ts | `{ task: string; workDir: string }` | change workflow 触发 Agent 任务 |
++| `workspace:content-changed` | fulltext-index-manager.ts | `{ path: string }` | 文件内容变更，触发全文索引更新 |
++| `workspace:get-active-tab-outline-request` | workspace-manager.ts | `{ token: number }` | 请求获取当前标签页大纲 |
++
+ ## 命令事件（宿主 → 插件）
+ 
+ 宿主下发给特定插件的单向指令。用 `sdk.host.onCommand` 订阅。
+@@ -58,3 +104,4 @@
+ | `agent:chat_request` | `AgentChatRequestPayload` | 宿主请 Agent 内核处理聊天请求 |
+ 
+ > 事件详情和路由策略见 `plugins-sdk/event-catalog.ts`。
++> 内部事件源码见 `electron/preload.ts`、`electron/services/workspace-context.ts`。

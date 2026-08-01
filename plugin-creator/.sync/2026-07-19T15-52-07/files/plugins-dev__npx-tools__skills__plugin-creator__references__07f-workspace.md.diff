@@ -1,0 +1,134 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07f-workspace.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07f-workspace.md
+index 109099f..e32c41e 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07f-workspace.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07f-workspace.md
+@@ -1,89 +1,72 @@
+ # workspace / scheduler / plugin / context — 工作区
+ 
+-
+-> 此文件由 `scripts/generate-skill-docs.js` 自动生成。修改 controller 后运行 `node scripts/generate-skill-docs.js` 更新。
+ ## workspace
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `addRecentDocument` | `filePath: string, title: string` | `null` | 添加文档到最近打开记录。 |
+-| `getActiveTabOutline` | `—` | `unknown` | 获取当前活动标签页的文档大纲。 |
++| `registerView` | `viewType: string, viewClass: unknown` | `any` | 注册自定义视图类型。 |
++| `unregisterView` | `viewType: string` | `any` | 注销自定义视图类型。 |
++| `getPath` | `—` | `string` | 获取当前工作区路径。 |
+ | `getMetadata` | `—` | `unknown` | 获取当前工作区元数据。 |
+-| `getPath` | `—` | `string | null` | 获取当前工作区路径。 |
+-| `getPluginsByExtension` | `ext: string` | `unknown[]` | 查询能处理指定扩展名的插件列表。 |
+-| `getRecentDocuments` | `—` | `unknown[]` | 获取最近打开的文档列表。 |
+-| `notifyPluginNavigate` | `options: {
+-    pluginId: string;
+-    filePath: string;
+-    lineNumber?: number;
+-    headingText?: string;
+-  }` | `null` | 通知指定插件导航到文件位置。 |
+-| `openWorkspaceTab` | `filePath: string | undefined, targetPluginId: string, extension?: string, articleId?: string, sessionId?: string, replaceActiveTab?: boolean, title?: string, line?: number, customParams?: Record<string, unknown>` | `null` | 在主窗口打开工作区标签页。自动显示并聚焦主窗口。 |
+-| `searchDocuments` | `options: { query: string; workspacePath: string }` | `unknown[]` | 在工作区中全文搜索文档。 |
++| `setOutline` | `sessionId: string, outline: unknown[]` | `any` | 设置文档大纲。 |
++| `setProperties` | `sessionId: string, properties: Record<string, unknown>` | `any` | 设置会话属性。 |
++| `getProperties` | `sessionId: string` | `any` | 获取会话属性。 |
++| `getProperty` | `sessionId: string, key: string` | `unknown` | 获取单个会话属性。 |
++| `setProperty` | `sessionId: string, key: string, value: unknown` | `void` | 设置单个会话属性。 |
++| `registerPanels` | `sessionId: string, panels: unknown[]` | `any` | 注册面板。 |
++| `getActiveTabId` | `—` | `any` | 获取当前活动标签页 ID。 |
++| `getActiveTabConfig` | `—` | `any` | 获取当前活动标签页配置。 |
++| `registerRibbonIcon` | `id, icon, title, onClick, pluginId?, onContextMenu?` | `any` | 注册侧边栏图标。 |
++| `unregisterRibbonIcon` | `id: string` | `any` | 注销侧边栏图标。 |
++| `registerFolderContextMenuItem` | `item: FolderContextMenuItem` | `any` | 注册文件夹右键菜单项。 |
++| `unregisterFolderContextMenuItem` | `id: string` | `any` | 注销文件夹右键菜单项。 |
++| `registerLink` | `id: string, title: string, url: string` | `any` | 注册链接。 |
++| `unregisterLink` | `id: string` | `any` | 注销链接。 |
++| `openWorkspaceTab` | `options: OpenTabOptions` | `any` | 在主窗口打开工作区标签页。 |
++| `splitActiveTab` | `direction: 'right' \| 'bottom'` | `any` | 分割当前活动标签页。 |
++| `updateActiveTabInfo` | `name: string, newConfig: Record<string, unknown>` | `any` | 更新活动标签页信息。 |
+ 
+ **调用示例**：
+ ```typescript
+-await callApi('workspace', 'addRecentDocument', [{ filePath, title }]);
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++
++const path = await sdk.workspace.getPath();
++sdk.workspace.registerRibbonIcon('my-icon', 'icon.png', '我的插件', () => {
++  sdk.workspace.openWorkspaceTab({ filePath: '/path/to/file' });
++});
+ ```
+ 
++> **注意**：controller 中还有 addRecentDocument、getRecentDocuments、searchDocuments、getActiveTabOutline、notifyPluginNavigate、getPluginsByExtension 等方法，但**未注册到 SDK**。
++
+ ## scheduler
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
++| `register` | `options: { id, cron?, intervalMs?, command?, args?, cwd? }` | `void` | 注册定时任务（cron 或 interval）。必须在后台进程注册。 |
++| `unregister` | `id: string` | `void` | 注销定时任务。 |
+ | `list` | `—` | `unknown[]` | 列出当前插件所有定时任务。 |
+-| `register` | `options: { id: string; cron?: string; intervalMs?: number; command?: string; args?: string[]; cwd?: string }` | `null` | 注册定时任务（cron 或 interval）。必须在后台进程注册。 await callApi("scheduler"… |
+-| `unregister` | `id: string` | `null` | 注销定时任务。 |
+-
+-**调用示例**：
+-```typescript
+-await callApi('scheduler', 'list', []);
+-```
+ 
+-## articles
++## plugin
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `get` | `articleId: string` | `unknown` | 读取文章内容。 |
+-| `update` | `articleId: string, title: string, content: string` | `null` | 更新文章标题和内容。 |
+-
+-**调用示例**：
+-```typescript
+-await callApi('articles', 'get', [articleId]);
+-```
++| `getInfo` | `—` | `PluginInfo` | 获取当前插件元信息（id, name, version, path）。 |
++| `getLifecycleContext` | `—` | `PluginLifecycleContext` | 获取当前插件生命周期上下文。 |
+ 
+ ## context
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `getActiveApp` | `—` | `unknown` | 获取当前活动应用信息。 |
+-| `getSelection` | `—` | `unknown` | 获取当前选中文本及来源应用。 |
+-
+-**调用示例**：
+-```typescript
+-await callApi('context', 'getActiveApp', []);
+-```
+-
+-## plugin
+-
+-| 方法 | 参数 | 返回值 | 说明 |
+-|------|------|--------|------|
+-| `getInfo` | `—` | `unknown` | 获取当前插件元信息。 |
+-| `getLifecycleContext` | `—` | `unknown` | 获取当前插件生命周期上下文。 |
+-
+-**调用示例**：
+-```typescript
+-await callApi('plugin', 'getInfo', []);
+-```
++| `getActiveApp` | `—` | `ActiveAppInfo` | 获取当前活动应用信息。 |
++| `getSelection` | `—` | `SelectionInfo \| null` | 获取当前选中文本及来源应用。 |
++| `onActiveAppChanged` | `cb: (appInfo: ActiveAppInfo) => void` | `void` | 监听活动应用变化。 |
+ 
+ ## selectionMenu
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `registerItem` | `item: SelectionMenuItem` | `null` | 注册划词菜单项。 |
+-| `unregisterItem` | `id: string` | `null` | 注销划词菜单项。 |
+-
+-**调用示例**：
+-```typescript
+-await callApi('selectionMenu', 'registerItem', [item]);
+-```
++| `registerItem` | `item: SelectionMenuItem` | `void` | 注册划词菜单项。 |
++| `unregisterItem` | `id: string` | `void` | 注销划词菜单项。 |
+ 
++> **注意**：controller 中还有 articles（get、update）方法，但**未注册到 SDK**。

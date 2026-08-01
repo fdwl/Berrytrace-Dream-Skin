@@ -1,0 +1,150 @@
+diff --git a/electron/services/file-manager.ts b/electron/services/file-manager.ts
+index 1253f1f..51d992e 100644
+--- a/electron/services/file-manager.ts
++++ b/electron/services/file-manager.ts
+@@ -1,9 +1,143 @@
+ import { app, shell, net, clipboard, nativeImage, ipcMain, dialog, BrowserWindow, OpenDialogOptions } from 'electron'
+-import { promises as fsPromises } from 'fs'
+-import { join } from 'path'
++import fs, { promises as fsPromises } from 'fs'
++import { join, basename } from 'path'
+ import { normalizePath } from '../utils/path-utils'
++import { RipgrepService } from './ripgrep-service'
++
++/** 精准浅层扫描项目目录下的 .workflow 文件 (最多 2 层：根目录及 1 级常用子目录) */
++async function scanShallowWorkflowFiles(projectDir: string): Promise<string[]> {
++  if (!projectDir || !fs.existsSync(projectDir)) {
++    return [];
++  }
++  const results: string[] = [];
++  const startTime = Date.now();
++  console.log(`[WorkflowScanner:scanDir] ========= 开始浅层扫描 =========`);
++  console.log(`[WorkflowScanner:scanDir] 目标路径: "${projectDir}"`);
++
++  try {
++    const rootEntries = await fsPromises.readdir(projectDir, { withFileTypes: true });
++    console.log(`[WorkflowScanner:scanDir] 根目录项共计 ${rootEntries.length} 项`);
++
++    for (const entry of rootEntries) {
++      // 1. 过滤所有以 . 开头的隐藏文件夹/文件
++      if (entry.name.startsWith('.')) continue;
++
++      // 2. 过滤常见的构建/依赖目录
++      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'build' || entry.name === 'out') continue;
++
++      const fullPath = join(projectDir, entry.name);
++
++      // 1 层：根目录下的 *.workflow 文件（放宽 isFile() 判断，提升软链/Dirent 兼容性）
++      if (entry.name.endsWith('.workflow')) {
++        console.log(`[WorkflowScanner:scanDir] 匹配根目录文件: "${fullPath}"`);
++        results.push(fullPath);
++      } 
++      // 2 层：1 级子目录 (如 docs, workflows 等)
++      else if (entry.isDirectory()) {
++        try {
++          const subEntries = await fsPromises.readdir(fullPath, { withFileTypes: true });
++          for (const sub of subEntries) {
++            if (sub.name.startsWith('.')) continue;
++            if (sub.name.endsWith('.workflow')) {
++              const subFullPath = join(fullPath, sub.name);
++              console.log(`[WorkflowScanner:scanDir] 匹配子目录文件: "${subFullPath}"`);
++              results.push(subFullPath);
++            }
++          }
++        } catch (subErr) {
++          console.warn(`[WorkflowScanner:scanDir] 无法读取子目录 "${fullPath}":`, subErr);
++        }
++      }
++    }
++  } catch (err) {
++    console.error(`[WorkflowScanner:scanDir] 无法读取根目录 "${projectDir}":`, err);
++  }
++
++  console.log(`[WorkflowScanner:scanDir] 扫描结束: 找到 ${results.length} 个 .workflow 文件 (耗时 ${Date.now() - startTime}ms)`);
++  console.log(`[WorkflowScanner:scanDir] =================================`);
++  return results;
++}
+ 
+ export function registerFileIpcHandlers(handleOpenFile: (filePath: string, line?: number) => void) {
++  // 统一使用 workspace: 规范前缀注册工程工作流扫描 IPC
++  ipcMain.handle('workspace:scanProjectWorkflows', async (_event, projectPath: string) => {
++    console.log(`[WorkspaceManager:scanProjectWorkflows] 收到扫描请求，项目路径: "${projectPath}"`);
++    if (!projectPath) return [];
++
++    try {
++      const normalized = normalizePath(projectPath);
++      const pathsToScan = new Set<string>();
++      pathsToScan.add(normalized);
++
++      // 判断路径是否已经是 docs 目录
++      const isDocsDir = normalized.endsWith('/docs') || normalized.endsWith('\\docs') || basename(normalized) === 'docs';
++      if (isDocsDir) {
++        // 已经是 docs 目录，追加父目录
++        pathsToScan.add(normalizePath(join(normalized, '..')));
++      } else {
++        // 非 docs 目录，追加 docs 子目录
++        pathsToScan.add(normalizePath(join(normalized, 'docs')));
++      }
++
++      let allFiles: string[] = [];
++
++      for (const targetDir of Array.from(pathsToScan)) {
++        try {
++          const found = await RipgrepService.getInstance().findWorkflowFiles(targetDir);
++          if (found && found.length > 0) {
++            console.log(`[WorkspaceManager:scanProjectWorkflows] ripgrep 在 "${targetDir}" 搜寻到 ${found.length} 个文件`);
++            allFiles = allFiles.concat(found);
++          }
++        } catch (rgErr) {
++          console.warn(`[WorkspaceManager:scanProjectWorkflows] ripgrep 扫描 "${targetDir}" 出错:`, rgErr);
++        }
++
++        // 备选浅层扫描保底
++        try {
++          const shallowFound = await scanShallowWorkflowFiles(targetDir);
++          allFiles = allFiles.concat(shallowFound);
++        } catch { /* ignore */ }
++      }
++
++      // 去重
++      const uniqueFiles = Array.from(new Set(allFiles));
++      console.log(`[WorkspaceManager:scanProjectWorkflows] 去重后获得 ${uniqueFiles.length} 个文件:`, uniqueFiles);
++
++      // 读取每个文件内容
++      const items = await Promise.all(
++        uniqueFiles.map(async (filePath) => {
++          try {
++            const content = await fsPromises.readFile(filePath, 'utf-8');
++            return { path: filePath, name: basename(filePath), content };
++          } catch (err) {
++            console.error(`[WorkspaceManager:scanProjectWorkflows] 读取文件失败 "${filePath}":`, err);
++            return null;
++          }
++        })
++      );
++
++      const validItems = items.filter(Boolean);
++      console.log(`[WorkspaceManager:scanProjectWorkflows] 成功返回 ${validItems.length} 个工作流定义`);
++      return validItems;
++    } catch (err) {
++      console.error('[WorkspaceManager:scanProjectWorkflows] 扫描失败:', err);
++      return [];
++    }
++  })
++
++  ipcMain.handle('workspace:readWorkflowContent', async (_event, filePath: string) => {
++    console.log(`[WorkspaceManager:readWorkflowContent] 收到读文件请求: "${filePath}"`);
++    try {
++      const normalized = normalizePath(filePath);
++      const content = await fsPromises.readFile(normalized, 'utf-8');
++      console.log(`[WorkspaceManager:readWorkflowContent] 成功读取 "${filePath}" (${content.length} 字节)`);
++      return content;
++    } catch (err) {
++      console.error('[WorkspaceManager:readWorkflowContent] 失败:', err);
++      return '';
++    }
++  })
++
+   ipcMain.handle('file:read', async (_event, filePath: string) => {
+     try {
+       const normalizedPath = normalizePath(filePath)

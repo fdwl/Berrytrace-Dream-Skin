@@ -1,0 +1,39 @@
+diff --git a/electron/plugins/controllers/computer-use-controller.ts b/electron/plugins/controllers/computer-use-controller.ts
+index 3a3c61f..3acece2 100644
+--- a/electron/plugins/controllers/computer-use-controller.ts
++++ b/electron/plugins/controllers/computer-use-controller.ts
+@@ -1,4 +1,4 @@
+-import type { PluginApiController } from '../plugin-api-controller';
++import { BaseApiController } from './api-context';
+ import { MacOSComputerUse } from '../../native/computer-use/computer-use-macos';
+ import { WindowsComputerUse } from '../../native/computer-use/computer-use-windows';
+ import type {
+@@ -8,7 +8,7 @@ import type {
+   ComputerScreenshotArgs,
+ } from '../../native/computer-use/computer-use-types';
+ 
+-export class ComputerUseController implements PluginApiController {
++export class ComputerUseController extends BaseApiController {
+   readonly namespace = 'computerUse';
+ 
+   private macEngine = new MacOSComputerUse();
+@@ -53,13 +53,13 @@ export class ComputerUseController implements PluginApiController {
+     return this.macEngine.captureScreen(args);
+   }
+ 
+-  getHandlers(): Record<string, Function> {
++  getHandlers(): Record<string, (...args: never[]) => Promise<unknown>> {
+     return {
+-      getAccessibilityTree: this.getAccessibilityTree.bind(this),
+-      clickElement: this.clickElement.bind(this),
+-      typeText: this.typeText.bind(this),
+-      pressHotkey: this.pressHotkey.bind(this),
+-      captureScreen: this.captureScreen.bind(this),
++      getAccessibilityTree: this.getAccessibilityTree.bind(this) as (...args: never[]) => Promise<unknown>,
++      clickElement: this.clickElement.bind(this) as (...args: never[]) => Promise<unknown>,
++      typeText: this.typeText.bind(this) as (...args: never[]) => Promise<unknown>,
++      pressHotkey: this.pressHotkey.bind(this) as (...args: never[]) => Promise<unknown>,
++      captureScreen: this.captureScreen.bind(this) as (...args: never[]) => Promise<unknown>,
+     };
+   }
+ }

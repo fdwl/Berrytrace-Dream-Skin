@@ -1,0 +1,306 @@
+import Store from 'electron-store';
+import * as fs from 'fs';
+import { join } from 'path';
+import type { FSWatcher } from 'chokidar';
+import chokidar from 'chokidar';
+
+export interface WorkflowRule {
+  id: string;
+  mode?: 'startup' | 'first-open' | 'change' | 'schedule';
+  cron?: string;
+  prompt: string;
+  watchGlob?: string;
+}
+
+export class WorkflowRunner {
+  private static instance: WorkflowRunner | null = null;
+  private store: Store;
+  private activeWatchers: Map<string, FSWatcher> = new Map();
+  private changeDebounceTimers: Map<string, NodeJS.Timeout> = new Map();
+
+  private constructor() {
+    this.store = new Store({ name: 'workflow_runner_store' });
+  }
+
+  public static getInstance(): WorkflowRunner {
+    if (!WorkflowRunner.instance) {
+      WorkflowRunner.instance = new WorkflowRunner();
+    }
+    return WorkflowRunner.instance;
+  }
+
+  /**
+   * 获取今天日期字符串 (YYYY-MM-DD)
+   */
+  private getTodayString(): string {
+    const d = new Date();
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  /**
+   * 检查今天特定任务是否已运行过
+   */
+  public hasRunToday(taskKey: string): boolean {
+    const records = (this.store.get('lastRunDates') as Record<string, string>) || {};
+    return records[taskKey] === this.getTodayString();
+  }
+
+  /**
+   * 标记特定任务今天已运行
+   */
+  public markRunToday(taskKey: string): void {
+    const records = (this.store.get('lastRunDates') as Record<string, string>) || {};
+    records[taskKey] = this.getTodayString();
+    this.store.set('lastRunDates', records);
+  }
+
+  /**
+   * 唤醒 AI Agent 执行具体的任务 Prompt
+   */
+  public async dispatchToAgent(options: {
+    workDir: string;
+    triggerType: 'startup' | 'change' | 'schedule';
+    taskPrompt: string;
+    ruleId: string;
+  }): Promise<void> {
+    const { workDir, triggerType, taskPrompt, ruleId } = options;
+    if (!taskPrompt || !taskPrompt.trim()) {
+      console.warn(`[WorkflowRunner:dispatchToAgent] Empty prompt for rule ${ruleId}, skipping.`);
+      return;
+    }
+
+    console.log(`[WorkflowRunner:dispatchToAgent] 🚀 Dispatching Agent task [${triggerType}:${ruleId}] in ${workDir}`);
+
+    try {
+      const { AiController } = await import('./controllers/ai.js');
+      const aiCtrl = new AiController();
+
+      const sessionId = `auto_${triggerType}_${ruleId}_${Date.now()}`;
+      const result = await aiCtrl.ai_runAgentTask({
+        task: taskPrompt.trim(),
+        workDir: workDir,
+        sessionId: sessionId,
+        systemPrompt: `你是一个后台自动化的 AI Agent 任务引擎。当前触发源：[${triggerType}]（规则标识：${ruleId}）。请高效自动完成任务。`,
+      }, { pluginId: 'system' }) as any;
+
+      console.log(`[WorkflowRunner:dispatchToAgent] Agent task dispatched successfully, sessionId=${result?.sessionId}`);
+    } catch (err) {
+      console.error(`[WorkflowRunner:dispatchToAgent] Failed to dispatch agent task [${ruleId}]:`, err);
+    }
+  }
+
+  /**
+   * 简单解析文件开头的 YAML Frontmatter 头部与 Markdown Body
+   */
+  private parseFrontmatter(content: string): { meta: Record<string, string>; body: string } {
+    const meta: Record<string, string> = {};
+    let body = content;
+
+    const frontmatterRegex = /^---\s*\n([\s\S]*?)\n---\s*\n?/;
+    const match = frontmatterRegex.exec(content);
+    if (match) {
+      const metaStr = match[1];
+      body = content.slice(match[0].length);
+      const lines = metaStr.split('\n');
+      for (const line of lines) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx > 0) {
+          const key = line.slice(0, colonIdx).trim();
+          let val = line.slice(colonIdx + 1).trim();
+          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1);
+          }
+          meta[key] = val;
+        }
+      }
+    }
+
+    return { meta, body: body.trim() };
+  }
+
+  /**
+   * 尝试读取工作区中的 skills 规则文件 (优先 skills/，其次 .skills/)
+   */
+  private findSkillFile(workDir: string, fileName: string): string | null {
+    const p1 = join(workDir, 'skills', fileName);
+    if (fs.existsSync(p1)) return p1;
+    const p2 = join(workDir, '.skills', fileName);
+    if (fs.existsSync(p2)) return p2;
+    return null;
+  }
+
+  /**
+   * 加载并运行启动与每日首次触发规约 (startup.md)
+   */
+  public async handleStartupRules(workDir: string): Promise<void> {
+    const startupFile = this.findSkillFile(workDir, 'startup.md');
+    if (!startupFile) return;
+
+    try {
+      console.log(`[WorkflowRunner:handleStartupRules] Found startup file: ${startupFile}`);
+      const content = fs.readFileSync(startupFile, 'utf-8');
+      const { meta, body } = this.parseFrontmatter(content);
+
+      const ruleId = meta.id || 'startup-default';
+      const mode = meta.mode || 'first-open'; // 默认为 每日首次打开 触发
+      const prompt = body || meta.prompt || '';
+
+      if (!prompt) {
+        console.warn(`[WorkflowRunner:handleStartupRules] No prompt found in ${startupFile}`);
+        return;
+      }
+
+      const taskKey = `${workDir}:${ruleId}`;
+
+      if (mode === 'first-open') {
+        if (this.hasRunToday(taskKey)) {
+          console.log(`[WorkflowRunner:handleStartupRules] Task ${ruleId} already run today (${this.getTodayString()}), skipping.`);
+          return;
+        }
+        console.log(`[WorkflowRunner:handleStartupRules] Daily first-open trigger for task ${ruleId}`);
+        this.markRunToday(taskKey);
+      } else {
+        console.log(`[WorkflowRunner:handleStartupRules] Startup trigger for task ${ruleId}`);
+      }
+
+      await this.dispatchToAgent({
+        workDir,
+        triggerType: 'startup',
+        taskPrompt: prompt,
+        ruleId,
+      });
+    } catch (err) {
+      console.error(`[WorkflowRunner:handleStartupRules] Error processing ${startupFile}:`, err);
+    }
+  }
+
+  /**
+   * 配置工作区文件变动触发规约 (change.md)
+   */
+  public setupChangeWatcher(workDir: string): void {
+    // 清理旧的 watcher
+    if (this.activeWatchers.has(workDir)) {
+      this.activeWatchers.get(workDir)?.close();
+      this.activeWatchers.delete(workDir);
+    }
+
+    const changeFile = this.findSkillFile(workDir, 'change.md');
+    if (!changeFile) return;
+
+    try {
+      console.log(`[WorkflowRunner:setupChangeWatcher] Setting up file change watcher from ${changeFile}`);
+      const content = fs.readFileSync(changeFile, 'utf-8');
+      const { meta, body } = this.parseFrontmatter(content);
+
+      const ruleId = meta.id || 'change-default';
+      const prompt = body || meta.prompt || '';
+      if (!prompt) return;
+
+      const watcher = chokidar.watch(workDir, {
+        ignored: [
+          /(^|[/\\])\../, // 忽略所有隐藏文件及隐藏目录（如 .git, .vscode, .berrytrace 等，防止 Agent 写入日志触发递归）
+          '**/node_modules/**',
+          '**/dist/**',
+          '**/build/**',
+          '**/*.log',
+        ],
+        persistent: true,
+        ignoreInitial: true,
+      });
+
+      const onFileChange = (pathChanged: string) => {
+        console.log(`[WorkflowRunner:setupChangeWatcher] File changed in ${workDir}: ${pathChanged}`);
+
+        const timerKey = `${workDir}:${ruleId}`;
+        if (this.changeDebounceTimers.has(timerKey)) {
+          clearTimeout(this.changeDebounceTimers.get(timerKey)!);
+        }
+
+        // 3 秒防抖，避免高频文件修改导致重复唤醒
+        const timer = setTimeout(() => {
+          this.changeDebounceTimers.delete(timerKey);
+          this.dispatchToAgent({
+            workDir,
+            triggerType: 'change',
+            taskPrompt: prompt,
+            ruleId,
+          });
+        }, 3000);
+
+        this.changeDebounceTimers.set(timerKey, timer);
+      };
+
+      watcher.on('add', onFileChange).on('change', onFileChange).on('unlink', onFileChange);
+      this.activeWatchers.set(workDir, watcher);
+
+    } catch (err) {
+      console.error(`[WorkflowRunner:setupChangeWatcher] Error setting up watcher for ${workDir}:`, err);
+    }
+  }
+
+  /**
+   * 加载指定工作区的所有自动唤醒工作流规约
+   */
+  public async loadWorkspaceWorkflows(workDir: string): Promise<void> {
+    if (!workDir) return;
+    console.log(`[WorkflowRunner:loadWorkspaceWorkflows] Loading workspace workflows for ${workDir}`);
+
+    // 1. 扫描并处理 startup.md
+    await this.handleStartupRules(workDir);
+
+    // 2. 扫描并建立 change.md 监听
+    this.setupChangeWatcher(workDir);
+
+    // 3. 扫描所有的 .workflow 文件并注册到 WorkflowEngine
+    try {
+      // @ts-ignore
+      const yaml = (await import('js-yaml')) as any;
+      const { WorkflowEngine } = await import('./workflow-engine.js');
+      const workflowFiles = this.findWorkflowFiles(workDir);
+      console.log(`[WorkflowRunner:loadWorkspaceWorkflows] Found ${workflowFiles.length} workflow files in ${workDir}`);
+      for (const file of workflowFiles) {
+        try {
+          const rawContent = fs.readFileSync(file, 'utf-8');
+          const doc = yaml.default.load(rawContent) as any;
+          if (doc && doc.id) {
+            WorkflowEngine.getInstance().register({
+              ...doc,
+              pluginId: 'workspace-local', // 标记为本地工作流
+            });
+            console.log(`[WorkflowRunner:loadWorkspaceWorkflows] Automatically registered workflow: ${doc.id} from ${file}`);
+          }
+        } catch (err) {
+          console.warn(`[WorkflowRunner:loadWorkspaceWorkflows] Failed to parse/register workflow ${file}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error(`[WorkflowRunner:loadWorkspaceWorkflows] Failed to auto-register workflows:`, err);
+    }
+  }
+
+  /**
+   * 递归扫描指定目录下所有的 .workflow 文件
+   */
+  private findWorkflowFiles(dir: string, depth: number = 0): string[] {
+    if (depth > 3) return []; // 限制深度
+    try {
+      const results: string[] = [];
+      const list = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of list) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (['node_modules', '.git', 'dist', 'build', '.berrytrace'].includes(entry.name)) continue;
+          results.push(...this.findWorkflowFiles(fullPath, depth + 1));
+        } else if (entry.isFile() && entry.name.endsWith('.workflow')) {
+          results.push(fullPath);
+        }
+      }
+      return results;
+    } catch {
+      return [];
+    }
+  }
+}

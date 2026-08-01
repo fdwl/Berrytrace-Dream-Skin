@@ -1,0 +1,38 @@
+/**
+ * PluginIsolationPolicy — 进程隔离策略（简化版）
+ *
+ * 静态映射，不做运行时动态降级/提升：
+ * - required   → 独立进程（强制隔离）
+ * - recommended → 独立进程（默认隔离）
+ * - optional   → 共享池（节省内存）
+ *
+ * 不稳定插件（频繁崩溃）由 PluginWatchdog 负责重启/禁用，
+ * 不在运行时切换进程模型。
+ */
+
+export type IsolationDecision = 'standalone' | 'pooled';
+
+export class PluginIsolationPolicy {
+  private static instance: PluginIsolationPolicy;
+
+  private constructor() {}
+
+  public static getInstance(): PluginIsolationPolicy {
+    if (!PluginIsolationPolicy.instance) {
+      PluginIsolationPolicy.instance = new PluginIsolationPolicy();
+    }
+    return PluginIsolationPolicy.instance;
+  }
+
+  /**
+   * 决策插件应使用的进程类型。
+   *
+   * @param pluginId 插件 ID（保留参数，供日志使用）
+   * @param declared 插件声明的 processIsolation 等级
+   * @returns 'standalone'（独立进程）或 'pooled'（共享池）
+   */
+  public decide(pluginId: string, declared: 'required' | 'recommended' | 'optional'): IsolationDecision {
+    if (declared === 'optional') return 'pooled';
+    return 'standalone';
+  }
+}

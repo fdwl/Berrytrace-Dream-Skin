@@ -1,0 +1,153 @@
+diff --git a/electron/services/lazy-main-window.ts b/electron/services/lazy-main-window.ts
+new file mode 100644
+index 0000000..46adb06
+--- /dev/null
++++ b/electron/services/lazy-main-window.ts
+@@ -0,0 +1,147 @@
++/**
++ * @module LazyMainWindow
++ * ─────────────────────────────────────────────────────────────────────────────
++ * 职责：Voice-only 模式下的「按需主窗口激活」服务
++ *
++ * 设计原则：
++ * - voice-only 启动时，主窗口完全不创建（节省 ~400MB Chromium 渲染进程内存）
++ * - 首次需要时（快捷键/Dock 点击/托盘菜单/插件 IPC）才创建并显示
++ * - 幂等：多次调用 ensureVisible 只创建一次
++ * ─────────────────────────────────────────────────────────────────────────────
++ */
++
++import { ipcMain, app, BrowserWindow } from 'electron';
++import { ElectronMainWindow } from '../windows/main-window';
++import type { MainWindowDependencies } from '../windows/main-window';
++
++let _activationInProgress = false;
++let _activationCallbacks: Array<(win: BrowserWindow) => void> = [];
++let _mainWindowDeps: MainWindowDependencies | null = null;
++let _showMainWindowOnActivate = true;
++
++/** 注入主窗口依赖（由 main.ts 在 whenReady 时设置，供惰性激活使用） */
++export function setLazyMainWindowDeps(deps: MainWindowDependencies): void {
++  _mainWindowDeps = deps;
++}
++
++/** 控制激活时是否立即显示（默认 true） */
++export function setShowOnActivate(show: boolean): void {
++  _showMainWindowOnActivate = show;
++}
++
++/**
++ * 确保主窗口已创建并可见。
++ * voice-only 模式下首次调用会完整走 createWindow + showWindow 流程。
++ * 后续调用直接返回已有窗口。
++ */
++export async function ensureMainWindowVisible(reason = 'user-request'): Promise<BrowserWindow> {
++  console.log(`[LazyMainWindow] ensureMainWindowVisible. reason="${reason}"`);
++
++  const mainWinInstance = ElectronMainWindow.getInstance();
++  const existingWin = mainWinInstance.getWindow();
++
++  // 窗口已存在：直接显示
++  if (existingWin && !existingWin.isDestroyed()) {
++    console.log(`[LazyMainWindow] Window already exists, showing. reason="${reason}"`);
++    mainWinInstance.showWindow();
++    return existingWin;
++  }
++
++  // 激活进行中：等待完成
++  if (_activationInProgress) {
++    console.log(`[LazyMainWindow] Activation in progress, queuing. reason="${reason}"`);
++    return new Promise<BrowserWindow>((resolve) => {
++      _activationCallbacks.push(resolve);
++    });
++  }
++
++  // 首次激活
++  _activationInProgress = true;
++  console.log(`[LazyMainWindow] 🚀 First-time lazy activation. reason="${reason}"`);
++
++  try {
++    // 注入依赖（如果已设置）
++    if (_mainWindowDeps) {
++      mainWinInstance.setDependencies(_mainWindowDeps);
++    }
++
++    // createWindow(showOnReady) — showOnReady=true 让窗口 ready-to-show 时自动显示
++    const win = mainWinInstance.createWindow(_showMainWindowOnActivate);
++
++    // 等待渲染进程发出 app:ready 信号（最多 8 秒）
++    await new Promise<void>((resolve) => {
++      let resolved = false;
++      const done = () => {
++        if (resolved) return;
++        resolved = true;
++        ipcMain.off('app:ready', readyHandler);
++        ipcMain.off('renderer-ready', readyHandler);
++        resolve();
++      };
++
++      const readyHandler = (event: Electron.IpcMainEvent) => {
++        if (event.sender === win.webContents) done();
++      };
++      ipcMain.on('app:ready', readyHandler);
++      ipcMain.on('renderer-ready', readyHandler);
++
++      // did-finish-load + 1.5s fallback
++      win.webContents.once('did-finish-load', () => {
++        setTimeout(done, 1500);
++      });
++
++      // 最长 8 秒兜底
++      setTimeout(done, 8000);
++    });
++
++    _activationInProgress = false;
++
++    // 通知所有等待方
++    const callbacks = _activationCallbacks.splice(0);
++    for (const cb of callbacks) {
++      try { cb(win); } catch { /* ignore */ }
++    }
++
++    console.log(`[LazyMainWindow] ✅ Main window activated. reason="${reason}"`);
++    return win;
++  } catch (err) {
++    _activationInProgress = false;
++    console.error(`[LazyMainWindow] ❌ Activation failed:`, err);
++    throw err;
++  }
++}
++
++/**
++ * 注册 IPC + Dock 事件处理器，供插件/渲染进程/系统触发主窗口激活。
++ * 幂等，可多次调用。
++ */
++let _ipcRegistered = false;
++export function registerLazyMainWindowIpc(): void {
++  if (_ipcRegistered) return;
++  _ipcRegistered = true;
++
++  // 插件 / 渲染进程通过 IPC 请求打开主窗口
++  ipcMain.handle('main-window:ensure-visible', async (_event, reason?: string) => {
++    try {
++      await ensureMainWindowVisible(reason || 'ipc-request');
++      return { success: true };
++    } catch (err: any) {
++      console.error('[LazyMainWindow] IPC ensure-visible failed:', err);
++      return { success: false, error: err?.message };
++    }
++  });
++
++  // macOS Dock 图标点击 → 激活主窗口
++  app.on('activate', () => {
++    const existingWin = ElectronMainWindow.getInstance().getWindow();
++    if (!existingWin || existingWin.isDestroyed()) {
++      ensureMainWindowVisible('dock-activate').catch((err) => {
++        console.error('[LazyMainWindow] Dock activate failed:', err);
++      });
++    } else {
++      ElectronMainWindow.getInstance().showWindow();
++    }
++  });
++
++  console.log('[LazyMainWindow] IPC handlers + Dock handler registered.');
++}

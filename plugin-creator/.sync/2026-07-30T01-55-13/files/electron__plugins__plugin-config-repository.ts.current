@@ -1,0 +1,200 @@
+/**
+ * @module PluginConfigRepository
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 职责：
+ * 插件系统所有持久化配置的唯一读写入口（Single Source of Truth for plugin config）。
+ *
+ * 解决问题：
+ * - 消除 7 个 cache key 裸字符串散落在 4 个文件中的现状
+ * - 统一 enabled / disabled / crash-disabled / pinned / trusted 的读写语义
+ * - 两个 key（prefDisabledPlugins, prefCrashDisabledPlugins）原本甚至未进 CacheAttribute 枚举，
+ *   在此统一注册并提供类型安全的访问接口
+ *
+ * 设计原则：
+ * - 所有方法均为同步（cache 本身是内存 + 磁盘同步写入）
+ * - 不持有任何运行时状态（不是单例，可直接 import 使用）
+ * - 不依赖任何其他 plugin 模块（避免循环依赖）
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import { cache } from '../config/index';
+import { CacheAttribute } from '../../src/config/CacheAttribute';
+
+// ── 补充两个原本未进 CacheAttribute 枚举的裸字符串 key ──────────────────────
+const KEY_DISABLED_PLUGINS = 'prefDisabledPlugins';
+const KEY_CRASH_DISABLED_PLUGINS = 'prefCrashDisabledPlugins';
+
+// ── OEM 内置插件查询（懒加载，避免循环依赖） ─────────────────────────────────
+function getOemBuiltins(): string[] {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { oemManager } = require('../services/oem-manager');
+    return oemManager.getConfig()?.builtinPlugins || [];
+  } catch {
+    return [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 读操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 获取用户手动启用的插件 ID 列表（undefined 表示"未初始化，默认全部启用"） */
+export function getEnabledPlugins(): string[] | undefined {
+  return cache.get(CacheAttribute.prefEnabledPlugins) as string[] | undefined;
+}
+
+/** 获取用户手动禁用的插件 ID 列表 */
+export function getDisabledPlugins(): string[] {
+  return (cache.get(KEY_DISABLED_PLUGINS) as string[] | undefined) ?? [];
+}
+
+/** 获取因崩溃熔断而被系统自动禁用的插件 ID 列表 */
+export function getCrashDisabledPlugins(): string[] {
+  return (cache.get(KEY_CRASH_DISABLED_PLUGINS) as string[] | undefined) ?? [];
+}
+
+/** 获取固定在工具栏的插件 ID 列表 */
+export function getPinnedPlugins(): string[] {
+  return (cache.get(CacheAttribute.prefPinnedPlugins) as string[] | undefined) ?? [];
+}
+
+/** 获取用户手动信任的插件 ID 列表（允许跳过签名检查） */
+export function getUserTrustedPlugins(): string[] {
+  return (cache.get(CacheAttribute.prefUserTrustedPlugins) as string[]) ?? [];
+}
+
+/** 是否允许加载未签名 / 第三方签名插件 */
+export function isAllowUntrustedPlugins(): boolean {
+  return cache.get(CacheAttribute.prefAllowUntrustedPlugins) === true;
+}
+
+/** 是否处于开发者模式 */
+export function isDeveloperMode(): boolean {
+  return cache.get(CacheAttribute.prefDeveloperMode) !== false;
+}
+
+/**
+ * 判断插件是否处于"启用"状态。
+ *
+ * 优先级（高 → 低）：
+ * 1. 用户手动禁用   → false
+ * 2. 崩溃熔断禁用   → false
+ * 3. resident / startupPriority=high  → true（常驻插件不可禁用）
+ * 4. OEM 内置白名单 → true
+ * 5. enabledList 中  → true/false
+ * 6. enabledList 未初始化（undefined） → 默认全部已知插件启用
+ *
+ * @param pluginId 插件 ID
+ * @param pluginManifest 可选，传入后用于判断 resident 和 startupPriority
+ * @param allKnownPluginIds 可选，当 enabledList 未初始化时用于判断插件是否已知
+ */
+export function isPluginEnabled(
+  pluginId: string,
+  options?: {
+    isResident?: boolean;
+    isHighPriority?: boolean;
+    isKnown?: boolean;
+  }
+): boolean {
+  // 1. 用户禁用
+  if (getDisabledPlugins().includes(pluginId)) return false;
+
+  // 2. 崩溃熔断
+  if (getCrashDisabledPlugins().includes(pluginId)) return false;
+
+  // 3. 常驻或高优先级插件（不可禁用）
+  if (options?.isResident || options?.isHighPriority) return true;
+
+  // 4. OEM 内置白名单
+  if (getOemBuiltins().includes(pluginId)) return true;
+
+  // 5 & 6. enabledList
+  const enabledList = getEnabledPlugins();
+  if (enabledList === undefined) {
+    // 未初始化：凡是已知的插件都视为启用
+    return options?.isKnown !== false;
+  }
+  return enabledList.includes(pluginId);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 写操作
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 将插件加入用户启用列表，并从禁用列表和崩溃禁用列表中移除 */
+export function enablePlugin(pluginId: string): void {
+  // 注意：enabledList=undefined 表示"所有已知插件默认启用"（未初始化状态）。
+  // 在此情况下，无需写入 enabledList——只需确保插件不在禁用列表即可。
+  // 如果贸然写入 [pluginId]，会导致其他所有插件被 isPluginEnabled 判定为"不在列表中"→ false。
+  // performInitHelper 在扫描阶段会正式初始化 enabledList（undefined → 全量列表），
+  // 之后再调用本函数时 enabledList 必然已有值。
+  const enabledList = getEnabledPlugins();
+  if (enabledList !== undefined) {
+    if (!enabledList.includes(pluginId)) enabledList.push(pluginId);
+    cache.set(CacheAttribute.prefEnabledPlugins, enabledList);
+  }
+  // enabledList=undefined 时只做禁用列表清理，不写 enabledList
+  cache.set(KEY_DISABLED_PLUGINS, getDisabledPlugins().filter(x => x !== pluginId));
+  cache.set(KEY_CRASH_DISABLED_PLUGINS, getCrashDisabledPlugins().filter(x => x !== pluginId));
+}
+
+/** 将插件加入用户禁用列表，并从启用列表中移除 */
+export function disablePlugin(pluginId: string): void {
+  const enabledList = getEnabledPlugins() ?? [];
+  cache.set(CacheAttribute.prefEnabledPlugins, enabledList.filter(x => x !== pluginId));
+
+  const disabledList = getDisabledPlugins();
+  if (!disabledList.includes(pluginId)) disabledList.push(pluginId);
+  cache.set(KEY_DISABLED_PLUGINS, disabledList);
+}
+
+/** 初始化 enabledList（首次安装时将所有已知插件写入） */
+export function initEnabledPlugins(allPluginIds: string[]): void {
+  cache.set(CacheAttribute.prefEnabledPlugins, allPluginIds);
+}
+
+/** 将插件加入崩溃熔断禁用列表（由 PluginWatchdog 的 permanentDisableCallback 调用） */
+export function crashDisablePlugin(pluginId: string): void {
+  const list = getCrashDisabledPlugins();
+  if (!list.includes(pluginId)) {
+    list.push(pluginId);
+    cache.set(KEY_CRASH_DISABLED_PLUGINS, list);
+  }
+}
+
+/** 从崩溃禁用列表中移除插件（用于"重置崩溃状态"、reload、enable 场景） */
+export function clearCrashDisabled(pluginId: string): void {
+  const updated = getCrashDisabledPlugins().filter(x => x !== pluginId);
+  cache.set(KEY_CRASH_DISABLED_PLUGINS, updated);
+}
+
+/** 固定 / 取消固定插件到工具栏 */
+export function setPinned(pluginId: string, pinned: boolean): void {
+  let list = getPinnedPlugins();
+  if (pinned) {
+    if (!list.includes(pluginId)) list.push(pluginId);
+  } else {
+    list = list.filter(x => x !== pluginId);
+  }
+  cache.set(CacheAttribute.prefPinnedPlugins, list);
+}
+
+/** 将插件加入用户信任列表（允许跳过签名检查） */
+export function trustPlugin(pluginId: string): void {
+  const list = getUserTrustedPlugins();
+  if (!list.includes(pluginId)) {
+    list.push(pluginId);
+    cache.set(CacheAttribute.prefUserTrustedPlugins, list);
+  }
+}
+
+/** 设置"允许未签名插件"开关 */
+export function setAllowUntrustedPlugins(enabled: boolean): void {
+  cache.set(CacheAttribute.prefAllowUntrustedPlugins, enabled);
+}
+
+/** 设置开发者模式开关 */
+export function setDeveloperMode(enabled: boolean): void {
+  cache.set(CacheAttribute.prefDeveloperMode, enabled);
+}

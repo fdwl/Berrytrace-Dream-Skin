@@ -1,0 +1,21 @@
+diff --git a/electron/plugins/event-subscription-registry.ts b/electron/plugins/event-subscription-registry.ts
+index abaef27..afc61fb 100644
+--- a/electron/plugins/event-subscription-registry.ts
++++ b/electron/plugins/event-subscription-registry.ts
+@@ -74,9 +74,13 @@ export class EventSubscriptionRegistry {
+    * 调试用：打印当前订阅表
+    */
+   public debugPrint(): void {
+-    console.log('[EventSubscriptionRegistry] Current subscriptions:');
+-    for (const [eventName, pluginIds] of this.subscriptions.entries()) {
+-      console.log(`  ${eventName}: [${Array.from(pluginIds).join(', ')}]`);
++    if (process.env.DEBUG_EVENT_REGISTRY === 'true') {
++      console.log('[EventSubscriptionRegistry] Current subscriptions:');
++      for (const [eventName, pluginIds] of this.subscriptions.entries()) {
++        console.log(`  ${eventName}: [${Array.from(pluginIds).join(', ')}]`);
++      }
++    } else {
++      console.log(`[EventSubscriptionRegistry] Indexed ${this.subscriptions.size} event subscriptions across plugins.`);
+     }
+   }
+ }

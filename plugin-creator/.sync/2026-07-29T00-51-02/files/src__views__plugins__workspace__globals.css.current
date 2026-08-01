@@ -1,0 +1,361 @@
+/* FlexWorkspace globals.css - 全局样式（无法用 Tailwind 替代的部分） */
+
+/* 顶部透明拖动区域 - 用于 Electron 窗口拖动 */
+.window-drag {
+  width: 100%;
+  cursor: grab;
+  position: relative;
+  z-index: 9999;
+}
+
+/* FlexLayout 第三方库样式覆盖 */
+.flexlayout__layout {
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  position: absolute;
+  overflow: hidden;
+  font-family: inherit;
+  background-color: var(--bg-page, #1e1e1e);
+}
+
+.flexlayout__tabset {
+  background-color: var(--bg-page, #1e1e1e);
+  overflow: hidden;
+}
+
+.flexlayout__tabset_header {
+  background-color: var(--bg-page, #18181b) !important;
+  border-bottom: 1px solid var(--border-light, rgba(255, 255, 255, 0.08)) !important;
+  box-sizing: border-box;
+}
+
+.flexlayout__tab {
+  background-color: var(--bg-page, #18181b);
+  overflow: hidden;
+}
+
+.flexlayout__tab_button {
+  background-color: transparent;
+  color: var(--text-tertiary, #969696);
+  font-size: 12px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease, border-top-color 0.15s ease, transform 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  border-top: 2px solid transparent;
+  /* Orca-inspired tab sizing: flex basis 160px, min 88px, max 240px.
+     Tabs shrink toward 88px before the strip scrolls. */
+  flex: 1 1 160px;
+  min-width: 88px;
+  max-width: 240px;
+  flex-shrink: 1;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.flexlayout__tab_button_content {
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+  flex: 1;
+}
+
+.flexlayout__tab_button:hover {
+  background-color: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary, #ffffff);
+}
+
+.flexlayout__tab_button--selected {
+  position: relative;
+  background-color: var(--bg-card, rgba(255, 255, 255, 0.08)) !important;
+  color: var(--text-primary, #ffffff) !important;
+  font-weight: 600;
+  border-top: 2px solid var(--color-brand, #6366f1) !important;
+  border-bottom: 2px solid transparent !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25) !important;
+  z-index: 5;
+}
+
+.flexlayout__tab_button--selected .flexlayout__tab_button_trailing {
+  opacity: 1 !important;
+  color: var(--text-secondary, #a1a1aa);
+}
+
+.flexlayout__tabset_tabbar_outer {
+  overflow: hidden !important;
+  background-color: var(--bg-page, #18181b) !important;
+}
+
+/* Tab strip scrollable: inner container scrolls horizontally so tabs never
+   shrink below min-width and overlap each other (orca pattern). */
+.flexlayout__tabset_tabbar_inner {
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  scroll-behavior: smooth;
+  background-color: var(--bg-page, #18181b) !important;
+}
+
+.flexlayout__tabset_tabbar_outer_top {
+  border-bottom: 0px !important;
+  padding: 0px 95px 0px 8px !important;
+  box-sizing: border-box;
+  position: relative !important; /* anchor for absolute scroll arrow overlays */
+  background-color: var(--bg-page, #18181b) !important;
+}
+
+/* Limit each Tab 标签的伸缩 (merged into the main .flexlayout__tab_button block above) */
+
+.flexlayout__tab_button_content {
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+  flex: 1;
+}
+
+/* 工具栏定位与平台适配 */
+.flexlayout__tabset_toolbar {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Windows 专属适配：
+   Windows 右上角拥有 138px 的原生窗口控制按钮（最小化/最大化/关闭）。
+   1. 将 flexlayout 工具栏往左推至 right: 145px，绝不与 Windows 三按钮重叠。
+   2. 为 tabbar outer 预留 210px 的右内边距，确保页签容器在 Windows 上不会延伸至工具栏与窗口控制三按钮区域。
+*/
+.platform-win .flexlayout__tabset_tabbar_outer_top {
+  padding-right: 215px !important;
+}
+
+.platform-win .flexlayout__tabset_toolbar {
+  right: 145px !important;
+}
+
+/* Mac 专属适配：
+   当 FlexLayout 在 Mac 下全屏/最大化、Zen模式、或侧边栏收起时，
+   仅在 .flexlayout__tabset_tabbar_inner_tab_container 上应用单重 72px 左边距，
+   紧贴在 macOS 左侧红黄绿 3 个交通灯按钮 (0..68px) 右侧，绝不多移；
+   同时顶部背景统一为 var(--bg-page)，消除浅灰色色块。
+*/
+.platform-mac.sidebar-collapsed .flexlayout__tabset_tabbar_inner_tab_container_top,
+.platform-mac.sidebar-collapsed .flexlayout__tabset_tabbar_inner_tab_container,
+.platform-mac.zen-mode .flexlayout__tabset_tabbar_inner_tab_container_top,
+.platform-mac.zen-mode .flexlayout__tabset_tabbar_inner_tab_container,
+.platform-mac .flexlayout__tabset_maximized .flexlayout__tabset_tabbar_inner_tab_container_top,
+.platform-mac .flexlayout__tabset_maximized .flexlayout__tabset_tabbar_inner_tab_container,
+.platform-mac .flexlayout__tabset--maximized .flexlayout__tabset_tabbar_inner_tab_container_top,
+.platform-mac .flexlayout__tabset--maximized .flexlayout__tabset_tabbar_inner_tab_container {
+  margin-left: 72px !important;
+  padding-left: 0px !important;
+}
+
+.flexlayout__tab_button--selected {
+  position: relative;
+  background-color: var(--bg-page, #1e1e1e) !important;
+  font-weight: 500;
+  border-bottom: 2px solid var(--bg-page, #1e1e1e) !important;
+  box-shadow: none !important;
+  z-index: 5;
+  transform: translateY(4px);
+}
+
+.flexlayout__tab_button--selected::before {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: -8px;
+  width: 8px;
+  height: 8px;
+  background: transparent;
+  border-bottom-right-radius: 8px;
+  box-shadow: 4px 4px 0 0 var(--bg-page, #1e1e1e) !important;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.flexlayout__tab_button--selected::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  right: -8px;
+  width: 8px;
+  height: 8px;
+  background: transparent;
+  border-bottom-left-radius: 8px;
+  box-shadow: -4px 4px 0 0 var(--bg-page, #1e1e1e) !important;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.flexlayout__tab_button_trailing {
+  margin-left: 6px;
+  padding: 2px;
+  border-radius: 50%;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--text-tertiary, #888888);
+  opacity: 0;
+  transform: scale(0.85);
+  transition: all 0.15s ease-in-out;
+  background-color: transparent;
+}
+
+.flexlayout__tab_button:hover .flexlayout__tab_button_trailing {
+  opacity: 1;
+  transform: scale(1);
+  background-color: rgba(255, 255, 255, 0.08); /* 小圆 Panel 包括这个 关闭 icon */
+}
+
+.flexlayout__tab_button_trailing:hover {
+  background-color: rgba(255, 255, 255, 0.18) !important;
+  color: var(--text-primary, #ffffff) !important;
+}
+
+.flexlayout__splitter {
+  background-color: transparent !important;
+  position: relative;
+}
+
+.flexlayout__splitter::after {
+  content: '';
+  position: absolute;
+  background-color: var(--border-light, #3c3c3c);
+  transition: all 0.15s ease;
+  z-index: 10;
+}
+
+.flexlayout__splitter_horz::after {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+}
+
+.flexlayout__splitter_horz:hover::after,
+.flexlayout__splitter_horz:active::after {
+  background-color: var(--color-brand, #5b7fff) !important;
+}
+
+.flexlayout__tab_button_bottom.flexlayout__tab_button--selected {
+  background-color: var(--color-brand, #5b7fff) !important;
+}
+
+.flexlayout__tab_button_left.flexlayout__tab_button--selected {
+  background-color: var(--color-brand, #5b7fff);
+}
+
+.flexlayout__tab_button_right.flexlayout__tab_button--selected {
+  border: 2px solid var(--color-brand, #5b7fff);
+}
+
+/* 拖拽指示器高亮 */
+.flexlayout__drag_rect {
+  border: 1px solid var(--color-brand, #5b7fff);
+  background: rgba(0, 122, 204, 0.15);
+  box-shadow: 0 0 10px rgba(0, 122, 204, 0.3);
+  border-radius: 4px;
+  z-index: 1000;
+}
+
+.flexlayout__splitter_vert::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-50%);
+}
+
+.flexlayout__splitter_vert:hover::after,
+.flexlayout__splitter_vert:active::after {
+  background-color: var(--color-brand, #5b7fff) !important;
+  height: 2px;
+}
+
+.flexlayout__splitter_drag {
+  background-color: var(--color-brand, #5b7fff);
+  opacity: 0.15;
+}
+
+.flexlayout__outline_rect {
+  border: 2px solid var(--color-brand, #5b7fff);
+  background: rgba(91, 127, 255, 0.15);
+  box-shadow: 0 0 10px rgba(91, 127, 255, 0.3);
+  border-radius: 4px;
+  z-index: 1000;
+}
+
+.flexlayout__outline_rect_edge {
+  background: rgba(91, 127, 255, 0.25);
+  border: 1px solid var(--color-brand, #5b7fff);
+  z-index: 1000;
+}
+
+.flexlayout__tabset-selected {
+  background-color: var(--bg-sidebar, #1e1e1e);
+}
+
+/* 动画定义 */
+@keyframes contextMenuFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* ---- Zen Mode (专注模式) CSS overrides ---- */
+.zen-mode .flexlayout__tabset_header {
+  position: absolute !important;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  transform: translateY(-100%);
+  opacity: 0;
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+/* Hover trigger zone at the top of the workspace */
+.zen-mode .flexlayout__tabset_header::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 12px;
+  background: transparent;
+  z-index: 1001;
+}
+
+.zen-mode .flexlayout__tabset_header:hover {
+  transform: translateY(0);
+  opacity: 1;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.zen-mode .flexlayout__tab {
+  top: 0 !important;
+  height: 100% !important;
+}

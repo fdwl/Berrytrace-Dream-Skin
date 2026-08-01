@@ -1,0 +1,13 @@
+diff --git a/electron/plugins/plugin-url-helper.ts b/electron/plugins/plugin-url-helper.ts
+index eca4cc8..05c079c 100644
+--- a/electron/plugins/plugin-url-helper.ts
++++ b/electron/plugins/plugin-url-helper.ts
+@@ -1,6 +1,6 @@
+ import { nativeTheme } from 'electron';
+-import { PluginManager } from './plugin-manager';
+-import { ScannedPlugin } from './plugin-scanner';
++import type { PluginManager } from './plugin-manager';
++import type { ScannedPlugin } from './plugin-scanner';
+ import { cache } from '../config/index';
+ import { CacheAttribute } from '../../src/config/CacheAttribute';
+ import { ElectronFloatBall } from '../windows/float-ball';

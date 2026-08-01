@@ -1,0 +1,104 @@
+diff --git a/electron/plugins/workflow-types.ts b/electron/plugins/workflow-types.ts
+new file mode 100644
+index 0000000..f151158
+--- /dev/null
++++ b/electron/plugins/workflow-types.ts
+@@ -0,0 +1,98 @@
++/**
++ * BerryTrace Skill 编排与 Workflow 执行引擎类型定义
++ */
++
++export interface StepParamRef {
++  $ref: string;
++}
++
++export interface WorkflowStep {
++  id: string;
++  name?: string;
++  tool: string;
++  params?: Record<string, unknown>;
++  condition?: string;
++  onError?: 'stop' | 'skip' | 'retry';
++  retryCount?: number;
++  timeout?: number; // 单步骤毫秒级超时
++  outputDataPath?: string; // 生成数据保存文件路径 (存工作区)
++  forEach?: string; // 批处理循环表达式，例如 "$input.items"
++  maxConcurrency?: number; // 最大并发数，缺省为 1 (串行)
++  humanInTheLoop?: {
++    message: string;
++    timeoutMs?: number;
++  };
++  aiFallback?: {
++    prompt: string;
++    model?: string;
++  };
++}
++
++export interface WorkflowTriggers {
++  userQueries?: string[];
++  cron?: string;
++  uiButtonLabel?: string;
++}
++
++export interface WorkflowPreflight {
++  requiredMcpTools?: string[];
++  requiredNetwork?: string;
++}
++
++export interface WorkflowDefinition {
++  version?: string;
++  id: string;
++  name: string;
++  description?: string;
++  author?: string;
++  securityLevel?: 'read_only' | 'normal' | 'high_risk';
++  pluginId?: string;
++  inputSchema?: Record<string, 'string' | 'number' | 'boolean' | 'object' | 'array'>;
++  preflight?: WorkflowPreflight;
++  triggers?: WorkflowTriggers;
++  steps: WorkflowStep[];
++}
++
++export interface WorkflowExecutionContext {
++  workflowId: string;
++  runId: string;
++  input: Record<string, unknown>;
++  triggerType: 'direct' | 'ai-intent' | 'cron' | 'webhook' | 'manual';
++  startedAt: number;
++}
++
++export interface StepExecutionResult {
++  stepId: string;
++  success: boolean;
++  output?: unknown;
++  input?: unknown;
++  error?: string;
++  durationMs: number;
++  retriesUsed: number;
++  aiFallbackUsed?: boolean;
++  skipped?: boolean;
++}
++
++export interface WorkflowExecutionResult {
++  runId: string;
++  workflowId: string;
++  success: boolean;
++  steps: StepExecutionResult[];
++  finalOutput?: unknown;
++  totalDurationMs: number;
++  error?: string;
++  startedAt?: number;
++}
++
++export interface ContextOptions {
++  ttlMs?: number;
++  scope?: 'session' | 'workspace' | 'global';
++  workspacePath?: string;
++}
++
++export interface ContextEntry {
++  value: unknown;
++  createdAt: number;
++  ttlMs?: number;
++  pluginId?: string;
++}

@@ -1,0 +1,177 @@
+/**
+ * @architecture-boundary PluginDevHelper
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 职责与业务流程：
+ * 负责开发态（Unpacked）插件的目录扫描、路径持久化、SDK 依赖软链接保障：
+ *  1. ensureSdkInPluginsHome: 自动将 `berrytrace-plugin-sdk` 软链接至 ~/.berrytrace/node_modules/
+ *  2. loadUnpackedPlugin: 加载未打包本地插件目录并校验 plugin.json。
+ *  3. loadPersistedDevPlugins: 生产/开发态目录对齐与持久化清理。
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+import { app } from 'electron';
+import { join, dirname } from 'path';
+import { promises as fs } from 'fs';
+import * as fsSync from 'fs';
+import { createRequire } from 'module';
+import { BERRYTRACE_HOME } from '../config/paths';
+import { McpHost } from './mcp-host';
+import { PluginScanner, type ScannedPlugin } from './plugin-scanner';
+
+export function ensureSdkInPluginsHome(): void {
+  try {
+    const r = createRequire(import.meta.url);
+    const sdkEntry = r.resolve('berrytrace-plugin-sdk');
+    const sdkSrcDir = join(dirname(sdkEntry), '..');
+    const targetDir = join(BERRYTRACE_HOME, 'node_modules', 'berrytrace-plugin-sdk');
+    const isInsideAsar = sdkSrcDir.includes('.asar');
+
+    fsSync.mkdirSync(dirname(targetDir), { recursive: true });
+
+    if (isInsideAsar) {
+      // 打包环境：独立 Node 子进程无法通过软链接读取 app.asar 内部文件，必须物理拷贝 SDK
+      fsSync.rmSync(targetDir, { recursive: true, force: true });
+      fsSync.cpSync(sdkSrcDir, targetDir, { recursive: true });
+      console.log(`[PluginManager] SDK physically copied to plugins home (asar mode): ${targetDir}`);
+    } else {
+      // 开发环境：优先使用软链接
+      try {
+        const stat = fsSync.lstatSync(targetDir);
+        if (stat.isSymbolicLink()) {
+          const linkTarget = fsSync.readlinkSync(targetDir);
+          if (linkTarget === sdkSrcDir && fsSync.existsSync(join(targetDir, 'package.json'))) {
+            return;
+          }
+        }
+        fsSync.rmSync(targetDir, { recursive: true, force: true });
+      } catch (e) {
+        const errCode = (e as Record<string, unknown> | null | undefined)?.code;
+        if (errCode !== 'ENOENT') {
+          try { fsSync.rmSync(targetDir, { recursive: true, force: true }); } catch {
+            // ignore
+          }
+        }
+      }
+
+      try {
+        fsSync.symlinkSync(sdkSrcDir, targetDir, 'junction');
+        console.log(`[PluginManager] SDK symlinked: ${targetDir} → ${sdkSrcDir}`);
+      } catch (_linkErr) {
+        // 软链接创建失败（权限不足等），退化为物理拷贝
+        fsSync.cpSync(sdkSrcDir, targetDir, { recursive: true });
+        console.log(`[PluginManager] SDK fallback physically copied to plugins home: ${targetDir}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[PluginManager] Failed to ensure SDK in plugins home:', err);
+  }
+}
+
+export function getDevPluginsFile(): string {
+  const sharedFile = join(BERRYTRACE_HOME, 'dev-plugins.json');
+  const legacyFile = join(app.getPath('userData'), 'dev-plugins.json');
+  if (!fsSync.existsSync(sharedFile) && fsSync.existsSync(legacyFile)) {
+    try {
+      fsSync.copyFileSync(legacyFile, sharedFile);
+      console.log('[PluginManager] Successfully migrated dev-plugins.json to shared BERRYTRACE_HOME');
+    } catch (e) {
+      console.warn('[PluginManager] Failed to migrate dev-plugins.json to shared home:', e);
+    }
+  }
+  return sharedFile;
+}
+
+export async function loadPersistedDevPlugins(
+  pluginsMap?: Map<string, ScannedPlugin>,
+  registerStaticContributionsFn?: (plugin: ScannedPlugin) => void
+): Promise<void> {
+  const file = getDevPluginsFile();
+  if (!fsSync.existsSync(file)) return;
+
+  try {
+    const raw = fsSync.readFileSync(file, 'utf8');
+    const data = JSON.parse(raw) as { paths?: string[] };
+    if (!Array.isArray(data?.paths)) return;
+
+    for (const dir of data.paths) {
+      if (fsSync.existsSync(dir)) {
+        try {
+          const scanned = await PluginScanner.scanPluginFolder(dir, true);
+          if (scanned && pluginsMap) {
+            scanned.isDevFolder = true;
+            pluginsMap.set(scanned.manifest.id, scanned);
+            if (registerStaticContributionsFn) {
+              registerStaticContributionsFn(scanned);
+            }
+            console.log(`[PluginDevHelper] Loaded persisted dev plugin: ${scanned.manifest.id} (${dir})`);
+          }
+        } catch (err) {
+          console.warn(`[PluginDevHelper] Failed to load persisted dev plugin at ${dir}:`, err);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[PluginDevHelper] Failed to read dev-plugins.json:', err);
+  }
+}
+
+export async function persistDevPluginPath(pluginId: string, dir: string): Promise<void> {
+  const file = getDevPluginsFile();
+  let paths: string[] = [];
+  if (fsSync.existsSync(file)) {
+    try {
+      const data = JSON.parse(fsSync.readFileSync(file, 'utf8')) as { paths: string[] };
+      if (Array.isArray(data?.paths)) paths = data.paths;
+    } catch {
+      // ignore
+    }
+  }
+  if (!paths.includes(dir)) {
+    paths.push(dir);
+    try {
+      fsSync.writeFileSync(file, JSON.stringify({ paths }), 'utf8');
+    } catch (err) {
+      console.error(`[PluginManager] Failed to write dev-plugins.json:`, err);
+    }
+  }
+}
+
+export async function loadUnpackedPlugin(
+  pluginPath: string,
+  pluginsMap: Map<string, ScannedPlugin>,
+  isPluginEnabledFn: (id: string) => boolean,
+  registerStaticContributionsFn: (plugin: ScannedPlugin) => void,
+  startBackgroundPluginFn: (id: string) => Promise<void>,
+  startMainPluginFn: (id: string) => Promise<void>,
+  notifyPluginsChangedFn: () => void
+): Promise<ScannedPlugin> {
+  console.log(`[PluginManager] Loading unpacked development plugin from: ${pluginPath}`);
+  const scanned = await PluginScanner.scanPluginFolder(pluginPath, true);
+  if (!scanned) {
+    throw new Error(`目录中未找到有效的 plugin.json: ${pluginPath}`);
+  }
+
+  scanned.isDevFolder = true;
+  pluginsMap.set(scanned.manifest.id, scanned);
+
+  await persistDevPluginPath(scanned.manifest.id, pluginPath);
+
+  if (isPluginEnabledFn(scanned.manifest.id)) {
+    McpHost.getInstance().unregisterPluginMcp(scanned.manifest.id);
+    registerStaticContributionsFn(scanned);
+    if (scanned.manifest.type === 'background' || scanned.manifest.type === 'hybrid') {
+      await startBackgroundPluginFn(scanned.manifest.id);
+    } else if (scanned.manifest.type === 'main') {
+      await startMainPluginFn(scanned.manifest.id);
+    }
+  }
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { FullTextIndexManager } = require('../services/fulltext-index-manager');
+    FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
+  } catch (_e) { /* empty */ }
+
+  notifyPluginsChangedFn();
+  return scanned;
+}

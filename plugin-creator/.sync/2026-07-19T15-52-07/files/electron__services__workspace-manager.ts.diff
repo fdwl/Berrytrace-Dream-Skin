@@ -1,0 +1,28 @@
+diff --git a/electron/services/workspace-manager.ts b/electron/services/workspace-manager.ts
+index 88d5a00..f7f1d10 100644
+--- a/electron/services/workspace-manager.ts
++++ b/electron/services/workspace-manager.ts
+@@ -48,6 +48,10 @@ export class WorkspaceManager {
+     this.onWorkspaceInitializedCallback = callback
+   }
+ 
++  public getPath(win: BrowserWindow | null = null): string | null {
++    return this.getPathForWindow(win);
++  }
++
+   public getPathForWindow(win: BrowserWindow | null): string | null {
+     if (win && !win.isDestroyed()) {
+       if (this.windowPaths.has(win.id)) {
+@@ -520,9 +524,11 @@ export class WorkspaceManager {
+         setTimeout(async () => {
+           const { PluginScheduler } = await import('../plugins/scheduler')
+           PluginScheduler.getInstance().loadWorkspaceSchedule(path)
++          const { WorkflowRunner } = await import('../plugins/workflow-runner')
++          WorkflowRunner.getInstance().loadWorkspaceWorkflows(path)
+         }, 5000)
+       } catch (err) {
+-        console.error('[WorkspaceManager] Failed to load workspace schedule:', err)
++        console.error('[WorkspaceManager] Failed to load workspace schedule or workflows:', err)
+       }
+ 
+       // Trigger buffer window workspace changed

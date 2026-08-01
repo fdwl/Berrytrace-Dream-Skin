@@ -1,0 +1,390 @@
+import type { IncomingMessage, ServerResponse, Server } from 'http';
+import { createServer } from 'http'
+import { app, BrowserWindow } from 'electron'
+import { ElectronMainWindow } from '../windows/main-window'
+import { PluginManager } from '../plugins/plugin-manager'
+import { ElectronBufferWindow } from '../windows/buffer-window'
+import { downloadAndInstallPlugin } from '../plugins/plugin-install'
+import { randomUUID } from 'crypto'
+import { writeFileSync, mkdirSync, unlinkSync } from 'fs'
+import { join } from 'path'
+
+/**
+ * Lightweight local HTTP server running on localhost:31828
+ * Permits browsers and local scripts to send actions and query models.
+ */
+export class ElectronLocalServer {
+  private static instance: ElectronLocalServer
+  private server: Server | null = null
+  private readonly port = 31828
+  private token: string | null = null
+
+  private constructor() {}
+
+  public static getInstance(): ElectronLocalServer {
+    if (!ElectronLocalServer.instance) {
+      ElectronLocalServer.instance = new ElectronLocalServer()
+    }
+    return ElectronLocalServer.instance
+  }
+
+  /**
+   * Start the HTTP server on 127.0.0.1:31828
+   */
+  public start(): void {
+    if (this.server) return
+
+    // Generate security token
+    this.token = randomUUID()
+
+    // Write token file to ~/.berrytrace/local_server.json with 0600 permissions
+    try {
+      const sdkDir = join(app.getPath('home'), '.berrytrace')
+      mkdirSync(sdkDir, { recursive: true })
+      const tokenFilePath = join(sdkDir, 'local_server.json')
+      writeFileSync(tokenFilePath, JSON.stringify({
+        port: this.port,
+        token: this.token
+      }, null, 2), { mode: 0o600 })
+      console.log(`[LocalServer] Token written to ${tokenFilePath}`)
+    } catch (e) {
+      console.error('[LocalServer] Failed to write token file:', e)
+    }
+
+    this.server = createServer((req: IncomingMessage, res: ServerResponse) => {
+      // Setup CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204)
+        res.end()
+        return
+      }
+
+      const url = new URL(req.url || '', `http://127.0.0.1:${this.port}`)
+      const pathname = url.pathname
+
+      // Route mapping: /ping is allowed without auth for health checking
+      if (pathname === '/ping') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          status: 'ok',
+          app: 'berrytrace',
+          version: app.getVersion()
+        }))
+        return
+      }
+
+      // Route /mcp/* requests directly to McpGateway (handles token & SSE)
+      if (pathname.startsWith('/mcp')) {
+        const { McpGateway } = require('../plugins/mcp-gateway')
+        McpGateway.getInstance().handleHttpRequest(req, res, url).then((handled: boolean) => {
+          if (!handled) {
+            res.writeHead(404, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'MCP route not found' }))
+          }
+        }).catch((err: any) => {
+          console.error('[LocalServer] Error in McpGateway:', err)
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: err.message }))
+        })
+        return
+      }
+
+      // Security check for all other routes
+      const authHeader = req.headers['authorization'] || req.headers['Authorization']
+      const expectedAuth = `Bearer ${this.token}`
+      if (!authHeader || authHeader !== expectedAuth) {
+        res.writeHead(401, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          error: {
+            message: 'Unauthorized: Invalid or missing API key.',
+            type: 'auth_error',
+            code: 'unauthorized'
+          }
+        }))
+        return
+      }
+
+      if (pathname === '/open') {
+        ElectronMainWindow.getInstance().showWindow()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true }))
+        return
+      }
+
+      if (pathname === '/open-plugin') {
+        const pluginId = url.searchParams.get('id')
+        if (pluginId) {
+          console.log(`[LocalServer] Opening plugin: ${pluginId}`)
+          const pm = PluginManager.getInstance()
+          const plugin = pm.getPlugin(pluginId)
+          if (plugin && (plugin.manifest as { type?: string }).type === 'window') {
+            pm.openPluginWindow(pluginId)
+          } else {
+            ElectronMainWindow.getInstance().openPlugin(pluginId)
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ success: true }))
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Missing plugin id' }))
+        }
+        return
+      }
+
+      if (pathname === '/reload-plugin') {
+        const pluginId = url.searchParams.get('id')
+        if (pluginId) {
+          console.log(`[LocalServer] Reloading plugin: ${pluginId}`)
+          const pm = PluginManager.getInstance()
+          pm.reloadPlugin(pluginId).then((reloaded) => {
+            if (reloaded) {
+              BrowserWindow.getAllWindows().forEach(win => {
+                if (!win.isDestroyed()) {
+                  win.webContents.send('plugin:hot-reloaded', { pluginId, timestamp: Date.now() })
+                }
+              })
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ success: true }))
+            } else {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: 'Plugin reload returned false (busy or skipped)' }))
+            }
+          }).catch((err) => {
+            console.error('[LocalServer] Failed to reload plugin:', err)
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: String(err) }))
+          })
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Missing plugin id' }))
+        }
+        return
+      }
+
+      if (pathname === '/install-plugin') {
+        const pluginUrl = url.searchParams.get('url')
+        if (pluginUrl) {
+          console.log(`[LocalServer] Installing plugin from URL: ${pluginUrl}`)
+          ElectronMainWindow.getInstance().showWindow()
+          downloadAndInstallPlugin(pluginUrl).then((success) => {
+            if (success) {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ success: true }))
+            } else {
+              res.writeHead(500, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: 'Failed to download or install plugin' }))
+            }
+          }).catch((err) => {
+            console.error('[LocalServer] Failed to download and install plugin:', err)
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: String(err) }))
+          })
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Missing url parameter' }))
+        }
+        return
+      }
+
+      if (pathname === '/buffer/add' && req.method === 'POST') {
+        let body = ''
+        req.on('data', (chunk) => {
+          body += chunk.toString()
+        })
+        req.on('end', () => {
+          try {
+            const data = JSON.parse(body)
+            if (data && data.content) {
+              const spaceId = data.spaceId || 'global'
+              const tempId = `temp_note_${Date.now()}`
+              
+              ElectronBufferWindow.getInstance().addBufferItem({
+                uuid: tempId,
+                content: JSON.stringify({ say: data.content, spaceId }),
+                event_date: new Date().toISOString(),
+                keywords: ['临时笔记'],
+                spaceId,
+              })
+
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ success: true, uuid: tempId }))
+            } else {
+              res.writeHead(400, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: 'Missing content field' }))
+            }
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'Invalid JSON' }))
+          }
+        })
+        return
+      }
+
+      if (pathname === '/v1/chat/completions' && req.method === 'POST') {
+        let body = ''
+        req.on('data', (chunk) => {
+          body += chunk.toString()
+        })
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body)
+            const { messages, model, stream, temperature, max_tokens } = data
+            if (!messages || !Array.isArray(messages)) {
+              res.writeHead(400, { 'Content-Type': 'application/json' })
+              res.end(JSON.stringify({ error: { message: "Invalid request: 'messages' must be an array.", type: 'invalid_request_error' } }))
+              return
+            }
+
+            const isStream = !!stream
+            const modelName = model || 'default'
+
+            const options = {
+              messages,
+              model: modelName,
+              temperature,
+              maxTokens: max_tokens,
+              sessionId: `local_server_${Date.now()}`
+            }
+
+            if (isStream) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Access-Control-Allow-Origin': '*'
+              })
+
+              const onChunk = (chunk: string) => {
+                const chunkObj = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    delta: { content: chunk },
+                    finish_reason: null
+                  }]
+                }
+                res.write(`data: ${JSON.stringify(chunkObj)}\n\n`)
+              }
+
+              try {
+                const { dispatchPluginApiCall } = await import('../plugins/api-dispatcher')
+                await dispatchPluginApiCall(
+                  'com.berrytrace.local-server',
+                  'ai',
+                  'chatStream',
+                  [options],
+                  { onChunk }
+                )
+
+                const finalChunk = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    delta: {},
+                    finish_reason: 'stop'
+                  }]
+                }
+                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+                res.write('data: [DONE]\n\n')
+                res.end()
+              } catch (err: any) {
+                const errObj = {
+                  error: {
+                    message: err.message || 'Stream processing failed',
+                    type: 'api_error'
+                  }
+                }
+                res.write(`data: ${JSON.stringify(errObj)}\n\n`)
+                res.write('data: [DONE]\n\n')
+                res.end()
+              }
+            } else {
+              try {
+                const { dispatchPluginApiCall } = await import('../plugins/api-dispatcher')
+                const result = await dispatchPluginApiCall(
+                  'com.berrytrace.local-server',
+                  'ai',
+                  'chat',
+                  [options]
+                ) as any
+
+                const responseObj = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion',
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    message: {
+                      role: 'assistant',
+                      content: result?.content || ''
+                    },
+                    finish_reason: 'stop'
+                  }],
+                  usage: {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0
+                  }
+                }
+
+                res.writeHead(200, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify(responseObj))
+              } catch (err: any) {
+                res.writeHead(500, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: { message: err.message || 'API call failed', type: 'api_error' } }))
+              }
+            }
+          } catch (err) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: { message: 'Invalid JSON request body.', type: 'invalid_request_error' } }))
+          }
+        })
+        return
+      }
+
+      // Default Not Found
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Not Found' }))
+    })
+
+    this.server.on('error', (err: Error) => {
+      console.error('[LocalServer] Error in HTTP server:', err)
+      this.server = null
+    })
+
+    // Binds strictly to 127.0.0.1 to avoid exposing endpoints to local network peers
+    this.server.listen(this.port, '127.0.0.1', () => {
+      console.log(`[LocalServer] Service started on http://127.0.0.1:${this.port}`)
+    })
+  }
+
+  /**
+   * Stop the HTTP server
+   */
+  public stop(): void {
+    if (this.server) {
+      this.server.close()
+      this.server = null
+      console.log('✅ Local detection server stopped')
+
+      // Clean up token file
+      try {
+        const tokenFilePath = join(app.getPath('home'), '.berrytrace', 'local_server.json')
+        unlinkSync(tokenFilePath)
+      } catch {
+        // ignore
+      }
+    }
+  }
+}

@@ -1,0 +1,222 @@
+/**
+ * HookRegistry — 跨插件运行时钩子注册表
+ *
+ * 允许任意插件注册回调函数，其他插件通过名称 + 参数调用。
+ * 宿主负责 IPC 转发到对应的插件进程。
+ *
+ * 使用 IPluginProcess 抽象接口屏蔽 utilityProcess / child_process.fork 差异。
+ * 进程池方案下，通过 targetPluginId 路由到目标插件。
+ */
+
+import { BrowserWindow, ipcMain } from 'electron';
+import type { IPluginProcess } from './plugin-process-adapter';
+
+interface HookEntry {
+  pluginId: string;
+  name: string;
+  priority: number;
+  handlerSrc: string; // handler.toString() 序列化
+}
+
+export class HookRegistry {
+  private static instance: HookRegistry;
+  private hooks = new Map<string, HookEntry[]>();
+  /** 插件进程注册表（通过 IPluginProcess 接口，兼容 utilityProcess / child_process.fork） */
+  private backgroundProcesses = new Map<string, IPluginProcess>();
+
+  static getInstance(): HookRegistry {
+    if (!HookRegistry.instance) {
+      HookRegistry.instance = new HookRegistry();
+    }
+    return HookRegistry.instance;
+  }
+
+  /** 注册一个 hook */
+  register(pluginId: string, name: string, priority: number, handlerSrc: string): void {
+    const entries = this.hooks.get(name) || [];
+    const idx = entries.findIndex(e => e.pluginId === pluginId);
+    const entry: HookEntry = { pluginId, name, priority, handlerSrc };
+    if (idx >= 0) {
+      entries[idx] = entry;
+    } else {
+      entries.push(entry);
+    }
+    // 按优先级排序（数字小优先）
+    entries.sort((a, b) => a.priority - b.priority);
+    this.hooks.set(name, entries);
+    console.log(`[HookRegistry] ${pluginId} 注册 hook "${name}" p=${priority} (共 ${entries.length} 个注册)`);
+  }
+
+  /** 清理插件的所有 hooks（插件注销时调用） */
+  unregisterPlugin(pluginId: string): void {
+    let count = 0;
+    for (const [name, entries] of this.hooks) {
+      const filtered = entries.filter(e => e.pluginId !== pluginId);
+      if (filtered.length !== entries.length) {
+        count += entries.length - filtered.length;
+        if (filtered.length === 0) this.hooks.delete(name);
+        else this.hooks.set(name, filtered);
+      }
+    }
+    if (count > 0) console.log(`[HookRegistry] 清理 ${pluginId} 的 ${count} 个 hooks`);
+  }
+
+  /** 注册 background 进程引用（用于 IPC 转发，接受 IPluginProcess 抽象接口） */
+  registerBackgroundProcess(pluginId: string, proc: IPluginProcess): void {
+    this.backgroundProcesses.set(pluginId, proc);
+  }
+
+  /** 注销单个 hook（插件自行调用） */
+  unregister(pluginId: string, name: string): void {
+    const entries = this.hooks.get(name);
+    if (!entries) return;
+    const filtered = entries.filter(e => e.pluginId !== pluginId);
+    if (filtered.length === 0) this.hooks.delete(name);
+    else this.hooks.set(name, filtered);
+    console.log(`[HookRegistry] ${pluginId} 注销 hook "${name}"`);
+  }
+
+  /** 注销 background 进程引用 */
+  unregisterBackgroundProcess(pluginId: string): void {
+    this.backgroundProcesses.delete(pluginId);
+    this.unregisterPlugin(pluginId);
+  }
+
+  /** 调用 hook。merge=false 返回第一个，merge=true 收集全部（数组） */
+  async call(
+    name: string,
+    args: unknown[],
+    sender?: any,
+    merge = false,
+    timeoutMs = 5000,
+  ): Promise<unknown> {
+    const entries = this.hooks.get(name);
+    if (!entries || entries.length === 0) {
+      console.log(`[HookRegistry] call "${name}" → 无注册`);
+      return null;
+    }
+
+    if (!merge) {
+      const entry = entries[0];
+      console.log(`[HookRegistry] call "${name}" → ${entry.pluginId} (first of ${entries.length})`);
+      try {
+        return await this.invokeHandler(entry, args, sender, timeoutMs);
+      } catch (err) {
+        console.warn(`[HookRegistry] call "${name}" 失败:`, err);
+        return null;
+      }
+    }
+
+    // merge 模式：收集全部结果
+    console.log(`[HookRegistry] call "${name}" → merge ${entries.length} 个 handler`);
+    const results: unknown[] = [];
+    for (const entry of entries) {
+      try {
+        const r = await this.invokeHandler(entry, args, sender, timeoutMs);
+        if (r !== null && r !== undefined) results.push(r);
+      } catch (err) {
+        console.warn(`[HookRegistry] call "${name}" ${entry.pluginId} 失败:`, err);
+      }
+    }
+    return results.length > 0 ? results : null;
+  }
+
+  /** 跨进程调用 handler */
+  private async invokeHandler(
+    entry: HookEntry,
+    args: unknown[],
+    sender?: any,
+    timeoutMs = 5000,
+  ): Promise<string | null> {
+    const validTimeout = (typeof timeoutMs === 'number' && !isNaN(timeoutMs) && timeoutMs > 0) ? timeoutMs : 5000;
+    const bgProc = this.backgroundProcesses.get(entry.pluginId);
+
+    if (bgProc) {
+      // Check if process has exited
+      if ('killed' in bgProc && (bgProc as any).killed) {
+        this.unregisterBackgroundProcess(entry.pluginId);
+        return null;
+      }
+
+      // Background plugin → 通过 IPluginProcess.sendMessage 异步调用
+      return new Promise((resolve, reject) => {
+        const token = `hook:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+
+        // 注册一次性消息监听以捕获 hook 结果回调。
+        // onMessage 返回取消监听函数 off()，必须在收到结果或超时后调用，
+        // 否则每次 hook 调用都会在进程上累积一个永久监听器，导致内存/CPU 泄漏。
+        const off = bgProc.onMessage((msg: unknown) => {
+          try {
+            const data = typeof msg === 'string' ? JSON.parse(msg) : (msg as Record<string, unknown>);
+            if (data.type === 'sdk:hook:result' && data.token === token) {
+              off(); // 收到目标结果，立即注销监听
+              clearTimeout(timer);
+              resolve((data.result ?? null) as string | null);
+            }
+          } catch { /* 忽略非目标消息 */ }
+        });
+
+        const timer = setTimeout(() => {
+          off(); // 超时也必须注销监听，避免泄漏
+          reject(new Error('timeout'));
+        }, validTimeout);
+
+        // 发送 hook 调用请求
+        bgProc.sendMessage({
+          type: 'sdk:hook:invoke',
+          token,
+          name: entry.name,
+          args,
+          handlerSrc: entry.handlerSrc,
+        });
+      });
+    }
+
+    // Determine the webContents to send IPC to
+    let webContents: any = null;
+    if (sender) {
+      webContents = sender.webContents || sender;
+    } else {
+      // Fallback: use active main window's webContents if sender is not provided (e.g. background process caller)
+      const wins = BrowserWindow.getAllWindows();
+      const mainWin = wins.find(w => {
+        const url = w.webContents.getURL();
+        return !url.includes('window=');
+      }) || wins[0] || null;
+      if (mainWin && !mainWin.isDestroyed()) {
+        webContents = mainWin.webContents;
+      }
+    }
+
+    if (webContents) {
+      // Renderer plugin → 通过 webContents 转发
+      return new Promise((resolve, reject) => {
+        const token = `hook:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+        const timer = setTimeout(() => {
+          ipcMain.removeListener('plugins:hook-result', handler);
+          reject(new Error('timeout'));
+        }, validTimeout);
+
+        const handler = (_event: any, response: { token: string; result?: string; error?: string }) => {
+          if (response.token === token) {
+            clearTimeout(timer);
+            ipcMain.removeListener('plugins:hook-result', handler);
+            if (response.error) reject(new Error(response.error));
+            else resolve(response.result ?? null);
+          }
+        };
+
+        ipcMain.on('plugins:hook-result', handler);
+        webContents.send('plugins:hook-invoke', {
+          token,
+          name: entry.name,
+          args,
+          handlerSrc: entry.handlerSrc,
+        });
+      });
+    }
+
+    // 无法路由到任何进程
+    throw new Error(`Hook "${entry.name}" 的插件 ${entry.pluginId} 不在线`);
+  }
+}

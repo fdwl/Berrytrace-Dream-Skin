@@ -1,0 +1,138 @@
+import { create } from 'zustand';
+
+/**
+ * ContentArea 显示模式：
+ * - 'chat'       默认 Agent Chat（包括无会话的空状态）
+ * - 'plans'      已安排（定时任务管理），替代 AgentChat 占据内容区
+ * - 'plugins'    插件管理，替代 AgentChat 占据内容区
+ * - 'automation' 自动化（工作流中心），替代 plans + 工作流
+ * - 'settings'   系统设置（内联展示），左边栏变为设置 Tab 导航 + 右侧内容区
+ * - 'sessions'   会话管理，全局管理历史对话与搜索
+ * - 'knowledge'  知识库画廊（包含多路径文档检索与可视化分类管理）
+ *
+ * 所有视图均支持在右侧打开 Workspace 面板（Universal Workspace）。
+ */
+export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation' | 'settings' | 'sessions' | 'knowledge';
+
+interface DashboardState {
+  /** Workspace 面板是否可见 */
+  workspaceVisible: boolean;
+  
+  /** 记录最近一次打开工作区的时间戳，用于避免初始化时的误收起竞态 */
+  workspaceOpenedAt: number;
+
+  /** ContentArea 当前显示的视图 */
+  contentView: ContentView;
+
+  /**
+   * 进入 settings 视图前的上一个视图，用于"返回"按钮导航。
+   * 避免返回到 'settings' 自身形成死循环。
+   */
+  prevContentView: ContentView;
+
+  /** 设置面板当前激活的 Tab ID（由 SidebarLayout 设置导航和 ContentArea 共享） */
+  settingsActiveTab: string;
+
+  /** 侧边栏选中的项目工作区路径（null = 默认工作区） */
+  selectedProjectPath: string | null;
+
+  /** 当前在侧边栏中展开的项目路径字典 */
+  expandedProjects: Record<string, boolean>;
+
+  /** Workspace 面板是否最大化全屏展示（折叠隐藏 ContentArea） */
+  workspaceMaximized: boolean;
+
+  /** 切换 Workspace 最大化状态 */
+  setWorkspaceMaximized: (maximized: boolean) => void;
+
+  /** 切换 Workspace 显示/隐藏 */
+  toggleWorkspace: () => void;
+  /** 显示 Workspace */
+  showWorkspace: () => void;
+  /** 隐藏 Workspace */
+  hideWorkspace: () => void;
+
+  /**
+   * 切换 ContentView。
+   * 切换到 'settings' 时自动记录 prevContentView，用于返回导航。
+   */
+  setContentView: (view: ContentView) => void;
+
+  /** 直接返回上一个非 settings 视图（由"返回"按钮使用） */
+  goBackFromSettings: () => void;
+
+  /** 设置 settingsActiveTab */
+  setSettingsActiveTab: (tabId: string) => void;
+
+  /** 设置侧边栏选中项目路径 */
+  setSelectedProjectPath: (path: string | null) => void;
+
+  /** 切换某个项目工作区的展开状态 */
+  toggleProjectExpanded: (path: string) => void;
+  /** 设置某个项目工作区的展开状态 */
+  setProjectExpanded: (path: string, expanded: boolean) => void;
+}
+
+export const useDashboardStore = create<DashboardState>((set, get) => ({
+  workspaceVisible: false,
+  workspaceOpenedAt: 0,
+  contentView: 'chat',
+  prevContentView: 'chat',
+  settingsActiveTab: 'general',
+  selectedProjectPath: null,
+  expandedProjects: {},
+  workspaceMaximized: false,
+  setWorkspaceMaximized: (maximized) => set({ workspaceMaximized: maximized }),
+
+  toggleWorkspace: () => set((s) => {
+    const nextVal = !s.workspaceVisible;
+    console.log(`[DashboardStore:toggleWorkspace] workspaceVisible changing from ${s.workspaceVisible} to ${nextVal}`);
+    return { 
+      workspaceVisible: nextVal,
+      workspaceOpenedAt: !s.workspaceVisible ? Date.now() : s.workspaceOpenedAt
+    };
+  }),
+  showWorkspace: () => set(() => {
+    console.log(`[DashboardStore:showWorkspace] setting workspaceVisible to true`);
+    return { workspaceVisible: true, workspaceOpenedAt: Date.now() };
+  }),
+  hideWorkspace: () => set(() => {
+    console.log(`[DashboardStore:hideWorkspace] setting workspaceVisible to false`);
+    return { workspaceVisible: false };
+  }),
+
+  setContentView: (view) => set((s) => {
+    console.log(`[DashboardStore:setContentView] changing contentView to ${view}`);
+    // 进入 settings 时记录上一个视图（防止 settings → settings 的循环）
+    const prev = s.contentView !== 'settings' ? s.contentView : s.prevContentView;
+    return {
+      contentView: view,
+      prevContentView: prev,
+    };
+  }),
+
+  goBackFromSettings: () => set((s) => {
+    const target = s.prevContentView !== 'settings' ? s.prevContentView : 'chat';
+    console.log(`[DashboardStore:goBackFromSettings] returning to ${target}`);
+    return { contentView: target };
+  }),
+
+  setSettingsActiveTab: (tabId) => set({ settingsActiveTab: tabId }),
+
+  setSelectedProjectPath: (path) => set({ selectedProjectPath: path }),
+  toggleProjectExpanded: (path) => set((s) => ({
+    expandedProjects: {
+      ...s.expandedProjects,
+      [path]: !s.expandedProjects[path]
+    }
+  })),
+  setProjectExpanded: (path, expanded) => set((s) => ({
+    expandedProjects: {
+      ...s.expandedProjects,
+      [path]: expanded
+    }
+  })),
+}));
+
+export default useDashboardStore;
+

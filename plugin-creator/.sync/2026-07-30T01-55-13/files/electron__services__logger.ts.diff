@@ -1,0 +1,152 @@
+diff --git a/electron/services/logger.ts b/electron/services/logger.ts
+index e513b81..9dee7b3 100644
+--- a/electron/services/logger.ts
++++ b/electron/services/logger.ts
+@@ -16,12 +16,47 @@ export interface LogEntry {
+   workspaceName?: string
+ }
+ 
++// Log level hierarchy: debug < info < warn < error
++const LOG_LEVEL_ORDER: Record<LogEntry['level'], number> = {
++  debug: 0,
++  info: 1,
++  warn: 2,
++  error: 3,
++}
++
++let currentLogLevel: LogEntry['level'] = 'info'
++
++export function setLogLevel(level: LogEntry['level']) {
++  currentLogLevel = level
++}
++
++export function getLogLevel(): LogEntry['level'] {
++  return currentLogLevel
++}
++
++function shouldLog(level: LogEntry['level']): boolean {
++  return LOG_LEVEL_ORDER[level] >= LOG_LEVEL_ORDER[currentLogLevel]
++}
++
+ const MAX_IN_MEMORY_LOGS = 1000
+ const inMemoryLogsBySource: Record<string, LogEntry[]> = {
+   all: []
+ }
+ let isLoggingInitialized = false
+ 
++export function getInMemoryLogs(source?: string, limit: number = 50): LogEntry[] {
++  let logs: LogEntry[] = []
++  if (source && inMemoryLogsBySource[source]) {
++    logs = inMemoryLogsBySource[source]
++  } else {
++    logs = inMemoryLogsBySource.all || []
++    if (source) {
++      logs = logs.filter(l => l.source.includes(source) || l.message.includes(source))
++    }
++  }
++  return logs.slice(-limit)
++}
++
+ // Store original console functions
+ export const originalConsole = {
+   log: console.log,
+@@ -37,10 +72,29 @@ const writeQueue: string[] = []
+ 
+ const appStartTime = Date.now()
+ 
++const ANSI_COLORS = {
++  reset: '\x1b[0m',
++  bold: '\x1b[1m',
++  error: '\x1b[31;1m', // Bold Red
++  warn: '\x1b[33;1m',  // Bold Yellow
++  info: '\x1b[36m',    // Cyan
++  debug: '\x1b[90m',   // Gray
++}
++
++function formatConsoleMessage(level: LogEntry['level'], text: string): string {
++  const color = ANSI_COLORS[level] || ANSI_COLORS.reset
++  return `${color}${text}${ANSI_COLORS.reset}`
++}
++
+ function formatLogLine(entry: LogEntry): string {
+   const dateStr = new Date(entry.timestamp).toISOString()
+   const elapsedMs = (entry.timestamp - appStartTime).toString().padStart(6, ' ')
+-  const levelStr = entry.level.toUpperCase().padEnd(5)
++  
++  let levelPrefix = ''
++  if (entry.level === 'error') levelPrefix = '❌ '
++  else if (entry.level === 'warn') levelPrefix = '⚠️ '
++
++  const levelStr = (levelPrefix + entry.level.toUpperCase()).padEnd(8)
+   const sourceStr = entry.source
+   const wsStr = entry.workspaceName ? ` [${entry.workspaceName}]` : ''
+   return `[${dateStr}] [+${elapsedMs}ms] [${levelStr}] [${sourceStr}]${wsStr} ${entry.message}\n`
+@@ -126,6 +180,7 @@ export function getHistoryMap(): Record<string, LogEntry[]> {
+ }
+ 
+ export function addLog(level: LogEntry['level'], source: string, message: string, workspacePath?: string, workspaceName?: string) {
++  if (!shouldLog(level)) return
+   if (isInsideAddLog) {
+     // Prevent infinite logging recursion by calling original console
+     originalConsole.error(`[Logger Recursion Prevention] [${level}] [${source}] ${message}`)
+@@ -286,7 +341,7 @@ export function setupWebContentsLogger(contents: Electron.WebContents) {
+     // Print to main process console in dev mode
+     if (process.env.VITE_DEV_SERVER_URL) {
+       const label = `[renderer:${source}]`
+-      originalConsole[fnLevel](`${label} ${fullMsg}`)
++      originalConsole[fnLevel](formatConsoleMessage(fnLevel, `${label} ${fullMsg}`))
+     }
+ 
+     // Phase 4: Resolve workspace context for this webContents
+@@ -350,30 +405,41 @@ export function initializeLogger() {
+   if (isLoggingInitialized) return
+   isLoggingInitialized = true
+ 
++  // Support BERRYTRACE_LOG_LEVEL env var (debug|info|warn|error)
++  const envLevel = (process.env.BERRYTRACE_LOG_LEVEL || '').toLowerCase()
++  if (envLevel in LOG_LEVEL_ORDER) {
++    currentLogLevel = envLevel as LogEntry['level']
++  }
++
+   // Clear app.log on startup so it only contains the current session
+   clearAppLogOnStartup()
+ 
+-  // Override console methods to capture main process output
++  // Override console methods to capture main process output and colorize terminal logs
+   console.log = (...args: unknown[]) => {
+-    originalConsole.log(...args)
+-    addLog('info', 'main', argsToString(...args))
++    const formatted = argsToString(...args)
++    originalConsole.log(formatted)
++    addLog('info', 'main', formatted)
+   }
+   console.info = (...args: unknown[]) => {
+-    originalConsole.info(...args)
+-    addLog('info', 'main', argsToString(...args))
++    const formatted = argsToString(...args)
++    originalConsole.info(formatConsoleMessage('info', formatted))
++    addLog('info', 'main', formatted)
+   }
+   console.warn = (...args: unknown[]) => {
+-    originalConsole.warn(...args)
+-    addLog('warn', 'main', argsToString(...args))
++    const formatted = argsToString(...args)
++    originalConsole.warn(formatConsoleMessage('warn', formatted))
++    addLog('warn', 'main', formatted)
+   }
+   console.error = (...args: unknown[]) => {
+-    originalConsole.error(...args)
+-    addLog('error', 'main', argsToString(...args))
++    const formatted = argsToString(...args)
++    originalConsole.error(formatConsoleMessage('error', formatted))
++    addLog('error', 'main', formatted)
+   }
+   if (console.debug) {
+     console.debug = (...args: unknown[]) => {
+-      originalConsole.debug(...args)
+-      addLog('debug', 'main', argsToString(...args))
++      const formatted = argsToString(...args)
++      originalConsole.debug(formatConsoleMessage('debug', formatted))
++      addLog('debug', 'main', formatted)
+     }
+   }

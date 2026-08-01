@@ -1,0 +1,14 @@
+diff --git a/electron/plugins/controllers/hooks.ts b/electron/plugins/controllers/hooks.ts
+index 372be2e..aaab115 100644
+--- a/electron/plugins/controllers/hooks.ts
++++ b/electron/plugins/controllers/hooks.ts
+@@ -2,7 +2,8 @@
+  * Hooks Controller — 处理 sdk.hooks.register / sdk.hooks.call
+  */
+ import { HookRegistry } from '../hook-registry.js';
+-import { BaseApiController, ApiContext } from './api-context.js';
++import type { ApiContext } from './api-context.js';
++import { BaseApiController } from './api-context.js';
+ 
+ export class HooksController extends BaseApiController {
+   /**

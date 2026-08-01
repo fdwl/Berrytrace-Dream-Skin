@@ -1,0 +1,24 @@
+diff --git a/electron/plugins/workflow-history-manager.ts b/electron/plugins/workflow-history-manager.ts
+index d98e4f2..4e2569a 100644
+--- a/electron/plugins/workflow-history-manager.ts
++++ b/electron/plugins/workflow-history-manager.ts
+@@ -2,7 +2,7 @@ import fs from 'fs';
+ import path from 'path';
+ // @ts-ignore
+ import yaml from 'js-yaml';
+-import { WorkflowDefinition } from './workflow-types';
++import type { WorkflowDefinition } from './workflow-types';
+ 
+ export interface WorkflowHistorySnapshot {
+   workflowId: string;
+@@ -115,7 +115,9 @@ export class WorkflowHistoryManager {
+             definition: doc as WorkflowDefinition,
+             comment: doc._comment,
+           });
+-        } catch {}
++        } catch {
++          // ignore corrupt json
++        }
+       }
+ 
+       snapshots.sort((a, b) => b.timestamp - a.timestamp);

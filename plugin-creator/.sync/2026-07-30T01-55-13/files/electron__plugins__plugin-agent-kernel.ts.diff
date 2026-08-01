@@ -1,0 +1,13 @@
+diff --git a/electron/plugins/plugin-agent-kernel.ts b/electron/plugins/plugin-agent-kernel.ts
+index 1f0dd0c..9f6858a 100644
+--- a/electron/plugins/plugin-agent-kernel.ts
++++ b/electron/plugins/plugin-agent-kernel.ts
+@@ -1,5 +1,6 @@
+-import { ipcMain, IpcMainEvent } from 'electron';
+-import { PluginManager } from './plugin-manager';
++import type { IpcMainEvent } from 'electron';
++import { ipcMain } from 'electron';
++import type { PluginManager } from './plugin-manager';
+ import { PluginLauncher } from './plugin-launcher';
+ 
+ export function listAgentKernelPluginIds(pm: PluginManager, onlyEnabled: boolean): string[] {

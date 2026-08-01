@@ -1,0 +1,120 @@
+diff --git a/electron/services/workspace-context.ts b/electron/services/workspace-context.ts
+index 2431112..bea8671 100644
+--- a/electron/services/workspace-context.ts
++++ b/electron/services/workspace-context.ts
+@@ -12,7 +12,7 @@
+  *
+  * @see docs/workspace-plugin-reload-race-analysis.md 方案 C
+  */
+-import { BrowserWindow } from 'electron'
++import type { BrowserWindow } from 'electron'
+ import * as fs from 'fs'
+ import { join } from 'path'
+ import { WORKSPACE_DIR_NAME } from '../../src/config/constants'
+@@ -36,6 +36,73 @@ export interface WindowResolver {
+   getWindowsForContext(workspacePath: string): BrowserWindow[]
+ }
+ 
++export function shouldIgnoreWorkspaceFile(filename: string): boolean {
++  if (!filename) return true;
++  const normalized = filename.replace(/\\/g, '/');
++
++  // 1. 常见系统、构建与安装包产物目录
++  if (
++    normalized.includes('.git/') || normalized.endsWith('.git') ||
++    normalized.includes('node_modules/') || normalized.includes('/node_modules/') || normalized.startsWith('node_modules/') ||
++    normalized.includes(WORKSPACE_DIR_NAME) ||
++    normalized.includes('.berrytrace') ||
++    normalized.startsWith('release/') || normalized.includes('/release/') ||
++    normalized.startsWith('dist-electron/') || normalized.includes('/dist-electron/') ||
++    normalized.startsWith('dist/') || normalized.includes('/dist/') ||
++    normalized.startsWith('build/') || normalized.includes('/build/') ||
++    normalized.startsWith('out/') || normalized.includes('/out/') ||
++    normalized.startsWith('deply_download/') || normalized.includes('/deply_download/') ||
++    normalized.startsWith('logs/') || normalized.includes('/logs/')
++  ) {
++    return true;
++  }
++
++  // 2. macOS Bundle / Framework / Xcode 工程与安装包 (应用级文件与打包临时文件)
++  if (
++    normalized.includes('.app/') || normalized.endsWith('.app') ||
++    normalized.includes('.framework/') || normalized.endsWith('.framework') ||
++    normalized.includes('.xcodeproj/') || normalized.endsWith('.xcodeproj') ||
++    normalized.includes('.xcworkspace/') || normalized.endsWith('.xcworkspace') ||
++    normalized.includes('.dSYM/') || normalized.endsWith('.dSYM') ||
++    normalized.endsWith('.dmg') ||
++    normalized.endsWith('.pkg') ||
++    normalized.endsWith('.ipa')
++  ) {
++    return true;
++  }
++
++  // 3. Windows 可执行程序、动态库、系统文件与安装包
++  if (
++    normalized.endsWith('.exe') ||
++    normalized.endsWith('.dll') ||
++    normalized.endsWith('.sys') ||
++    normalized.endsWith('.msi') ||
++    normalized.endsWith('.cab') ||
++    normalized.endsWith('.iso')
++  ) {
++    return true;
++  }
++
++  // 4. 压缩包、块映射、日志、数据库与 IDE 缓存文件
++  if (
++    normalized.endsWith('.DS_Store') ||
++    normalized.endsWith('.log') ||
++    normalized.endsWith('.db') || normalized.endsWith('.db-journal') || normalized.endsWith('.db-wal') ||
++    normalized.endsWith('.sqlite') || normalized.endsWith('.sqlite3') || normalized.endsWith('.sqlite-journal') || normalized.endsWith('.sqlite-wal') ||
++    normalized.endsWith('.zip') || normalized.endsWith('.tar') || normalized.endsWith('.gz') || normalized.endsWith('.7z') ||
++    normalized.endsWith('.blockmap') ||
++    normalized.includes('.codebuddy') ||
++    normalized.includes('.vite') ||
++    normalized.includes('.next') ||
++    normalized.includes('.turbo') ||
++    normalized.includes('.cache')
++  ) {
++    return true;
++  }
++
++  return false;
++}
++
+ export class WorkspaceContext {
+   readonly workspacePath: string
+ 
+@@ -129,15 +196,7 @@ export class WorkspaceContext {
+     try {
+       console.log(`${TAG} Starting watcher at: ${this.workspacePath}`)
+       this.watcher = fs.watch(this.workspacePath, { recursive: true }, (event, filename) => {
+-        if (!filename) return
+-        if (
+-          filename.includes('.git') ||
+-          filename.includes('node_modules') ||
+-          filename.includes(WORKSPACE_DIR_NAME) ||
+-          filename.includes('.DS_Store')
+-        ) {
+-          return
+-        }
++        if (!filename || shouldIgnoreWorkspaceFile(filename)) return;
+ 
+         this.changedFiles.add(filename)
+ 
+@@ -153,13 +212,13 @@ export class WorkspaceContext {
+         // 诊断：记录 file:modified 即将发送（在 debounce 定时器挂载时）
+         // 此日志帮助判断事件是否是被 rename 触发的
+         if (event === 'rename') {
+-          console.log(`[WorkspaceContext:watcher:defer] file:modified will be broadcast after 100ms debounce for "${filename}" (triggered by rename)`)
++          console.debug(`[WorkspaceContext:watcher:defer] file:modified will be broadcast after 100ms debounce for "${filename}" (triggered by rename)`)
+         }
+         this.fileModifiedDebounces.set(debounceKey, timeout)
+ 
+         if (event === 'rename') {
+           // 诊断：rename 事件可能是删除、重命名或原子保存（删旧+建新）
+-          console.log(`[WorkspaceContext:watcher:rename] event=rename filename="${filename}" absPath="${absPath}"`);
++          console.debug(`[WorkspaceContext:watcher:rename] event=rename filename="${filename}" absPath="${absPath}"`);
+           this.notifyStructureChanged()
+         } else {
+           this.notifyContentChanged()

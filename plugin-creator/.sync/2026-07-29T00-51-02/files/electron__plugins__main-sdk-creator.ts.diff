@@ -1,0 +1,15 @@
+diff --git a/electron/plugins/main-sdk-creator.ts b/electron/plugins/main-sdk-creator.ts
+index a63dfad..24307a5 100644
+--- a/electron/plugins/main-sdk-creator.ts
++++ b/electron/plugins/main-sdk-creator.ts
+@@ -1,7 +1,8 @@
+-import { ipcMain, BrowserWindow, IpcMainEvent } from 'electron';
++import type { IpcMainEvent } from 'electron';
++import { ipcMain, BrowserWindow } from 'electron';
+ import { dispatchPluginApiCall } from './api-dispatcher';
+ import { McpHost } from './mcp-host';
+-import { PluginManager } from './plugin-manager';
++import type { PluginManager } from './plugin-manager';
+ 
+ export function createMainSDKInstance(pluginId: string, pm: PluginManager): Record<string, unknown> {
+   const callApi = (apiName: string, methodName: string, args: unknown[] = []) => {

@@ -1,0 +1,94 @@
+diff --git a/src/views/plugins/workspace/FlexWorkspace.tsx b/src/views/plugins/workspace/FlexWorkspace.tsx
+index 546e3be..70fb55f 100644
+--- a/src/views/plugins/workspace/FlexWorkspace.tsx
++++ b/src/views/plugins/workspace/FlexWorkspace.tsx
+@@ -166,12 +166,24 @@ function FlexWorkspace() {
+     }
+   };
+ 
++  // Tab 右键菜单开/关时通知主进程临时移除 WebContentsView（避免菜单被遮挡）
++  useEffect(() => {
++    const ipc = window.electronAPI?.ipc;
++    if (!ipc) return;
++    if (contextMenu) {
++      ipc.send('browser-view:overlay-opened', {});
++    } else {
++      ipc.send('browser-view:overlay-closed', {});
++    }
++  }, [contextMenu]);
++
+   useEffect(() => {
+     const handleCloseMenu = () => setContextMenu(null);
+     window.addEventListener('click', handleCloseMenu);
+     return () => window.removeEventListener('click', handleCloseMenu);
+   }, []);
+ 
++
+   // 监听主进程创建新文档的请求（Ctrl+Command+N）
+   useEffect(() => {
+     if (!isElectron || !window.electronAPI?.main?.onCreateNewDocument) return;
+@@ -201,61 +213,13 @@ function FlexWorkspace() {
+     };
+   }, []);
+ 
+-  // 监听插件通过 SDK IPC 在工作区打开标签页的请求
+-  useEffect(() => {
+-    if (!isElectron || !window.electronAPI?.main?.onOpenWorkspaceTab) return;
+ 
+-    const unsubscribe = window.electronAPI.main.onOpenWorkspaceTab((data) => {
+-      console.log('[FlexWorkspace] Received main:open-workspace-tab message:', data);
+-      const store = useWorkspaceStore.getState();
+-      store.openWorkspaceTab(
+-        data.filePath,
+-        data.pluginId,
+-        data.extension,
+-        data.articleId,
+-        data.sessionId,
+-        data.replaceActiveTab,
+-        data.title,
+-        data.line,
+-        data.customParams
+-      );
+-    });
+ 
+-    return () => {
+-      unsubscribe();
+-    };
+-  }, []);
++  // 注意：webview:new-window 已废弃（WebContentsView 迁移后）
++  // new-window 事件现在由 BrowserViewManager 通过 browser-view:event(type='new-window') 发出
++  // 由各 BrowserTabPanel 实例自行处理，不需要在 FlexWorkspace 层级监听
+ 
+-  // 监听主进程的 webview:new-window IPC 消息，在工作区新建标签页打开
+-  useEffect(() => {
+-    if (!isElectron || !window.electronAPI?.ipc?.on) return;
+-
+-    const unsubscribe = window.electronAPI.ipc.on('webview:new-window', (data: any) => {
+-      console.log('[FlexWorkspace:webview:new-window] IPC received data:', data);
+-      const { url } = data;
+-      if (url) {
+-        const sessionId = `browser_${Date.now()}`;
+-        console.log(`[FlexWorkspace:webview:new-window] Opening browser tab for URL=${url}, sessionId=${sessionId}`);
+-        useWorkspaceStore.getState().openWorkspaceTab(
+-          undefined,
+-          'system.browser',
+-          undefined,
+-          undefined,
+-          sessionId,
+-          false,
+-          '浏览器',
+-          undefined,
+-          { initialUrl: url }
+-        );
+-      } else {
+-        console.log('[FlexWorkspace:webview:new-window] Received new-window IPC event but url was empty.');
+-      }
+-    });
+ 
+-    return () => {
+-      unsubscribe();
+-    };
+-  }, []);
+ 
+   // 监听主进程重新打开侧边栏的请求（Ctrl+Command+O）
+   useEffect(() => {

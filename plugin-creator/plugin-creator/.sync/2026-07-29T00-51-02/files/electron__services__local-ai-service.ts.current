@@ -1,0 +1,842 @@
+import type { UtilityProcess} from 'electron';
+import { app, utilityProcess, ipcMain } from 'electron';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
+import * as child_process from 'child_process';
+import { net } from 'electron';
+import type { AITaskRequest, AITaskResponse, AITaskType } from '../workers/local-ai.worker';
+import { fileURLToPath } from 'url';
+import { EventEmitter } from 'events';
+import { getModelsRootDir } from '../config/paths';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+export class LocalAIService extends EventEmitter {
+  private static instance: LocalAIService | null = null;
+  private child: UtilityProcess | null = null;
+  private pendingRequests: Map<string, { resolve: (val: any) => void; reject: (err: any) => void }> = new Map();
+  
+  private get modelDir(): string {
+    return getModelsRootDir();
+  }
+
+  public getModelDir(): string {
+    return this.modelDir;
+  }
+
+  private isDownloading = false;
+  private downloadProgress = 0; // 0 to 100
+  private workerRetryCount = 0;
+  private stableRunningTimer: NodeJS.Timeout | null = null;
+
+  private spawnedProcesses = new Map<string, child_process.ChildProcess>();
+  private isQuitting = false;
+
+  private constructor() {
+    super();
+    this.ensureModelDir();
+    this.registerGenericIpcHandlers();
+    this.registerIpcHandlers();
+
+    // Register StorageMigrationService handlers early
+    import('./storage-migration-service.js').then(({ StorageMigrationService }) => {
+      StorageMigrationService.getInstance().registerIpcHandlers();
+      console.log('[LocalAIService] StorageMigrationService handlers registered early.');
+    }).catch((err) => {
+      console.error('[LocalAIService] Failed to load StorageMigrationService early:', err);
+    });
+
+    app.on('before-quit', () => {
+      this.isQuitting = true;
+      console.log('[LocalAIService] App is quitting. Stopping worker respawns.');
+      if (this.child) {
+        try {
+          this.child.kill();
+          console.log('[LocalAIService] Killed LocalAIWorker child process.');
+        } catch (e) {
+          // ignore
+        }
+        this.child = null;
+      }
+      for (const [key, proc] of this.spawnedProcesses.entries()) {
+        try {
+          proc.kill();
+          console.log(`[LocalAIService] Killed spawned process: ${key}`);
+        } catch (e) {
+          // ignore
+        }
+      }
+      this.spawnedProcesses.clear();
+    });
+  }
+
+  private isInitialized = false;
+
+  // ═══════════════════════════════════════════════════════════
+  //  Generic IPC Handlers（平台能力，无任何业务语义）
+  //
+  //  宿主只提供 3 个通用能力：
+  //  1. local-ai:spawn       — 启动一个 Node.js 脚本
+  //  2. local-ai:ws-request  — 向 localhost WebSocket 发请求
+  //  3. local-ai:http-post   — 向 localhost HTTP POST
+  //
+  //  所有语音逻辑（TTS/STT/模型管理）由插件自己实现。
+  // ═══════════════════════════════════════════════════════════
+  private registerGenericIpcHandlers(): void {
+    /**
+     * 启动一个 Node.js 脚本（通用脚本执行器）。
+     * 插件传入脚本路径和参数，宿主 spawn 子进程并返回 key。
+     * 脚本路径相对于项目根目录解释。
+     */
+    ipcMain.handle('local-ai:spawn', async (_event, opts: {
+      key: string;           // 插件自定义 key，用于后续管理
+      script: string;        // 脚本相对路径（相对于项目根）
+      port?: number;         // 可选端口参数
+      args?: string[];      // 额外命令行参数
+    }) => {
+      const existingProc = this.spawnedProcesses.get(opts.key);
+      if (existingProc && existingProc.exitCode === null) {
+        console.log(`[LocalAIService] Process with key "${opts.key}" is already running (PID: ${existingProc.pid}). Reusing.`);
+        return { ok: true, pid: existingProc.pid };
+      }
+
+      const scriptPath = path.join(path.dirname(__dirname), opts.script);
+      console.log(`[LocalAIService] Spawn request: key="${opts.key}" script=${scriptPath}`);
+
+      if (!fs.existsSync(scriptPath)) {
+        return { ok: false, error: `Script not found: ${scriptPath}` };
+      }
+
+      const nodeArgs = [scriptPath];
+      if (opts.port != null) nodeArgs.push('--port', String(opts.port));
+      if (opts.args) nodeArgs.push(...opts.args);
+
+      const proc = child_process.spawn('node', nodeArgs, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      proc.stderr?.on('data', (d) => console.log(`[Spawn:${opts.key}]`, d.toString().trim()));
+      proc.on('exit', (code) => {
+        console.log(`[Spawn:${opts.key}] exited with code ${code}`);
+        this.spawnedProcesses.delete(opts.key);
+      });
+
+      this.spawnedProcesses.set(opts.key, proc);
+      return { ok: true, pid: proc.pid };
+    });
+
+    /**
+     * 检查已 spawn 的进程是否还活着。
+     */
+    ipcMain.handle('local-ai:spawn-status', async (_event, opts: { keys: string[] }) => {
+      const result: Record<string, boolean> = {};
+      for (const key of opts.keys) {
+        const proc = this.spawnedProcesses.get(key);
+        result[key] = proc?.exitCode === null;
+      }
+      return result;
+    });
+
+    /**
+     * 通用 WebSocket 请求（插件连 localhost 服务的代理）。
+     */
+    ipcMain.handle('local-ai:ws-request', async (_event, opts: {
+      url: string;            // ws://127.0.0.1:PORT
+      payload: unknown;       // 要发送的 JSON
+      timeoutMs?: number;     // 超时（毫秒）
+    }) => {
+      const { WebSocket } = await import('ws');
+
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const ws = new WebSocket(opts.url);
+        const timeout = setTimeout(() => {
+          if (!settled) { settled = true; ws.close(); reject(new Error(`WS timeout (${opts.timeoutMs || 30000}ms)`)); }
+        }, opts.timeoutMs || 30000);
+
+        ws.on('open', () => {
+          ws.send(JSON.stringify(opts.payload));
+        });
+        ws.on('message', (raw: Buffer) => {
+          if (settled) return;
+          settled = true; clearTimeout(timeout); ws.close();
+          try { resolve(JSON.parse(raw.toString())); } catch { resolve(raw.toString()); }
+        });
+        ws.on('error', (err: Error) => {
+          if (!settled) { settled = true; clearTimeout(timeout); reject(new Error(`WS error: ${err.message}`)); }
+        });
+        ws.on('close', () => {
+          if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('WS closed unexpectedly')); }
+        });
+      });
+    });
+
+    /**
+     * 通用 HTTP POST 代理（插件连 localhost 服务的代理）。
+     */
+    ipcMain.handle('local-ai:http-post', async (_event, opts: {
+      url: string;            // http://127.0.0.1:PORT/path
+      body: unknown;          // POST body（JSON）
+    }) => {
+      const resp = await net.fetch(opts.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts.body),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${errText}`);
+      }
+      return resp.json();
+    });
+
+    /**
+     * 获取当前的本地 AI 模型根目录（支持用户自定义迁移路径）。
+     */
+    ipcMain.handle('local-ai:get-model-dir', async () => {
+      return getModelsRootDir();
+    });
+  }
+
+  public static getInstance(): LocalAIService {
+    if (!LocalAIService.instance) {
+      LocalAIService.instance = new LocalAIService();
+    }
+    return LocalAIService.instance;
+  }
+
+  private ensureModelDir() {
+    fs.mkdirSync(this.modelDir, { recursive: true });
+    fs.mkdirSync(path.join(this.modelDir, 'embedding'), { recursive: true });
+    fs.mkdirSync(path.join(this.modelDir, 'ocr'), { recursive: true });
+  }
+
+  /**
+   * Initialize Local AI Service:
+   * 1. Check/download default models.
+   * 2. Spawn worker process.
+   */
+  public async initialize(): Promise<void> {
+    if (this.isInitialized) {
+      console.log('[LocalAIService] Already initialized, skipping duplicate call.');
+      return;
+    }
+    this.isInitialized = true;
+    console.log('[LocalAIService] Initializing Local AI Service...');
+
+    // Register IPC handlers early so they are available immediately
+    this.registerIpcHandlers();
+
+    // Dynamically load StorageMigrationService and register its IPC handlers
+    import('./storage-migration-service.js').then(({ StorageMigrationService }) => {
+      StorageMigrationService.getInstance().registerIpcHandlers();
+      console.log('[LocalAIService] StorageMigrationService handlers registered.');
+    }).catch((err) => {
+      console.error('[LocalAIService] Failed to load StorageMigrationService:', err);
+    });
+
+    // Provision model and spawn worker asynchronously in background
+    this.checkAndProvisionDefaultModel()
+      .then(() => {
+        this.spawnWorker();
+      })
+      .catch((err) => {
+        console.error('[LocalAIService] Failed to check/provision default model:', err);
+      });
+  }
+
+  public suspendWorker(): void {
+    console.log('[LocalAIService] Suspending all local AI worker and spawned processes for storage migration...');
+    this.isQuitting = true;
+    if (this.child) {
+      try {
+        this.child.kill();
+      } catch (e) {
+        // ignore
+      }
+      this.child = null;
+    }
+    for (const [key, proc] of this.spawnedProcesses.entries()) {
+      try {
+        proc.kill();
+        console.log(`[LocalAIService] Suspended spawned process: ${key}`);
+      } catch (e) {
+        // ignore
+      }
+    }
+    this.spawnedProcesses.clear();
+  }
+
+  public resumeWorker(): void {
+    console.log('[LocalAIService] Resuming local AI worker after storage migration...');
+    this.isQuitting = false;
+    this.workerRetryCount = 0;
+    this.spawnWorker();
+  }
+
+  private spawnWorker() {
+    if (this.child) {
+      try {
+        this.child.kill();
+      } catch (e) {
+        // ignore
+      }
+      this.child = null;
+    }
+
+    if (this.stableRunningTimer) {
+      clearTimeout(this.stableRunningTimer);
+      this.stableRunningTimer = null;
+    }
+
+    let workerPath = path.join(__dirname, 'workers/local-ai.worker.js');
+    if (!fs.existsSync(workerPath)) {
+      const appPath = app.isPackaged ? process.resourcesPath : process.cwd();
+      const altPath = path.join(appPath, 'dist-electron/workers/local-ai.worker.js');
+      if (fs.existsSync(altPath)) {
+        workerPath = altPath;
+      } else {
+        const legacyPath = path.join(__dirname, '../workers/local-ai.worker.js');
+        if (fs.existsSync(legacyPath)) {
+          workerPath = legacyPath;
+        }
+      }
+    }
+
+    console.log(`[LocalAIService] Spawning LocalAIWorker from: ${workerPath}`);
+    try {
+      this.child = utilityProcess.fork(workerPath, [], {
+        stdio: 'pipe'
+      });
+
+      let stdoutRemainder = '';
+      this.child.stdout?.on('data', (chunk: Buffer) => {
+        const str = chunk.toString();
+        stdoutRemainder += str;
+        const lines = stdoutRemainder.split(/\r?\n/);
+        stdoutRemainder = lines.pop() || '';
+        for (const line of lines) {
+          console.log(`[LocalAIWorker:stdout] ${line}`);
+        }
+      });
+      this.child.stdout?.on('end', () => {
+        if (stdoutRemainder.trim()) {
+          console.log(`[LocalAIWorker:stdout] ${stdoutRemainder}`);
+        }
+      });
+
+      let stderrRemainder = '';
+      this.child.stderr?.on('data', (chunk: Buffer) => {
+        const str = chunk.toString();
+        stderrRemainder += str;
+        const lines = stderrRemainder.split(/\r?\n/);
+        stderrRemainder = lines.pop() || '';
+        for (const line of lines) {
+          console.error(`[LocalAIWorker:stderr] ${line}`);
+        }
+      });
+      this.child.stderr?.on('end', () => {
+        if (stderrRemainder.trim()) {
+          console.error(`[LocalAIWorker:stderr] ${stderrRemainder}`);
+        }
+      });
+
+      // Reset retry count after 30 seconds of stable running
+      this.stableRunningTimer = setTimeout(() => {
+        if (this.child) {
+          this.workerRetryCount = 0;
+          console.log('[LocalAIService] LocalAIWorker has been running stably for 30s. Resetting retry count.');
+        }
+      }, 30000);
+
+      // Emit ready event and notify renderer processes
+      this.emit('ready');
+      import('electron').then(({ BrowserWindow }) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.webContents.send('local-ai:ready');
+          }
+        }
+      }).catch(() => {});
+
+      this.child.on('message', (message: any) => {
+        const response = message as AITaskResponse;
+        if (response && response.requestId) {
+          const promise = this.pendingRequests.get(response.requestId);
+          if (promise) {
+            this.pendingRequests.delete(response.requestId);
+            if (response.success) {
+              promise.resolve(response.result);
+            } else {
+              promise.reject(new Error(response.error || 'Unknown worker error'));
+            }
+          }
+        }
+      });
+
+      this.child.on('exit', (code) => {
+        if (this.stableRunningTimer) {
+          clearTimeout(this.stableRunningTimer);
+          this.stableRunningTimer = null;
+        }
+        this.child = null;
+
+        if (this.isQuitting) {
+          console.log('[LocalAIService] LocalAIWorker exited during app quit. Skipping auto-respawn.');
+          return;
+        }
+
+        if (this.workerRetryCount >= 5) {
+          console.error(`[LocalAIService] LocalAIWorker crashed too many times (${this.workerRetryCount}). Disabling auto-respawn.`);
+          return;
+        }
+        this.workerRetryCount++;
+        console.warn(`[LocalAIService] LocalAIWorker exited with code ${code}. Re-spawning in 5 seconds (attempt ${this.workerRetryCount}/5)...`);
+        setTimeout(() => {
+          this.spawnWorker();
+        }, 5000);
+      });
+    } catch (err) {
+      console.error('[LocalAIService] Failed to spawn LocalAIWorker:', err);
+    }
+  }
+
+  /**
+   * Checks if default embedding model (bge-small-zh) is present.
+   * If missing, auto-downloads it (or copies it from scratch in dev mode).
+   */
+  private async checkAndProvisionDefaultModel(): Promise<void> {
+    const defaultModelPath = path.join(this.modelDir, 'embedding', 'bge-small-zh');
+    const modelFile = path.join(defaultModelPath, 'model.onnx');
+    const vocabFile = path.join(defaultModelPath, 'vocab.txt');
+
+    if (fs.existsSync(modelFile) && fs.existsSync(vocabFile)) {
+      console.log('[LocalAIService] Default BGE embedding model is already present.');
+      return;
+    }
+
+    fs.mkdirSync(defaultModelPath, { recursive: true });
+
+    // ─── Development Mode Hook: Copy from scratch directory ───
+    if (!app.isPackaged || process.env.VITE_DEV_SERVER_URL) {
+      const scratchDir = path.join(process.cwd(), 'scratch', 'ocr-test', 'models');
+      const scratchModel = path.join(scratchDir, 'bge_zh.onnx');
+      const scratchModelQuant = path.join(scratchDir, 'bge_base_zh_quant.onnx');
+      const scratchVocab = path.join(scratchDir, 'bge_vocab.txt');
+
+      if (fs.existsSync(scratchVocab)) {
+        let copied = false;
+        // Try quantized first if it exists, otherwise standard
+        const sourceModel = fs.existsSync(scratchModelQuant) ? scratchModelQuant : (fs.existsSync(scratchModel) ? scratchModel : null);
+
+        if (sourceModel) {
+          console.log(`[LocalAIService] [Dev] Copying embedding model from scratch folder: ${sourceModel}`);
+          fs.copyFileSync(sourceModel, modelFile);
+          fs.copyFileSync(scratchVocab, vocabFile);
+          console.log('[LocalAIService] [Dev] Successfully provisioned default model from scratch folder.');
+          copied = true;
+        }
+        if (copied) return;
+      }
+    }
+
+    // ─── Production / Fallback: Network Download ───
+    console.log('[LocalAIService] Default model files missing. Initiating background download...');
+    this.isDownloading = true;
+
+    // Use personal server as the primary source for domestic users to guarantee speed
+    const modelUrl = 'https://getdear.cn/mstatic/models/bge_base_zh_quant.onnx';
+    const vocabUrl = 'https://getdear.cn/mstatic/models/bge_vocab.txt';
+
+    try {
+      // 1. Download vocab.txt (small, fast)
+      console.log(`[LocalAIService] Downloading vocab file from ${vocabUrl}...`);
+      await this.downloadFile(vocabUrl, vocabFile, '3b5b76c4aef48ecf8cb3abaafe960f09');
+      console.log('[LocalAIService] Vocab file downloaded.');
+
+      // 2. Download model.onnx (large, ~96MB)
+      console.log(`[LocalAIService] Downloading model file from ${modelUrl}...`);
+      await this.downloadFile(modelUrl, modelFile, '31d7c8c9080da8179b37ffcf6fe52b8d');
+      console.log('[LocalAIService] Model file downloaded.');
+
+      console.log('[LocalAIService] Default model successfully downloaded and provisioned.');
+
+      // Trigger background reindex in FullTextIndexManager since we now have the model
+      import('./fulltext-index-manager.js').then(({ FullTextIndexManager }) => {
+        FullTextIndexManager.getInstance().triggerVectorReindex();
+      }).catch(e => {
+        console.warn('[LocalAIService] Failed to trigger FullTextIndexManager reindex:', e);
+      });
+    } catch (err) {
+      console.error('[LocalAIService] Failed to download default model files:', err);
+      // Clean up incomplete files
+      try {
+        if (fs.existsSync(modelFile)) await fs.promises.unlink(modelFile);
+        if (fs.existsSync(vocabFile)) await fs.promises.unlink(vocabFile);
+      } catch (e) {
+        // ignore
+      }
+    } finally {
+      this.isDownloading = false;
+    }
+  }
+
+  private calculateFileMd5(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('md5');
+      const stream = fs.createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', (err) => reject(err));
+    });
+  }
+
+  /**
+   * 下载文件到 destPath。
+   * 如果文件已存在且 MD5 匹配则跳过；否则重新下载。
+   * @param url 下载地址
+   * @param destPath 目标路径
+   * @param md5 可选 MD5 校验值（优先于 size 校验）
+   * @param expectedSize 可选文件大小（MD5 不可用时用于快速校验）
+   */
+  private async downloadFile(url: string, destPath: string, md5?: string, expectedSize?: number): Promise<void> {
+    const tempPath = destPath + '.part';
+
+    // 清理上次失败的临时文件
+    if (fs.existsSync(tempPath)) {
+      try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+    }
+
+    // 文件已存在 → MD5 或大小验证
+    if (fs.existsSync(destPath)) {
+      const stats = await fs.promises.stat(destPath);
+      const existingSize = stats.size;
+      if (md5) {
+        const existingMd5 = await this.calculateFileMd5(destPath);
+        if (existingMd5 === md5) {
+          console.log(`[LocalAIService] ${path.basename(destPath)} already exists (MD5 ok, ${(existingSize / 1024 / 1024).toFixed(1)}MB), skipping.`);
+          return;
+        }
+        console.log(`[LocalAIService] ${path.basename(destPath)} MD5 mismatch, re-downloading.`);
+        try { await fs.promises.unlink(destPath); } catch { /* ignore */ }
+      } else if (expectedSize && existingSize === expectedSize) {
+        console.log(`[LocalAIService] ${path.basename(destPath)} already exists (${(existingSize / 1024 / 1024).toFixed(1)}MB), skipping.`);
+        return;
+      } else if (!expectedSize) {
+        console.log(`[LocalAIService] ${path.basename(destPath)} already exists, skipping.`);
+        return;
+      } else {
+        console.log(`[LocalAIService] ${path.basename(destPath)} size mismatch, re-downloading.`);
+        try { await fs.promises.unlink(destPath); } catch { /* ignore */ }
+      }
+    }
+
+    const response = await net.fetch(url, { redirect: 'follow' });
+    if (!response.ok) {
+      throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+    }
+
+    // 写入临时文件
+    const buffer = Buffer.from(await response.arrayBuffer());
+    await fs.promises.writeFile(tempPath, buffer);
+
+    // 1. 优先 MD5 校验
+    if (md5) {
+      const fileMd5 = crypto.createHash('md5').update(buffer).digest('hex');
+      if (fileMd5 !== md5) {
+        try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+        throw new Error(`MD5 mismatch: expected ${md5}, got ${fileMd5}`);
+      }
+    }
+
+    // 2. Content-Length 校验
+    const contentLength = response.headers.get('content-length');
+    const actualLength = parseInt(contentLength ?? '0', 10);
+    if (actualLength > 0 && buffer.length !== actualLength) {
+      try { await fs.promises.unlink(tempPath); } catch { /* ignore */ }
+      throw new Error(`Incomplete download: expected ${actualLength}, got ${buffer.length}`);
+    }
+
+    // 3. expectedSize 仅做警告
+    if (expectedSize && buffer.length !== expectedSize) {
+      console.warn(`[LocalAIService] ${path.basename(destPath)}: expected ${expectedSize}, actual ${buffer.length} — using actual.`);
+    }
+
+    // 重命名为最终文件名
+    await fs.promises.rename(tempPath, destPath);
+    console.log(`[LocalAIService] ${path.basename(destPath)} downloaded (${(buffer.length / 1024 / 1024).toFixed(1)}MB).`);
+  }
+
+  /**
+   * Returns active embedding directory and its dimensions
+   */
+  public getActiveEmbeddingModel(): { modelId: string; modelDir: string; dimension: number } {
+    // Default model is bge-small-zh, which has 512 dimensions.
+    // If bge-base-zh is present and configured, we can switch dimension to 768.
+    // Let's check what models are present.
+    const baseDir = path.join(this.modelDir, 'embedding');
+
+    // If base-zh is present and fully configured, prefer it (as manual option)
+    const baseModelDir = path.join(baseDir, 'bge-base-zh');
+    if (fs.existsSync(path.join(baseModelDir, 'model.onnx')) && fs.existsSync(path.join(baseModelDir, 'vocab.txt'))) {
+      return {
+        modelId: 'bge-base-zh',
+        modelDir: baseModelDir,
+        dimension: 768
+      };
+    }
+
+    // Default to bge-small-zh (768 dimensions as we download bge_base_zh_quant)
+    const smallModelDir = path.join(baseDir, 'bge-small-zh');
+    return {
+      modelId: 'bge-small-zh',
+      modelDir: smallModelDir,
+      dimension: 768
+    };
+  }
+
+  public isWorkerRunning(): boolean {
+    return !!this.child && !this.isDownloading;
+  }
+
+  /**
+   * Run a task via the utilityProcess
+   */
+  public runTask(taskType: AITaskType, modelId: string, args: AITaskRequest['args']): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this.child) {
+        reject(new Error('LocalAIWorker child process is not running'));
+        return;
+      }
+
+      const requestId = Math.random().toString(36).substring(2, 15);
+      const request: AITaskRequest = {
+        requestId,
+        taskType,
+        modelId,
+        args
+      };
+
+      this.pendingRequests.set(requestId, { resolve, reject });
+      this.child.postMessage(request);
+    });
+  }
+
+  /**
+   * High-level embedding interface
+   */
+  public async getEmbedding(text: string): Promise<number[]> {
+    const { modelId, modelDir } = this.getActiveEmbeddingModel();
+    const result = await this.runTask('embedding', modelDir, { text });
+    if (!result || !result.vector) {
+      throw new Error('Incomplete embedding result returned from worker');
+    }
+    return result.vector;
+  }
+
+  /**
+   * High-level OCR interface
+   */
+  public async runOCR(imagePath: string): Promise<Array<{ text: string; box: [number, number, number, number]; confidence: number }>> {
+    // Look for PaddleOCR v4 in BERRYTRACE_HOME/models/ocr/paddle-v4
+    let ocrDir = path.join(this.modelDir, 'ocr', 'paddle-v4');
+
+    // Dev environment fallback to scratch folder if missing
+    if (!fs.existsSync(path.join(ocrDir, 'det.onnx')) && (!app.isPackaged || process.env.VITE_DEV_SERVER_URL)) {
+      const scratchDir = path.join(process.cwd(), 'scratch', 'ocr-test', 'models');
+      if (fs.existsSync(path.join(scratchDir, 'det.onnx')) && fs.existsSync(path.join(scratchDir, 'rec.onnx'))) {
+        console.log('[LocalAIService] [Dev] Using OCR models from scratch folder.');
+        ocrDir = scratchDir;
+      }
+    }
+
+    if (!fs.existsSync(path.join(ocrDir, 'det.onnx')) || !fs.existsSync(path.join(ocrDir, 'rec.onnx'))) {
+      throw new Error(`OCR model (paddle-v4) assets not installed. Directory: ${ocrDir}`);
+    }
+
+    const result = await this.runTask('ocr', ocrDir, { imagePath });
+    if (!result || !result.ocrBlocks) {
+      throw new Error('Incomplete OCR result returned from worker');
+    }
+    return result.ocrBlocks;
+  }
+
+  // ── 本地 LLM (Qwen2.5-1.5B) 推理 ───────────────────────────────────────────
+  // @huggingface/transformers 和 onnxruntime-node 均在宿主 node_modules 中，
+  // 所以推理必须在宿主进程（main process）执行，插件通过 callApi 委托。
+
+  private _llmPipeline: unknown = null;
+  private _llmModelDir: string | null = null;
+  private _llmIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly LLM_IDLE_EVICTION_MS = 10 * 60 * 1000; // 10 分钟
+
+  /**
+   * 按平台返回推荐的 device 优先级列表。
+   * 依次尝试，首个成功加载的 device 作为最终选择。
+   *
+   * - Apple Silicon (darwin/arm64)：coreml → cpu
+   * - Windows：cuda → dml → cpu
+   * - Linux：cuda → cpu
+   * - Intel Mac / 其他：cpu
+   */
+  private _getLlmDeviceCandidates(): string[] {
+    const { platform, arch } = process;
+    if (platform === 'darwin' && arch === 'arm64') {
+      return ['coreml', 'cpu']; // Apple Silicon Metal GPU via CoreML
+    }
+    if (platform === 'win32') {
+      return ['cuda', 'dml', 'cpu']; // NVIDIA CUDA → DirectML (AMD/Intel/NVIDIA) → CPU
+    }
+    if (platform === 'linux') {
+      return ['cuda', 'cpu']; // NVIDIA CUDA → CPU
+    }
+    return ['cpu']; // Intel Mac / 其他
+  }
+
+  /** 记录实际使用的 device，供日志和未来 UI 展示 */
+  private _llmActiveDevice: string | null = null;
+
+  /**
+   * 加载本地 LLM pipeline（幂等，已加载则跳过）。
+   * 自动检测最优 device（GPU → CPU 降级）。
+   * 由插件通过 sdk.callApi('local-ai', 'llmLoad') 调用。
+   */
+  public async llmLoad(modelDir: string): Promise<{ ok: boolean; error?: string; device?: string }> {
+    // 同一目录已加载，直接返回
+    if (this._llmPipeline && this._llmModelDir === modelDir) {
+      console.log(`[LocalAIService:LLM] Pipeline already loaded on device="${this._llmActiveDevice}", reusing.`);
+      this._resetLlmIdleTimer();
+      return { ok: true, device: this._llmActiveDevice ?? 'cpu' };
+    }
+
+    // 如有旧 pipeline，先释放
+    await this._evictLlmPipeline();
+
+    console.log(`[LocalAIService:LLM] Loading pipeline from: ${modelDir}`);
+    const { pipeline: createPipeline, env } = await import('@huggingface/transformers');
+    const { dirname: pd, basename: pb } = await import('path');
+
+    env.allowLocalModels = true;
+    env.allowRemoteModels = false;
+    env.localModelPath = pd(modelDir) + path.sep;
+    const modelId = pb(modelDir);
+
+    const devices = this._getLlmDeviceCandidates();
+    console.log(`[LocalAIService:LLM] Device candidates: [${devices.join(', ')}]`);
+
+    for (const device of devices) {
+      try {
+        console.log(`[LocalAIService:LLM] Trying device="${device}"...`);
+        this._llmPipeline = await createPipeline('text-generation', modelId, {
+          dtype: 'q4',
+          device: device as 'cpu' | 'cuda' | 'dml' | 'coreml',
+        });
+        this._llmModelDir = modelDir;
+        this._llmActiveDevice = device;
+        this._resetLlmIdleTimer();
+        console.log(`[LocalAIService:LLM] ✅ Pipeline ready on device="${device}".`);
+        return { ok: true, device };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[LocalAIService:LLM] device="${device}" unavailable: ${msg.slice(0, 120)}`);
+        // 继续尝试下一个 device
+      }
+    }
+
+    const errMsg = `No suitable device found among [${devices.join(', ')}]`;
+    console.error(`[LocalAIService:LLM] ${errMsg}`);
+    return { ok: false, error: errMsg };
+  }
+
+
+  /**
+   * 使用已加载的 LLM pipeline 生成文本。
+   * 由插件通过 sdk.callApi('local-ai', 'llmGenerate') 调用。
+   */
+  public async llmGenerate(opts: {
+    prompt: string;
+    modelDir?: string;
+    maxNewTokens?: number;
+    temperature?: number;
+  }): Promise<{ text: string }> {
+    // 如果 pipeline 未加载或目录变了，先加载
+    if (!this._llmPipeline || (opts.modelDir && this._llmModelDir !== opts.modelDir)) {
+      if (!opts.modelDir) throw new Error('[LocalAIService:LLM] modelDir required for first call');
+      const loadResult = await this.llmLoad(opts.modelDir);
+      if (!loadResult.ok) throw new Error(loadResult.error ?? 'Failed to load LLM');
+    }
+
+    this._resetLlmIdleTimer();
+
+    type PipelineFn = (
+      input: string,
+      opts: Record<string, unknown>
+    ) => Promise<Array<{ generated_text: string }>>;
+
+    const pipe = this._llmPipeline as PipelineFn;
+    const result = await pipe(opts.prompt, {
+      max_new_tokens: opts.maxNewTokens ?? 256,
+      temperature: opts.temperature ?? 0.3,
+      do_sample: (opts.temperature ?? 0) > 0,
+    });
+
+    const output = result[0]?.generated_text ?? '';
+    const text = output.startsWith(opts.prompt)
+      ? output.slice(opts.prompt.length).trim()
+      : output.trim();
+    return { text };
+  }
+
+  private _resetLlmIdleTimer(): void {
+    if (this._llmIdleTimer) clearTimeout(this._llmIdleTimer);
+    this._llmIdleTimer = setTimeout(async () => {
+      console.log('[LocalAIService:LLM] Idle eviction triggered, releasing pipeline.');
+      await this._evictLlmPipeline();
+    }, LocalAIService.LLM_IDLE_EVICTION_MS);
+  }
+
+  private async _evictLlmPipeline(): Promise<void> {
+    if (this._llmIdleTimer) { clearTimeout(this._llmIdleTimer); this._llmIdleTimer = null; }
+    if (this._llmPipeline) {
+      const p = this._llmPipeline as { dispose?: () => Promise<void> | void };
+      if (typeof p.dispose === 'function') {
+        await Promise.resolve(p.dispose()).catch((err: unknown) => {
+          console.warn('[LocalAIService:LLM] dispose() failed:', err);
+        });
+      }
+      this._llmPipeline = null;
+      this._llmModelDir = null;
+      console.log('[LocalAIService:LLM] Pipeline evicted.');
+    }
+  }
+
+  private registerIpcHandlers() {
+    ipcMain.removeHandler('local-ai:embedding');
+    ipcMain.removeHandler('local-ai:ocr');
+    ipcMain.removeHandler('local-ai:status');
+
+    ipcMain.handle('local-ai:embedding', async (event, text: string) => {
+      return this.getEmbedding(text);
+    });
+
+    ipcMain.handle('local-ai:ocr', async (event, imagePath: string) => {
+      return this.runOCR(imagePath);
+    });
+
+    ipcMain.handle('local-ai:status', async () => {
+      const active = this.getActiveEmbeddingModel();
+      const hasEmbedding = fs.existsSync(path.join(active.modelDir, 'model.onnx')) && fs.existsSync(path.join(active.modelDir, 'vocab.txt'));
+      return {
+        hasEmbedding,
+        modelId: active.modelId,
+        embeddingDimension: active.dimension,
+        isDownloading: this.isDownloading,
+        downloadProgress: this.downloadProgress,
+        workerRunning: !!this.child,
+      };
+    });
+  }
+
+}
+

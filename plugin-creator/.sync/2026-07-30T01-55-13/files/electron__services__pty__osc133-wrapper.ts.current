@@ -1,0 +1,90 @@
+import { EventEmitter } from 'events';
+
+export interface OSC133State {
+  isPromptReady: boolean;
+  lastExitCode?: number;
+  currentPrompt?: string;
+  inCommandOutput: boolean;
+}
+
+export class OSC133Wrapper extends EventEmitter {
+  private state: OSC133State = {
+    isPromptReady: true,
+    inCommandOutput: false,
+  };
+
+  /**
+   * Process raw ANSI stream from PTY, detect OSC 133 sequences, and emit status events
+   * OSC 133 Sequences:
+   *  - \x1b]133;A\x07 : Prompt Start
+   *  - \x1b]133;B\x07 : Command Start
+   *  - \x1b]133;C\x07 : Command Executing / Output Start
+   *  - \x1b]133;D;{status}\x07 : Command Finished
+   */
+  processOutput(chunk: string): string {
+    // Check for OSC 133 sequence patterns
+    if (chunk.includes('\x1b]133;A\x07')) {
+      this.state.isPromptReady = true;
+      this.state.inCommandOutput = false;
+      this.emit('prompt-start');
+      this.emit('ready', { ...this.state });
+    }
+
+    if (chunk.includes('\x1b]133;B\x07')) {
+      this.state.isPromptReady = false;
+      this.emit('command-start');
+    }
+
+    if (chunk.includes('\x1b]133;C\x07')) {
+      this.state.inCommandOutput = true;
+      this.emit('command-output-start');
+    }
+
+    // eslint-disable-next-line no-control-regex
+    const matchD = chunk.match(/\x1b\]133;D;?(\d+)?\x07/);
+    if (matchD) {
+      const exitCode = matchD[1] ? parseInt(matchD[1], 10) : 0;
+      this.state.isPromptReady = true;
+      this.state.inCommandOutput = false;
+      this.state.lastExitCode = exitCode;
+      this.emit('command-finished', { exitCode });
+      this.emit('ready', { ...this.state });
+    }
+
+    // Clean OSC 133 control sequences for clean UI display if needed
+    // eslint-disable-next-line no-control-regex
+    return chunk.replace(/\x1b\]133;[A-D](?:;\d+)?\x07/g, '');
+  }
+
+  getState(): OSC133State {
+    return { ...this.state };
+  }
+
+  /**
+   * Format control key sequences for TUI prompt interactivity (e.g. inquirer, clack, vim)
+   */
+  static formatControlKey(key: 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight' | 'Enter' | 'Tab' | 'Space' | 'Escape' | 'Ctrl+C'): string {
+    switch (key) {
+      case 'ArrowUp':
+        return '\x1b[A';
+      case 'ArrowDown':
+        return '\x1b[B';
+      case 'ArrowRight':
+        return '\x1b[C';
+      case 'ArrowLeft':
+        return '\x1b[D';
+      case 'Enter':
+        return '\r';
+      case 'Tab':
+        return '\t';
+      case 'Space':
+        return ' ';
+      case 'Escape':
+        return '\x1b';
+      case 'Ctrl+C':
+        return '\x03';
+      default:
+        return '\r';
+    }
+  }
+}

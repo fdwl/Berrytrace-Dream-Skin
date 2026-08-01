@@ -1,0 +1,341 @@
+diff --git a/electron/services/double-tap-detector.ts b/electron/services/double-tap-detector.ts
+index 332b410..7b61ae8 100644
+--- a/electron/services/double-tap-detector.ts
++++ b/electron/services/double-tap-detector.ts
+@@ -5,10 +5,20 @@ import { spawn } from 'child_process'
+ import type { ChildProcess } from 'child_process'
+ import { cache, CacheAttribute } from '../config/index'
+ import { getShortcutActionRegistry } from './shortcut-action-registry'
++import { ShortcutActivationDispatcher } from './shortcut-activation-dispatcher'
++
++import { KeybindingsManager } from './keybindings-manager'
+ 
+ const __filename = fileURLToPath(import.meta.url)
+ const __dirname = dirname(__filename)
+ 
++/** 默认阈值/手势参数（消除魔法字面量） */
++const DEFAULT_DOUBLE_TAP_MODIFIER_FALLBACK = 'cmd'
++export const DEFAULT_LONG_PRESS_KEY = 'alt'
++const DEFAULT_DOUBLE_TAP_THRESHOLD_MS = 400
++const DEFAULT_LONG_PRESS_DELAY_MS = 500
++const DOUBLE_TAP_HELPER_NAME = process.platform === 'win32' ? 'keyboard_double_tap_helper.exe' : 'keyboard_double_tap_helper'
++
+ let doubleTapProcess: ChildProcess | null = null
+ let isDoubleTapHookRunning = false
+ let doubleTapShutdownTimer: NodeJS.Timeout | null = null
+@@ -20,15 +30,75 @@ export function isDoubleTapPermissionGranted(): boolean {
+   return true
+ }
+ 
++/**
++ * 检索当前真正【已被用户开启/有效】的物理按键手势与所需修饰键集合
++ */
++export function getActivePhysicalGestures(): { activeGestures: Set<string>; requiredModifiers: Set<string> } {
++  const activeGestures = new Set<string>()
++  const requiredModifiers = new Set<string>()
++
++  // 1. 检索 Switch 开关状态
++  const doubleTapEnabled = (cache.get(CacheAttribute.prefDoubleTapEnabled) as boolean) ?? false
++  const fnVoiceEnabled = (cache.get(CacheAttribute.prefFnVoiceEnabled) as boolean) ?? false
++  const fnShiftTranslateEnabled = (cache.get(CacheAttribute.prefFnShiftTranslateEnabled) as boolean) ?? false
++  const fnSpaceMeimeiEnabled = (cache.get(CacheAttribute.prefFnSpaceMeimeiEnabled) as boolean) ?? false
++
++  if (fnVoiceEnabled) {
++    activeGestures.add('short_press:fn')
++    activeGestures.add('long_press_start:fn')
++    activeGestures.add('long_press_end:fn')
++    requiredModifiers.add('fn')
++  }
++  if (fnSpaceMeimeiEnabled) {
++    activeGestures.add('combo:fn+space')
++    requiredModifiers.add('fn')
++  }
++  if (fnShiftTranslateEnabled) {
++    activeGestures.add('combo:shift+fn')
++    requiredModifiers.add('fn')
++  }
++  if (doubleTapEnabled) {
++    const mod = (cache.get(CacheAttribute.prefDoubleTapModifier) as string) || DEFAULT_DOUBLE_TAP_MODIFIER_FALLBACK
++    activeGestures.add(`double_tap:${mod}`)
++    requiredModifiers.add(mod)
++  }
++
++  // 2. 检索 KeybindingsManager 中的有效规则（排除已被禁用的规则）
++  try {
++    const effectiveRules = KeybindingsManager.getInstance().getEffectiveKeybindings()
++    for (const rule of effectiveRules) {
++      if (rule.gesture && rule.gesture.trim().length > 0) {
++        const gesture = rule.gesture.trim()
++        activeGestures.add(gesture)
++        if (gesture.includes('fn')) requiredModifiers.add('fn')
++        if (gesture.includes('cmd')) requiredModifiers.add('cmd')
++        if (gesture.includes('alt')) requiredModifiers.add('alt')
++        if (gesture.includes('ctrl')) requiredModifiers.add('ctrl')
++        if (gesture.includes('shift')) requiredModifiers.add('shift')
++      }
++    }
++  } catch (_e) {
++    /* ignore error retrieving effective keybindings */
++  }
++
++  return { activeGestures, requiredModifiers }
++}
++
+ export function startGlobalDoubleTapHook() {
+-  const enabled = (cache.get(CacheAttribute.prefDoubleTapEnabled) as boolean) ?? true
+-  if (!enabled) {
+-    console.log('[DoubleTap] Global double-tap shortcut feature is disabled by settings.')
++  const { activeGestures, requiredModifiers } = getActivePhysicalGestures()
++  const anyShortcutActive = requiredModifiers.size > 0
++  
++  // 同步保存状态供缓存查询
++  cache.set('prefNativeHookMasterSwitch', anyShortcutActive)
++
++  if (!anyShortcutActive) {
++    console.log('[NativeHook:DoubleTap:STOP] 💤 零键盘手势开启，底层 C++ 钩子进程销毁休眠。')
++    stopGlobalDoubleTapHook()
+     return
+   }
+ 
+   if (isDoubleTapHookRunning || doubleTapProcess) {
+-    console.log('[DoubleTap] Global double-tap hook is already running, skipping start.')
++    console.log('[NativeHook:DoubleTap:STATUS] Global double-tap hook is already running, skipping start.')
+     return
+   }
+ 
+@@ -37,48 +107,24 @@ export function startGlobalDoubleTapHook() {
+   if (process.platform === 'darwin') {
+     const hasPermission = isDoubleTapPermissionGranted()
+     if (!hasPermission) {
+-      console.warn('[DoubleTap] Accessibility permission missing on macOS for double tap.')
++      console.warn('⚠️ [NativeHook:DoubleTap:WARN] Accessibility permission missing on macOS for double tap / Fn gestures.')
+       return
+     }
+   }
+ 
+-  // ── Collect modifiers for double-tap and long-press ──
+-  // prefDoubleTapModifiers (array) allows multiple modifiers simultaneously.
+-  // Falls back to legacy prefDoubleTapModifier (single value) for backward compat.
+-  const doubleTapModifiersRaw = cache.get(CacheAttribute.prefDoubleTapModifiers)
+-  let doubleTapModifiers: string[]
+-  if (Array.isArray(doubleTapModifiersRaw) && doubleTapModifiersRaw.length > 0) {
+-    doubleTapModifiers = doubleTapModifiersRaw as string[]
+-  } else {
+-    // Legacy fallback: single modifier
+-    const legacy = (cache.get(CacheAttribute.prefDoubleTapModifier) as string) || 'cmd'
+-    doubleTapModifiers = [legacy]
+-  }
+-
+-  const longPressKey = (cache.get(CacheAttribute.prefLongPressKey) as string) || 'alt'
+-
+-  const modifierList = [...doubleTapModifiers, longPressKey]
+-  const fnVoiceEnabled = (cache.get(CacheAttribute.prefFnVoiceEnabled) as boolean) ?? false
+-  const fnShiftTranslateEnabled = (cache.get(CacheAttribute.prefFnShiftTranslateEnabled) as boolean) ?? false
+-  const fnSpaceMeimeiEnabled = (cache.get(CacheAttribute.prefFnSpaceMeimeiEnabled) as boolean) ?? false
+-
+-  if (fnVoiceEnabled || fnShiftTranslateEnabled || fnSpaceMeimeiEnabled) {
+-    modifierList.push('fn')
+-  }
+-
+-  // Merge all unique modifiers so the native helper tracks all of them
+-  const allModifiers = [...new Set(modifierList)].join(',')
++  // 仅保留当前已被开启快捷键所需的物理修饰键，避免无意义的键盘事件拦截
++  const allModifiers = [...requiredModifiers].join(',')
+ 
+-  const threshold = (cache.get(CacheAttribute.prefDoubleTapThreshold) as number) || 400
+-  const longPressDelay = (cache.get(CacheAttribute.prefLongPressDelay) as number) || 500
++  const threshold = (cache.get(CacheAttribute.prefDoubleTapThreshold) as number) || DEFAULT_DOUBLE_TAP_THRESHOLD_MS
++  const longPressDelay = (cache.get(CacheAttribute.prefLongPressDelay) as number) || DEFAULT_LONG_PRESS_DELAY_MS
+ 
+-  const helperName = process.platform === 'win32' ? 'keyboard_double_tap_helper.exe' : 'keyboard_double_tap_helper'
++  const helperName = DOUBLE_TAP_HELPER_NAME
+   const isDev = !app.isPackaged
+   const helperPath = isDev
+     ? join(__dirname, '..', process.platform === 'win32' ? 'build-win' : 'build-mac', 'Release', helperName)
+     : join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', helperName)
+ 
+-  console.log(`[DoubleTap] Spawning helper: ${helperPath} (modifiers: ${allModifiers}, threshold: ${threshold}ms, longPressDelay: ${longPressDelay}ms)...`)
++  console.log(`[NativeHook:DoubleTap:START] Spawning helper: ${helperPath} (modifiers: [${allModifiers}], activeGestures: ${Array.from(activeGestures).join(', ')})`)
+ 
+   try {
+     // args: [modifiers, threshold, longPressDelay, pid]
+@@ -98,30 +144,30 @@ export function startGlobalDoubleTapHook() {
+         if (!trimmed) continue
+         try {
+           const parsed = JSON.parse(trimmed)
+-          console.log('[DoubleTap] Event received:', parsed)
++          console.log(`[NativeHook:DoubleTap:EVENT] Helper event received: ${parsed.event}:${parsed.modifier}`)
+           handleHelperEvent(parsed)
+         } catch (e) {
+-          console.error('[DoubleTap] Failed to parse helper stdout JSON:', trimmed, e)
++          console.error('🚨 [NativeHook:DoubleTap:ERROR] Failed to parse helper stdout JSON:', trimmed, e)
+         }
+       }
+     })
+ 
+     doubleTapProcess.stderr?.on('data', (data) => {
+-      console.log(`[DoubleTap Helper Log] ${data.toString().trim()}`)
++      console.log(`[NativeHook:DoubleTap Log] ${data.toString().trim()}`)
+     })
+ 
+     doubleTapProcess.on('close', (code) => {
+-      console.log(`[DoubleTap Process] Helper process exited with code ${code}`)
++      console.log(`[NativeHook:DoubleTap:EXIT] Helper process exited with code ${code}`)
+       doubleTapProcess = null
+       isDoubleTapHookRunning = false
+     })
+ 
+     doubleTapProcess.on('error', (err) => {
+-      console.error('[DoubleTap Process] Helper process error:', err)
++      console.error('🚨 [NativeHook:DoubleTap:ERROR] Helper process error:', err)
+     })
+ 
+   } catch (err) {
+-    console.error('[DoubleTap] Failed to spawn helper process:', err)
++    console.error('🚨 [NativeHook:DoubleTap:ERROR] Failed to spawn helper process:', err)
+     isDoubleTapHookRunning = false
+     doubleTapProcess = null
+   }
+@@ -175,6 +221,15 @@ export function restartGlobalDoubleTapHook() {
+ }
+ 
+ function handleHelperEvent(parsed: { event: string; modifier: string; timestamp?: number }) {
++  const gestureKey = `${parsed.event}:${parsed.modifier}`
++  const { activeGestures } = getActivePhysicalGestures()
++
++  // 严格粒度关口校验：如果该手势未被激活/开启，直接拦截丢弃
++  if (!activeGestures.has(gestureKey)) {
++    console.log(`[NativeHook:DoubleTap:GATED] Event "${gestureKey}" blocked because gesture is not active.`)
++    return
++  }
++
+   // ── Onboarding intercept mode: forward to onboarding guide instead of executing actions ──
+   const onboardingIntercept = (cache.get('_onboardingInterceptMode') as boolean) ?? false
+   if (onboardingIntercept) {
+@@ -193,32 +248,12 @@ function handleHelperEvent(parsed: { event: string; modifier: string; timestamp?
+     return
+   }
+ 
+-  if (parsed.modifier === 'fn') {
+-    import('./fn-voice-input').then(({ handleFnKeyEvent }) => {
+-      handleFnKeyEvent(parsed.event)
+-    }).catch((err) => {
+-      console.error('[DoubleTap] Failed to load fn-voice-input service:', err)
+-    })
+-    return
+-  }
+-
+-  if (parsed.event === 'combo' && parsed.modifier === 'fn+space') {
+-    const fnSpaceMeimeiEnabled = (cache.get(CacheAttribute.prefFnSpaceMeimeiEnabled) as boolean) ?? false
+-    if (fnSpaceMeimeiEnabled) {
+-      import('../windows/float-ball').then(({ ElectronFloatBall }) => {
+-        ElectronFloatBall.getInstance().toggleMeimeiWindow()
+-      }).catch((err) => {
+-        console.error('[DoubleTap] Failed to toggle meimei window on fn+space:', err)
+-      })
+-    } else {
+-      console.log('[DoubleTap] Fn+Space Ask Meimei is disabled by settings.')
+-    }
+-    return
+-  }
+-
+-  const gestureKey = `${parsed.event}:${parsed.modifier}`
++  // 1. 尝试通过 ShortcutActivationDispatcher 动态激活绑定插件或执行系统指令
++  ShortcutActivationDispatcher.getInstance().handleGesture(gestureKey).catch((err) => {
++    console.error('[DoubleTap] Failed to handle gesture via ShortcutActivationDispatcher:', err)
++  })
+ 
+-  // 1. Try action registry bindings first
++  // 2. 尝试 ActionRegistry 绑定动作
+   const bindings = (cache.get(CacheAttribute.prefShortcutBindings) as Record<string, string[]>) || {}
+   const registry = getShortcutActionRegistry()
+   const executed = registry.executeBindings(gestureKey, bindings)
+@@ -227,12 +262,7 @@ function handleHelperEvent(parsed: { event: string; modifier: string; timestamp?
+     console.log(`[DoubleTap] Executed ${executed} bound actions for gesture: ${gestureKey}`)
+   }
+ 
+-  // 2. Fall back to hardcoded legacy actions for backward compatibility
+-  if (parsed.event === 'double_tap') {
+-    triggerLegacyDoubleTapAction(parsed.modifier)
+-  }
+-
+-  // 3. Broadcast event to renderer processes for plugins that listen directly
++  // 3. 将手势事件广播至渲染进程（供监听原生手势的插件使用）
+   const allWindows = BrowserWindow.getAllWindows()
+   for (const win of allWindows) {
+     if (!win.isDestroyed()) {
+@@ -244,74 +274,3 @@ function handleHelperEvent(parsed: { event: string; modifier: string; timestamp?
+     }
+   }
+ }
+-
+-function triggerLegacyDoubleTapAction(modifier: string) {
+-  // Legacy hardcoded action — only if no registry bindings handled it
+-  const bindings = (cache.get(CacheAttribute.prefShortcutBindings) as Record<string, string[]>) || {}
+-  const gestureKey = `double_tap:${modifier}`
+-  if (bindings[gestureKey]?.length) return
+-
+-  const action = (cache.get(CacheAttribute.prefDoubleTapAction) as string) || 'agent-chat'
+-  console.log(`[DoubleTap] Legacy action: ${action} (modifier: ${modifier})`)
+-
+-  switch (action) {
+-    case 'agent-chat':
+-      try {
+-        import('../windows/float-ball').then(({ ElectronFloatBall }) => {
+-          ElectronFloatBall.getInstance().toggleMeimeiWindow()
+-        })
+-      } catch (err) {
+-        console.error('[DoubleTap] Failed to toggle meimei window:', err)
+-      }
+-      break
+-    case 'quick-panel':
+-      import('../windows/quick-panel').then(({ ElectronQuickPanelWindow }) => {
+-        ElectronQuickPanelWindow.getInstance().toggleQuickPanelWindow()
+-      })
+-      break
+-    case 'new-document':
+-      import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-        const win = ElectronMainWindow.getInstance().getWindow()
+-        if (win && !win.isDestroyed()) {
+-          win.webContents.send('main:create-new-document')
+-        }
+-      })
+-      break
+-    case 'toggle-sidebar':
+-      import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-        const win = ElectronMainWindow.getInstance().getWindow()
+-        if (win && !win.isDestroyed()) {
+-          win.webContents.send('main:toggle-sidebar')
+-        }
+-      })
+-      break
+-    case 'search':
+-      import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-        const win = ElectronMainWindow.getInstance().getWindow()
+-        if (win && !win.isDestroyed()) {
+-          win.webContents.send('main:focus-search')
+-        }
+-      })
+-      break
+-    case 'zen-mode':
+-      import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-        const win = ElectronMainWindow.getInstance().getWindow()
+-        if (win && !win.isDestroyed()) {
+-          win.webContents.send('zen:toggle')
+-        }
+-      })
+-      break
+-    case 'screenshot':
+-      import('./screenshot').then(({ ElectronScreenshot }) => {
+-        ElectronScreenshot.getInstance().triggerScreenshot()
+-      })
+-      break
+-    case 'show-main':
+-      import('../windows/main-window').then(({ ElectronMainWindow }) => {
+-        ElectronMainWindow.getInstance().toggleWindow()
+-      })
+-      break
+-    default:
+-      console.warn('[DoubleTap] Unknown legacy action:', action)
+-  }
+-}

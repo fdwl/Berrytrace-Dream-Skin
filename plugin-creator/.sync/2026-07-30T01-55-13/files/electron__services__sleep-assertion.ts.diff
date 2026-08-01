@@ -1,0 +1,15 @@
+diff --git a/electron/services/sleep-assertion.ts b/electron/services/sleep-assertion.ts
+index 861cb6c..ee1906b 100644
+--- a/electron/services/sleep-assertion.ts
++++ b/electron/services/sleep-assertion.ts
+@@ -59,7 +59,9 @@ export class SystemSleepAssertionManager {
+         if (powerSaveBlocker.isStarted(this.blockerId)) {
+           powerSaveBlocker.stop(this.blockerId);
+         }
+-      } catch (e) {}
++      } catch (e) {
++        // ignore
++      }
+       this.blockerId = null;
+     }
+   }

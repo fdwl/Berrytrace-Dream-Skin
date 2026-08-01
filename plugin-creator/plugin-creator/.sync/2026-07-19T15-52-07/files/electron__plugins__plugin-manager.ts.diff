@@ -1,0 +1,196 @@
+diff --git a/electron/plugins/plugin-manager.ts b/electron/plugins/plugin-manager.ts
+index e8aebf0..3799988 100644
+--- a/electron/plugins/plugin-manager.ts
++++ b/electron/plugins/plugin-manager.ts
+@@ -29,7 +29,6 @@ import {
+   listAgentKernelPluginIds
+ } from './plugin-agent-kernel';
+ import { PluginWatchdog } from './plugin-watchdog';
+-import { PluginIsolationPolicy } from './plugin-isolation-policy';
+ 
+ export type PluginLifecycleAction =
+   | 'initial-load'
+@@ -75,6 +74,8 @@ export class PluginManager {
+   private deferredInitComplete = false;
+   private idleTrackerStarted = false;
+ 
++  private pendingReloads = new Set<string>();
++
+   // 插件空闲回收：常驻状态通过 plugin.json 的 "resident": true 声明，不再硬编码 ID
+   private pluginLastActiveTime = new Map<string, number>();
+   private pluginIdleCheckInterval: NodeJS.Timeout | null = null;
+@@ -83,7 +84,6 @@ export class PluginManager {
+   private constructor() {
+     this.registerIpcHandlers();
+     this.startWatchdog();
+-    this.startIsolationPolicy();
+ 
+     // 注册 EventBus 跨进程广播桥接：eventBus.emit(事件, payload, { broadcast: true }) → 转发到所有插件
+     import('../../src/services/event_bus').then(({ default: eventBus }) => {
+@@ -222,19 +222,6 @@ export class PluginManager {
+     // 注入 busy 查询函数：忙碌插件（如下载模型期间）豁免心跳超时 kill
+     PluginWatchdog.getInstance().setIsPluginBusyFn((id) => launcher.isPluginBusy(id));
+     console.log('[PluginManager] PluginWatchdog started');
+-
+-    // 绑定崩溃回调：通知隔离策略记录崩溃，用于 optional 插件不稳定时提升到独立进程
+-    PluginWatchdog.getInstance().setCrashCallback((pluginId, _code) => {
+-      PluginIsolationPolicy.getInstance().recordCrash(pluginId);
+-    });
+-  }
+-
+-  /**
+-   * 启动隔离策略，定时检查内存压力并动态降级/提升插件进程类型。
+-   */
+-  private startIsolationPolicy(): void {
+-    PluginIsolationPolicy.getInstance().start();
+-    console.log('[PluginManager] IsolationPolicy started');
+   }
+ 
+   private startSystemIdleTracker(): void {
+@@ -515,15 +502,6 @@ export class PluginManager {
+     }
+   }
+ 
+-  private copyDirRecursiveSync(src: string, dest: string) {
+-    if (fsSync.statSync(src).isDirectory()) {
+-      fsSync.mkdirSync(dest, { recursive: true });
+-      fsSync.readdirSync(src).forEach(c => this.copyDirRecursiveSync(join(src, c), join(dest, c)));
+-    } else {
+-      fsSync.writeFileSync(dest, fsSync.readFileSync(src));
+-    }
+-  }
+-
+   private ensureSdkInPluginsHome(): void {
+     try {
+       const r = createRequire(import.meta.url);
+@@ -531,34 +509,26 @@ export class PluginManager {
+       const sdkSrcDir = join(dirname(sdkEntry), '..');
+       const targetDir = join(BERRYTRACE_HOME, 'node_modules', 'berrytrace-plugin-sdk');
+ 
+-      let shouldCopy = false;
+-      if (!fsSync.existsSync(targetDir)) {
+-        shouldCopy = true;
+-      } else {
++      // 检查是否已是正确的 symlink
++      if (fsSync.existsSync(targetDir)) {
+         try {
+-          const srcPkg = JSON.parse(fsSync.readFileSync(join(sdkSrcDir, 'package.json'), 'utf8'));
+-          const destPkg = JSON.parse(fsSync.readFileSync(join(targetDir, 'package.json'), 'utf8'));
+-          if (srcPkg.version !== destPkg.version) {
+-            shouldCopy = true;
++          const stat = fsSync.lstatSync(targetDir);
++          if (stat.isSymbolicLink()) {
++            const linkTarget = fsSync.readlinkSync(targetDir);
++            if (linkTarget === sdkSrcDir) {
++              return; // symlink 已正确指向源目录
++            }
+           }
+-        } catch {
+-          shouldCopy = true;
+-        }
++        } catch { /* 继续创建 symlink */ }
++        // 非 symlink 或指向错误，删除后重建
++        fsSync.rmSync(targetDir, { recursive: true, force: true });
+       }
+ 
+-      if (shouldCopy) {
+-        console.log(`[PluginManager] Copying SDK from ${sdkSrcDir} to ${targetDir}...`);
+-        if (fsSync.existsSync(targetDir)) {
+-          fsSync.rmSync(targetDir, { recursive: true, force: true });
+-        }
+-        fsSync.mkdirSync(dirname(targetDir), { recursive: true });
+-        this.copyDirRecursiveSync(sdkSrcDir, targetDir);
+-        console.log('[PluginManager] SDK copy completed successfully.');
+-      } else {
+-        console.log('[PluginManager] SDK in plugins home is up to date.');
+-      }
++      fsSync.mkdirSync(dirname(targetDir), { recursive: true });
++      fsSync.symlinkSync(sdkSrcDir, targetDir, 'junction');
++      console.log(`[PluginManager] SDK symlinked: ${targetDir} → ${sdkSrcDir}`);
+     } catch (err) {
+-      console.warn('[PluginManager] Failed to auto-copy SDK to plugins home:', err);
++      console.warn('[PluginManager] Failed to symlink SDK to plugins home:', err);
+     }
+   }
+ 
+@@ -1012,6 +982,7 @@ export class PluginManager {
+     await this.persistDevPluginPath(scanned.manifest.id, pluginPath);
+ 
+     if (this.isPluginEnabled(scanned.manifest.id)) {
++      McpHost.getInstance().unregisterPluginMcp(scanned.manifest.id);
+       this.registerStaticContributions(scanned);
+       if (scanned.manifest.type === 'background' || scanned.manifest.type === 'hybrid') {
+         await this.startBackgroundPlugin(scanned.manifest.id);
+@@ -1020,6 +991,11 @@ export class PluginManager {
+       }
+     }
+ 
++    try {
++      const { FullTextIndexManager } = require('../services/fulltext-index-manager');
++      FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
++    } catch (_e) { /* empty */ }
++
+     this.notifyPluginsChanged();
+     return scanned;
+   }
+@@ -1028,29 +1004,54 @@ export class PluginManager {
+     const plugin = this.plugins.get(pluginId);
+     if (!plugin) return false;
+ 
++    // 若插件正在执行 Agent 任务，暂缓卸载与重载，记录到 pendingReloads 待任务完成后自动套用
++    try {
++      const { PluginLauncher } = require('./plugin-launcher');
++      if (PluginLauncher.getInstance().isPluginBusy(pluginId)) {
++        console.log(`[PluginManager] Plugin "${pluginId}" is currently busy with an active Agent session. Deferring reload.`);
++        this.pendingReloads.add(pluginId);
++        return true;
++      }
++    } catch (err) {
++      console.warn('[PluginManager] Failed to check plugin busy status:', err);
++    }
++
++    this.pendingReloads.delete(pluginId);
+     console.log(`[PluginManager] Reloading plugin: ${pluginId}`);
+     this.markPluginLifecycle(pluginId, 'reload', 'normal');
+ 
+     await this.deactivatePlugin(pluginId);
+ 
+     const rescanned = await PluginScanner.scanPluginFolder(plugin.path, false);
+-    if (rescanned) {
+-      this.plugins.set(pluginId, rescanned);
+-    }
++    const targetPlugin = rescanned || plugin;
++    this.plugins.set(pluginId, targetPlugin);
+ 
+     if (this.isPluginEnabled(pluginId)) {
+-      this.registerStaticContributions(plugin);
+-      if (plugin.manifest.type === 'background' || plugin.manifest.type === 'hybrid') {
++      this.registerStaticContributions(targetPlugin);
++      if (targetPlugin.manifest.type === 'background' || targetPlugin.manifest.type === 'hybrid') {
+         await this.startBackgroundPlugin(pluginId);
+-      } else if (plugin.manifest.type === 'main') {
++      } else if (targetPlugin.manifest.type === 'main') {
+         await this.startMainPlugin(pluginId);
+       }
+     }
+ 
++    try {
++      const { FullTextIndexManager } = require('../services/fulltext-index-manager');
++      FullTextIndexManager.getInstance().indexToolsLibrary([]).catch(console.error);
++    } catch (_e) { /* empty */ }
++
+     this.notifyPluginsChanged();
+     return true;
+   }
+ 
++  public async processPendingReload(pluginId: string): Promise<void> {
++    if (this.pendingReloads.has(pluginId)) {
++      console.log(`[PluginManager] Processing deferred reload for plugin: ${pluginId}`);
++      this.pendingReloads.delete(pluginId);
++      await this.reloadPlugin(pluginId);
++    }
++  }
++
+   public getPluginPath(pluginId: string): string | undefined {
+     const p = this.plugins.get(pluginId);
+     return p ? p.path : undefined;

@@ -1,0 +1,48 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/07c-storage.md b/plugins-dev/npx-tools/skills/plugin-creator/references/07c-storage.md
+index fd8ac97..be90363 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/07c-storage.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/07c-storage.md
+@@ -1,20 +1,34 @@
+ # storage — 存储
+ 
++## storage.kv — 键值对
+ 
+-> 此文件由 `scripts/generate-skill-docs.js` 自动生成。修改 controller 后运行 `node scripts/generate-skill-docs.js` 更新。
+-## storage
++| 方法 | 参数 | 返回值 | 说明 |
++|------|------|--------|------|
++| `kv.get` | `key: string, defaultValue?: unknown` | `unknown` | 读取键值对数据。 |
++| `kv.set` | `key: string, value: unknown` | `void` | 写入键值对数据，会覆盖已有值。 |
++| `kv.delete` | `key: string` | `void` | 删除指定键值对。 |
++| `kv.clear` | `—` | `void` | 清空当前插件所有键值对数据。 |
++
++## storage.db — SQLite
+ 
+ | 方法 | 参数 | 返回值 | 说明 |
+ |------|------|--------|------|
+-| `db_execute` | `sql: string, params: unknown[]` | `unknown` | 执行 SQL 语句。SELECT / PRAGMA 返回查询结果数组，其他语句返回 lastInsertRowid 和 … |
+-| `db_run` | `sql: string, params: unknown[]` | `unknown` | 执行 SQL 语句（别名，与 execute 行为一致）。 |
+-| `kv_clear` | `—` | `null` | 清空当前插件所有键值对数据。 |
+-| `kv_delete` | `key: string` | `null` | 删除指定键值对。 |
+-| `kv_get` | `key: string, defaultValue: unknown` | `unknown` | 读取键值对数据。 |
+-| `kv_set` | `key: string, value: unknown` | `null` | 写入键值对数据，会覆盖已有值。 |
++| `db.execute` | `sql: string, params?: unknown[]` | `Record<string, unknown>[]` | 执行 SQL 语句。SELECT 返回查询结果数组。 |
+ 
+ **调用示例**：
+ ```typescript
+-await callApi('storage', 'db_execute', [{ sql, params }]);
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++
++// KV 存储
++await sdk.storage.kv.set('lastSync', Date.now());
++const lastSync = await sdk.storage.kv.get('lastSync', 0);
++
++// SQLite
++const rows = await sdk.storage.db.execute(
++  'SELECT * FROM items WHERE category = ?',
++  ['note']
++);
+ ```
+ 
++> **注意**：controller 中还有 `db.run` 方法，但**未注册到 SDK**（功能与 `db.execute` 一致）。

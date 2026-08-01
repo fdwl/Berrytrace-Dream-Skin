@@ -1,0 +1,13 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+index 38cfdfe..45ab3ee 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/SKILL.md
+@@ -1,7 +1,7 @@
+ ---
+ name: plugin-creator
+ description: BerryTrace 插件开发指南。创建、修改、调试 BerryTrace 插件，或将现有的 GitHub 代码库、NPM 命令行工具包包装/封装为可供 AI 调用的本地插件与 MCP 工具。
+-last_synced_git: e324be429097babf8c36ce8fc6f7073e16bb36cb
++last_synced_git: 000633f55d75e7e21f60f31432faa6db6e8ff0c8
+ ---
+ 
+ # BerryTrace 插件开发指南

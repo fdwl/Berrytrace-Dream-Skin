@@ -1,0 +1,99 @@
+{
+  "description": "BerryTrace System and AI Kernel Error catalog mapping file. Helps AI troubleshoot issues and explain runtime errors.",
+  "errors": [
+    {
+      "code": "AI_TIMEOUT",
+      "symptom": "AI response timeout or hangs",
+      "pattern": "timeout|超时",
+      "message": "AI 响应超时，请稍后重试或简化您的请求",
+      "possible_causes": [
+        "Network connection bottleneck to LLM endpoint",
+        "Prompt context is too large causing long reasoning cycles",
+        "API service provider experiencing heavy load"
+      ],
+      "actions": [
+        "Check network to berrytrace.getdear.cn or custom endpoint",
+        "Start a new clean chat session to reduce history tokens"
+      ]
+    },
+    {
+      "code": "API_CALL_FAILED",
+      "symptom": "HTTP status code 401, 403, 429, or general API key errors",
+      "pattern": "api|status code|401|403|429",
+      "message": "API 调用失败，请检查 API 密钥和网络连接",
+      "possible_causes": [
+        "Invalid or expired OpenAI/BerryTrace API key",
+        "Insufficient balance on the API account"
+      ],
+      "actions": [
+        "Go to Settings panel in Main Window UI and verify API key settings",
+        "Verify API key balance on the provider platform"
+      ]
+    },
+    {
+      "code": "NETWORK_DISCONNECTED",
+      "symptom": "Fetch failed or server connection refused",
+      "pattern": "network|econnrefused|enotfound|fetch failed",
+      "message": "网络连接失败，请检查您的网络设置",
+      "possible_causes": [
+        "No internet connection or local proxy blocking requests",
+        "LLM provider endpoint is offline"
+      ],
+      "actions": [
+        "Test web navigation to the API endpoint in browser",
+        "Configure system proxy settings if required"
+      ]
+    },
+    {
+      "code": "RATE_LIMIT_EXCEEDED",
+      "symptom": "Quota or rate limit messages",
+      "pattern": "rate limit|quota|too many requests",
+      "message": "API 调用频率超限，请稍后重试",
+      "possible_causes": [
+        "High frequency of API requests from the current IP",
+        "Plan-level concurrent limit reached"
+      ],
+      "actions": [
+        "Wait 1-2 minutes before re-executing task",
+        "Upgrade API subscription plan"
+      ]
+    },
+    {
+      "code": "CONTEXT_LENGTH_OVERFLOW",
+      "symptom": "Token limit exceeded",
+      "pattern": "context length|token.*exceed",
+      "message": "对话内容过长，请开启新会话或删减历史消息",
+      "possible_causes": [
+        "Historical message length exceeds model's context window size",
+        "Extremely large active files or directory trees are loaded into prompt"
+      ],
+      "actions": [
+        "Use new session to reset history context",
+        "Close unnecessary tabs in the workspace editor"
+      ]
+    },
+    {
+      "code": "NAMESPACE_NOT_FOUND",
+      "symptom": "Plugin API namespace not found error",
+      "pattern": "namespace not found",
+      "possible_causes": [
+        "The SDK attempted to call a namespace that is not registered in api-dispatcher.ts"
+      ],
+      "actions": [
+        "Verify namespace mapping in electron/plugins/api-dispatcher.ts",
+        "Check that the controller implementing the namespace is added to the controllers Map"
+      ]
+    },
+    {
+      "code": "METHOD_NOT_SUPPORTED",
+      "symptom": "Unsupported method in Controller error",
+      "pattern": "unsupported method.*controller",
+      "possible_causes": [
+        "The SDK requested a method name that is missing from the switch-case in the controller execution method"
+      ],
+      "actions": [
+        "Verify method implementation switch cases in electron/plugins/controllers/"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,585 @@
+import type { Session } from 'electron';
+import { app, clipboard, net } from 'electron'
+import * as path from 'path'
+import { promises as fsPromises } from 'fs'
+import { fileURLToPath } from 'url'
+import { ElectronMainWindow } from '../windows/main-window'
+import { PluginManager } from '../plugins/plugin-manager'
+import type { ScannedPlugin } from '../plugins/plugin-scanner'
+import { downloadAndInstallPlugin } from '../plugins/plugin-install'
+import { WorkspaceManager } from './workspace-manager'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+let protocolUrlToOpenOnStart: string | null = null
+
+/**
+ * Register custom protocol client with the operating system
+ */
+export function registerProtocolClient() {
+  const scheme = !app.isPackaged ? 'berrytrace-dev' : 'berrytrace'
+  if (process.defaultApp) {
+    if (process.argv.length >= 2) {
+      app.setAsDefaultProtocolClient(scheme, process.execPath, [
+        path.resolve(process.argv[1]),
+      ])
+    }
+  } else {
+    app.setAsDefaultProtocolClient(scheme)
+  }
+  console.log(`✅ Registered ${scheme}:// protocol client`)
+}
+
+/**
+ * Extract custom protocol URL from command line arguments
+ */
+export function getProtocolUrlFromArgv(argv: string[]): string | null {
+  for (const arg of argv) {
+    if (arg.startsWith('berrytrace://') || arg.startsWith('berrytrace-dev://')) {
+      return arg
+    }
+  }
+  return null
+}
+
+/**
+ * Handle custom protocol link execution
+ */
+export async function handleProtocolUrl(urlStr: string) {
+  console.log(`[Protocol] Handling URL: ${urlStr}`)
+  try {
+    const url = new URL(urlStr)
+    const host = url.hostname || url.host
+    const isSilent = url.searchParams.get('silent') === 'true'
+
+    // For all requests, make sure the main window or target action is activated
+    if (!isSilent) {
+      ElectronMainWindow.getInstance().showWindow()
+    }
+
+    if (host === 'export-plugins') {
+      // berrytrace://export-plugins?to=/tmp/berrytrace-plugins.json
+      const outputFile = url.searchParams.get('to') || path.join(app.getPath('temp'), 'berrytrace-plugins.json');
+      console.log(`[Protocol] Exporting plugin list to: ${outputFile}`);
+      const pm = PluginManager.getInstance();
+      const { getPluginRootDir } = await import('../plugins/plugin-manager');
+      const rootDir = getPluginRootDir();
+      const plugins = pm.getPluginsList().map((p: ScannedPlugin) => ({
+        id: p.manifest?.id || '',
+        name: p.manifest?.name || '',
+        type: p.manifest?.type || '',
+        path: pm.getPluginPath(p.manifest?.id || '') || '',
+      }));
+      fsPromises.writeFile(outputFile, JSON.stringify(plugins, null, 2), 'utf-8')
+        .then(() => console.log(`[Protocol] Plugin list exported: ${plugins.length} plugins`))
+        .catch(err => console.error(`[Protocol] Failed to write plugin list:`, err));
+    } else if (host === 'reload-plugin') {
+      // berrytrace://reload-plugin?id=com.berrytrace.plugin.xxx
+      const pluginId = url.searchParams.get('id')
+      if (pluginId) {
+        console.log(`[Protocol] Reloading plugin: ${pluginId}`)
+        const pm = PluginManager.getInstance()
+        try {
+          await pm.reloadPlugin(pluginId)
+          console.log(`[Protocol] Plugin reloaded: ${pluginId}`)
+        } catch (err) {
+          console.error(`[Protocol] Failed to reload plugin:`, err)
+        }
+      }
+    } else if (host === 'open-plugin') {
+      const pluginId = url.searchParams.get('id')
+      if (pluginId) {
+        console.log(`[Protocol] Opening plugin: ${pluginId}`)
+        // Get all query params except 'id'
+        const queryParams = new URLSearchParams()
+        url.searchParams.forEach((value, key) => {
+          if (key !== 'id') {
+            queryParams.set(key, value)
+          }
+        })
+        const queryStr = queryParams.toString() ? '?' + queryParams.toString() : ''
+
+        const pm = PluginManager.getInstance()
+        await pm.ensurePluginLoaded(pluginId)
+
+        const plugin = pm.getPlugin(pluginId)
+        if (plugin && (plugin.manifest as { type?: string }).type === 'window') {
+          pm.openPluginWindow(pluginId, queryStr)
+        } else {
+          ElectronMainWindow.getInstance().openPlugin(pluginId, queryStr)
+        }
+      }
+    } else if (host === 'new-note') {
+      const content = url.searchParams.get('content')
+      const spaceId = url.searchParams.get('spaceId') || 'global'
+      if (content) {
+        console.log(`[Protocol] Note content received from protocol: ${spaceId}`)
+      }
+    } else if (host === 'install-plugin') {
+      const urlParam = url.searchParams.get('url')
+      if (urlParam) {
+        console.log(`[Protocol] Navigating to preferences for installing plugin from URL: ${urlParam}`)
+        const mainWindow = ElectronMainWindow.getInstance().getWindow();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('navigate', `/preferences?installPkgUrl=${encodeURIComponent(urlParam)}`);
+        }
+      }
+    } else if (host === 'open-file') {
+      const pathParam = url.searchParams.get('path')
+      if (pathParam) {
+        console.log(`[Protocol] Opening file via protocol: ${pathParam}`)
+        const mainWindow = ElectronMainWindow.getInstance().getWindow()
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('note-tools:open-file', { filePath: pathParam })
+        }
+      }
+    } else if (host === 'new') {
+      const fileParam = url.searchParams.get('file')
+      const useClipboard = url.searchParams.has('clipboard')
+      const contentParam = url.searchParams.get('content')
+
+      if (!fileParam) {
+        console.log('[Protocol] new action: missing file parameter')
+        return
+      }
+
+      // Get content: prefer clipboard if flag is set
+      let content = ''
+      if (useClipboard) {
+        try {
+          content = clipboard.readText()
+          console.log(`[Protocol] Read ${content.length} chars from clipboard`)
+        } catch (err) {
+          console.error('[Protocol] Failed to read clipboard:', err)
+        }
+      }
+
+      // Fallback to content parameter if clipboard is empty or no clipboard flag
+      if (!content && contentParam) {
+        content = contentParam
+      }
+
+      if (!content) {
+        console.log('[Protocol] new action: no content available (clipboard empty and no content param)')
+        return
+      }
+
+      // Get workspace path
+      const workspacePath = WorkspaceManager.getInstance().getPathForWindow(
+        ElectronMainWindow.getInstance().getWindow()
+      )
+
+      if (!workspacePath) {
+        console.error('[Protocol] new action: no workspace path available')
+        return
+      }
+
+      try {
+        // Ensure target directory exists
+        const targetDir = path.join(workspacePath, fileParam)
+        await fsPromises.mkdir(targetDir, { recursive: true })
+
+        // Generate filename from first line of content + timestamp
+        const firstLine = content
+          .split('\n')[0]
+          .replace(/[\\/:*?"<>|#]/g, '')
+          .trim()
+          .substring(0, 50)
+        const timestamp = new Date()
+          .toISOString()
+          .replace(new RegExp('[' + '-:T' + ']', 'g'), '')
+          .substring(0, 14)
+        const fileName = `${timestamp}_${firstLine || 'clipping'}.md`
+
+        const filePath = path.join(targetDir, fileName)
+        await fsPromises.writeFile(filePath, content, 'utf8')
+
+        console.log(`[Protocol] Saved clipboard content to: ${filePath}`)
+
+        // Open the file in the editor
+        const mainWindow = ElectronMainWindow.getInstance().getWindow()
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('note-tools:open-file', { filePath })
+        }
+      } catch (err) {
+        console.error('[Protocol] new action: failed to save file:', err)
+      }
+    }
+  } catch (e) {
+    console.error(`[Protocol] Failed to handle protocol URL: ${urlStr}`, e)
+    ElectronMainWindow.getInstance().showWindow()
+  }
+}
+
+/**
+ * Set the protocol URL to be opened once the app becomes ready
+ */
+export function setProtocolUrlToOpenOnStart(url: string | null) {
+  protocolUrlToOpenOnStart = url
+}
+
+/**
+ * Retrieve the buffered startup protocol URL
+ */
+export function getProtocolUrlToOpenOnStart(): string | null {
+  return protocolUrlToOpenOnStart
+}
+
+export function registerPluginProtocol(ses: Session) {
+  try {
+    ses.protocol.handle('berrytrace-plugin', async (request) => {
+      try {
+        const url = new URL(request.url)
+        const pluginId = url.hostname
+        let filePath = decodeURIComponent(url.pathname)
+        if (filePath.startsWith('/')) {
+          filePath = filePath.substring(1)
+        }
+
+        // Support direct local file reading (images/videos/audios) for plugins
+        if (pluginId === 'local-file') {
+          let targetPath = filePath;
+          if (process.platform === 'win32' && /^[a-zA-Z]:/.test(targetPath)) {
+            // Keep Windows drive letter as is
+          } else if (process.platform === 'win32' && targetPath.startsWith('/')) {
+            targetPath = targetPath.substring(1);
+          } else if (process.platform !== 'win32' && !targetPath.startsWith('/')) {
+            targetPath = '/' + targetPath;
+          }
+
+          try {
+            const data = await fsPromises.readFile(targetPath);
+            let mimeType = 'application/octet-stream';
+            const ext = targetPath.split('.').pop()?.toLowerCase();
+            if (ext === 'png') mimeType = 'image/png';
+            else if (ext === 'jpg' || ext === 'jpeg') mimeType = 'image/jpeg';
+            else if (ext === 'gif') mimeType = 'image/gif';
+            else if (ext === 'webp') mimeType = 'image/webp';
+            else if (ext === 'mp4') mimeType = 'video/mp4';
+            else if (ext === 'webm') mimeType = 'video/webm';
+            else if (ext === 'mov') mimeType = 'video/quicktime';
+            else if (ext === 'ogg') mimeType = 'video/ogg';
+            else if (ext === 'svg') mimeType = 'image/svg+xml';
+            else if (ext === 'mp3') mimeType = 'audio/mpeg';
+            else if (ext === 'wav') mimeType = 'audio/wav';
+
+            return new Response(data, {
+              status: 200,
+              headers: {
+                'Content-Type': mimeType,
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          } catch (err: unknown) {
+            console.error(`[Protocol] Error reading local-file at ${targetPath}:`, err);
+            return new Response('File not found', { status: 404 });
+          }
+        }
+
+        let isSystem = pluginId === 'system'
+        let targetPluginId = pluginId
+        let relativeFilePath = filePath
+
+        // Intercept official plugin assets routed through system origin
+        if (isSystem && filePath.startsWith('plugins/')) {
+          const parts = filePath.split('/')
+          if (parts.length >= 3) {
+            targetPluginId = parts[1]
+            relativeFilePath = parts.slice(2).join('/')
+            isSystem = false
+          }
+        }
+
+        // Serve virtual system style tokens or host wrapper assets
+        if (isSystem) {
+          if (relativeFilePath === 'plugins-sdk/browser.js' || relativeFilePath === 'plugins-sdk/types.js') {
+            try {
+              let sdkPath = '';
+              const searchPaths = [
+                path.join(__dirname, '..', 'node_modules/berrytrace-plugin-sdk/dist/browser.js'),
+                path.resolve(__dirname, '../../node_modules/berrytrace-plugin-sdk/dist/browser.js'),
+                path.resolve(__dirname, '../node_modules/berrytrace-plugin-sdk/dist/browser.js'),
+                path.join(__dirname, '..', 'plugins-sdk/dist/browser.js'),
+              ];
+              for (const p of searchPaths) {
+                try {
+                  await fsPromises.access(p);
+                  sdkPath = p;
+                  break;
+                } catch {
+                  // check next search path
+                }
+              }
+              if (!sdkPath) {
+                console.error('[Protocol] Browser SDK not found in search paths:', searchPaths);
+                return new Response('Browser SDK not found', { status: 404 });
+              }
+              const data = await fsPromises.readFile(sdkPath);
+              return new Response(data, {
+                status: 200,
+                headers: {
+                  'Content-Type': 'application/javascript',
+                  'Access-Control-Allow-Origin': '*'
+                }
+              });
+            } catch (err) {
+              console.error('[Protocol] Failed to serve plugins-sdk/browser.js:', err);
+              return new Response('Error loading SDK', { status: 500 });
+            }
+          }
+
+          if (relativeFilePath === 'capture-window') {
+            try {
+              const windowIdStr = url.searchParams.get('windowId')
+              const qualityParam = url.searchParams.get('quality') || 'medium'
+              const windowId = windowIdStr ? parseInt(windowIdStr, 10) : null
+              
+              if (windowId === null || isNaN(windowId)) {
+                return new Response('Invalid windowId', { status: 400 })
+              }
+
+              const { Window } = await import('node-screenshots')
+              const windows = Window.all()
+              const target = windows.find(win => win.id() === windowId)
+              if (!target) {
+                return new Response('Window not found', { status: 404 })
+              }
+
+              const image = await target.captureImage()
+              const buffer = await image.toPng()
+
+              const sharpModule = await import('sharp')
+              const sharp = sharpModule.default || sharpModule
+              let sharpImg = sharp(buffer)
+
+              let targetQuality = 70
+              let resizeWidth: number | null = 1280
+
+              if (qualityParam === 'low') {
+                resizeWidth = 800
+                targetQuality = 60
+              } else if (qualityParam === 'medium') {
+                resizeWidth = 1280
+                targetQuality = 80
+              } else if (qualityParam === 'high') {
+                resizeWidth = null
+                targetQuality = 90
+              } else {
+                const parsed = parseInt(qualityParam, 10)
+                if (!isNaN(parsed)) {
+                  targetQuality = parsed
+                }
+              }
+
+              if (resizeWidth !== null) {
+                sharpImg = sharpImg.resize({ width: resizeWidth, withoutEnlargement: true })
+              }
+
+              const outputBuffer = await sharpImg
+                .jpeg({ quality: targetQuality })
+                .toBuffer()
+
+              return new Response(outputBuffer as any, {
+                status: 200,
+                headers: {
+                  'Content-Type': 'image/jpeg',
+                  'Access-Control-Allow-Origin': '*',
+                  'Cache-Control': 'no-cache, no-store, must-revalidate'
+                }
+              })
+            } catch (err) {
+              console.error('[Protocol] capture-window failed:', err)
+              return new Response('Capture failed', { status: 500 })
+            }
+          }
+
+          if (relativeFilePath === 'style.css') {
+            const cssContent = `
+              :root {
+                --color-brand: #319795;
+                --bg-page: #fafafa;
+                --text-primary: #333333;
+                --text-secondary: #4a5568;
+                --text-tertiary: #718096;
+                --border-light: #e2e8f0;
+                --bg-hover: #edf2f7;
+                --bg-card: #ffffff;
+              }
+              body.dark {
+                --bg-page: #1a1a1a;
+                --text-primary: #f7fafc;
+                --text-secondary: #e2e8f0;
+                --text-tertiary: #a0aec0;
+                --border-light: #2d3748;
+                --bg-hover: #2d3748;
+                --bg-card: #2d3748;
+              }
+            `;
+            return new Response(cssContent, {
+              status: 200,
+              headers: {
+                'Content-Type': 'text/css',
+                'Access-Control-Allow-Origin': '*'
+              }
+            });
+          }
+
+          // Host wrapper assets proxy (development) or file loading (production)
+          const devServer = process.env.VITE_DEV_SERVER_URL
+          if (devServer) {
+            const devServerUrl = devServer.endsWith('/')
+              ? devServer.slice(0, -1)
+              : devServer
+            const devUrl = `${devServerUrl}/${relativeFilePath}${url.search}`
+            console.log(`[Protocol] Proxying system wrapper request to Vite: ${devUrl}`)
+            try {
+              const response = await net.fetch(devUrl)
+              const headers = new Headers(response.headers)
+              headers.set('Access-Control-Allow-Origin', '*')
+              return new Response(response.body, {
+                status: response.status,
+                statusText: response.statusText,
+                headers
+              })
+            } catch (err) {
+              console.error(`[Protocol] Failed to proxy Vite request: ${devUrl}`, err instanceof Error ? err.message : String(err))
+              return new Response('Dev server proxy error', { status: 502 })
+            }
+          } else {
+            // Serve from dist folder in production
+            const distPath = path.join(__dirname, '../dist')
+            const fullPath = path.join(distPath, relativeFilePath)
+            try {
+              const data = await fsPromises.readFile(fullPath)
+              let mimeType = 'application/octet-stream'
+              const ext = fullPath.split('.').pop()?.toLowerCase()
+              if (ext === 'html') mimeType = 'text/html'
+              else if (ext === 'js') mimeType = 'application/javascript'
+              else if (ext === 'css') mimeType = 'text/css'
+              else if (ext === 'png') mimeType = 'image/png'
+              else if (ext === 'jpg' || ext === 'jpeg') mimeType = 'image/jpeg'
+              else if (ext === 'gif') mimeType = 'image/gif'
+              else if (ext === 'svg') mimeType = 'image/svg+xml'
+              else if (ext === 'json') mimeType = 'application/json'
+
+              return new Response(data, {
+                status: 200,
+                headers: {
+                  'Content-Type': mimeType,
+                  'Access-Control-Allow-Origin': '*'
+                }
+              })
+            } catch {
+              console.warn(`[Protocol] Dist asset not found: ${fullPath}`)
+              return new Response('File not found', { status: 404 })
+            }
+          }
+        }
+
+        // Check if plugin exists
+        const pluginPath = PluginManager.getInstance().getPluginPath(targetPluginId)
+        console.log('[Protocol] Requested pluginId =', targetPluginId, 'resolved path =', pluginPath);
+        if (!pluginPath) {
+          console.warn(`[Protocol] Request for unknown plugin: ${targetPluginId}`)
+          return new Response('Plugin not found', { status: 404 })
+        }
+
+        let fullPath = path.join(pluginPath, relativeFilePath)
+        let data: Buffer
+        try {
+          data = await fsPromises.readFile(fullPath)
+        } catch (err) {
+          // If the file was requested without extension, try appending .js
+          if (path.extname(fullPath) === '') {
+            try {
+              fullPath = fullPath + '.js'
+              data = await fsPromises.readFile(fullPath)
+            } catch (err2) {
+              throw err // Throw the original error if .js also fails
+            }
+          } else {
+            throw err
+          }
+        }
+
+        // Determine standard MIME types
+        let mimeType = 'application/octet-stream'
+        const ext = fullPath.split('.').pop()?.toLowerCase()
+        if (ext === 'html') {
+          mimeType = 'text/html'
+          let htmlContent = data.toString('utf-8')
+          const injectionScript = `
+            <script type="importmap">
+              {
+                "imports": {
+                  "berrytrace-plugin-sdk": "berrytrace-plugin://system/plugins-sdk/browser.js"
+                }
+              }
+            </script>
+            <script>
+              // Automatically injected by BerryTrace Host for global shortcuts support
+              window.addEventListener('keydown', (e) => {
+                window.parent.postMessage({
+                  source: 'berrytrace-plugin-sdk',
+                  type: 'keyboard:keydown',
+                  key: e.key,
+                  code: e.code,
+                  keyCode: e.keyCode,
+                  ctrlKey: e.ctrlKey,
+                  metaKey: e.metaKey,
+                  altKey: e.altKey,
+                  shiftKey: e.shiftKey
+                }, '*');
+              });
+            </script>
+          `
+          if (htmlContent.includes('</head>')) {
+            htmlContent = htmlContent.replace('</head>', `${injectionScript}</head>`)
+          } else if (htmlContent.includes('</body>')) {
+            htmlContent = htmlContent.replace('</body>', `${injectionScript}</body>`)
+          } else {
+            htmlContent = htmlContent + injectionScript
+          }
+
+          return new Response(htmlContent, {
+            status: 200,
+            headers: {
+              'Content-Type': mimeType,
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+              'Pragma': 'no-cache',
+              'Expires': '0'
+            }
+          })
+        }
+        else if (ext === 'js') mimeType = 'application/javascript'
+        else if (ext === 'css') mimeType = 'text/css'
+        else if (ext === 'png') mimeType = 'image/png'
+        else if (ext === 'jpg' || ext === 'jpeg') mimeType = 'image/jpeg'
+        else if (ext === 'gif') mimeType = 'image/gif'
+        else if (ext === 'svg') mimeType = 'image/svg+xml'
+        else if (ext === 'json') mimeType = 'application/json'
+
+        return new Response(data as unknown as BodyInit, {
+          status: 200,
+          headers: {
+            'Content-Type': mimeType,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+          }
+        })
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[Protocol] Error serving plugin asset:`, errMsg);
+        return new Response('File not found', { status: 404 });
+      }
+    })
+    console.log(`[Protocol] Registered berrytrace-plugin on session: ${ses.getStoragePath() || 'memory-only'}`)
+  } catch (err) {
+    console.error(`[Protocol] Failed to register berrytrace-plugin on session:`, err)
+  }
+}
+

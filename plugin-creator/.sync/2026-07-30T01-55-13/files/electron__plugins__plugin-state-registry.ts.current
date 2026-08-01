@@ -1,0 +1,275 @@
+/**
+ * @module PluginStateRegistry
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 职责：插件系统唯一的运行时状态存储（Single Source of Truth for plugin runtime state）
+ *
+ * 解决的问题：
+ * - 消除 PluginManager.loadedPluginsSet / activatingPlugins / pendingApiCallsQueue
+ * - 消除 PluginActivityTracker.pluginLastActiveTime / activeRenderedPlugins
+ * - 消除 PluginWatchdog.restartingPlugins
+ * - 提供统一的状态机转换 API，状态变更可追踪
+ *
+ * 设计约束：
+ * - 不依赖任何其他 plugin 模块（零循环依赖）
+ * - 进程句柄留在 PluginLauncher（它是进程的拥有者）
+ * - 心跳指标留在 PluginWatchdog（它是内部运维数据）
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+// ── 类型定义 ─────────────────────────────────────────────────────────────────
+
+/**
+ * 插件生命周期阶段（状态机枚举）
+ *
+ * 合法转换：
+ *   unregistered  → registered    （扫描到插件）
+ *   registered    → activating    （开始启动）
+ *   activating    → active        （启动成功）
+ *   activating    → registered    （启动失败，回退）
+ *   active        → restarting    （watchdog 检测到崩溃，触发重启）
+ *   active        → registered    （空闲卸载）
+ *   active        → deactivating  （用户禁用 / 主动卸载）
+ *   restarting    → activating    （重启开始）
+ *   restarting    → disabled      （超过最大重启次数，熔断）
+ *   deactivating  → registered    （卸载完成）
+ *   *             → disabled      （用户禁用 / 崩溃熔断）
+ *   disabled      → registered    （用户重新启用）
+ */
+export type PluginPhase =
+  | 'unregistered'
+  | 'registered'
+  | 'activating'
+  | 'active'
+  | 'restarting'
+  | 'deactivating'
+  | 'disabled';
+
+/** IPC api-call 挂起队列条目（激活屏障用） */
+export interface PendingApiCall {
+  apiName: string;
+  methodName: string;
+  args: unknown[];
+  callerId: string;
+  sender: Electron.WebContents;
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+}
+
+/** 每个插件的运行时状态记录 */
+interface PluginRecord {
+  pluginId: string;
+  phase: PluginPhase;
+
+  /** 最后活跃时间戳（unix ms）；0 = 从未活跃 */
+  lastActiveTime: number;
+
+  /** 是否有 Renderer 正在渲染此插件的视图（来自 PluginActiveViewTracker） */
+  isRendered: boolean;
+
+  /** 激活期间挂起的 api-call 队列（Activation Barrier） */
+  pendingApiCalls: PendingApiCall[];
+}
+
+// ── PluginStateRegistry ───────────────────────────────────────────────────────
+
+export class PluginStateRegistry {
+  private static _instance: PluginStateRegistry;
+
+  private records = new Map<string, PluginRecord>();
+
+  private constructor() {}
+
+  public static getInstance(): PluginStateRegistry {
+    if (!PluginStateRegistry._instance) {
+      PluginStateRegistry._instance = new PluginStateRegistry();
+    }
+    return PluginStateRegistry._instance;
+  }
+
+  // ── 内部辅助 ───────────────────────────────────────────────────────────────
+
+  private getOrCreate(pluginId: string): PluginRecord {
+    let record = this.records.get(pluginId);
+    if (!record) {
+      record = {
+        pluginId,
+        phase: 'unregistered',
+        lastActiveTime: 0,
+        isRendered: false,
+        pendingApiCalls: [],
+      };
+      this.records.set(pluginId, record);
+    }
+    return record;
+  }
+
+  // ── 状态机：阶段读写 ────────────────────────────────────────────────────────
+
+  /** 获取当前阶段 */
+  public getPhase(pluginId: string): PluginPhase {
+    return this.records.get(pluginId)?.phase ?? 'unregistered';
+  }
+
+  /**
+   * 设置插件阶段（状态机转换）。
+   * 不做合法性校验（调用方负责保证转换合理），但会输出日志以便排查。
+   */
+  public setPhase(pluginId: string, phase: PluginPhase): void {
+    const record = this.getOrCreate(pluginId);
+    const from = record.phase;
+    if (from === phase) return;
+    console.log(`[PluginStateRegistry] ${pluginId}: ${from} → ${phase}`);
+    record.phase = phase;
+  }
+
+  /** 是否处于"已激活"（进程运行中）状态 */
+  public isActive(pluginId: string): boolean {
+    return this.getPhase(pluginId) === 'active';
+  }
+
+  /** 是否处于"正在激活"（启动流程中）状态 */
+  public isActivating(pluginId: string): boolean {
+    return this.getPhase(pluginId) === 'activating';
+  }
+
+  /** 是否处于"正在重启"状态 */
+  public isRestarting(pluginId: string): boolean {
+    return this.getPhase(pluginId) === 'restarting';
+  }
+
+  /** 是否处于"禁用"状态 */
+  public isDisabled(pluginId: string): boolean {
+    return this.getPhase(pluginId) === 'disabled';
+  }
+
+  /**
+   * 将插件标记为"已加载/active"（等同于原 loadedPluginsSet.add）
+   */
+  public markActive(pluginId: string): void {
+    this.setPhase(pluginId, 'active');
+  }
+
+  /**
+   * 将插件标记为"已卸载"（等同于原 loadedPluginsSet.delete）
+   */
+  public markUnloaded(pluginId: string): void {
+    const current = this.getPhase(pluginId);
+    // disabled 状态不因卸载而变为 registered（防止绕过禁用）
+    if (current !== 'disabled') {
+      this.setPhase(pluginId, 'registered');
+    }
+  }
+
+  /** 所有处于 active 状态的插件 ID */
+  public getActivePluginIds(): string[] {
+    return Array.from(this.records.entries())
+      .filter(([, r]) => r.phase === 'active')
+      .map(([id]) => id);
+  }
+
+  // ── 活跃度 ─────────────────────────────────────────────────────────────────
+
+  /** 记录插件最后活跃时间（IPC 调用、事件接收等场景） */
+  public recordActivity(pluginId: string): void {
+    this.getOrCreate(pluginId).lastActiveTime = Date.now();
+  }
+
+  /** 获取插件最后活跃时间戳（ms），0 表示从未活跃 */
+  public getLastActiveTime(pluginId: string): number {
+    return this.records.get(pluginId)?.lastActiveTime ?? 0;
+  }
+
+  /**
+   * 获取插件空闲时长（ms）。
+   * 若插件从未活跃（lastActiveTime = 0），返回 Infinity，让空闲回收优先处理。
+   */
+  public getIdleDuration(pluginId: string): number {
+    const last = this.getLastActiveTime(pluginId);
+    return last === 0 ? Infinity : Date.now() - last;
+  }
+
+  // ── Renderer 渲染状态 ────────────────────────────────────────────────────────
+
+  /** 标记插件是否有 Renderer 正在渲染其视图（来自 PluginActiveViewTracker IPC） */
+  public setRendered(pluginId: string, rendered: boolean): void {
+    this.getOrCreate(pluginId).isRendered = rendered;
+    if (rendered) {
+      // 有视图在渲染 → 同步刷新活跃时间，防止被空闲回收
+      this.recordActivity(pluginId);
+    }
+  }
+
+  /** 是否有 Renderer 正在渲染此插件的视图 */
+  public isRendered(pluginId: string): boolean {
+    return this.records.get(pluginId)?.isRendered ?? false;
+  }
+
+  /** 获取所有正在被渲染的插件 ID 集合 */
+  public getRenderedPluginIds(): Set<string> {
+    const result = new Set<string>();
+    for (const [id, r] of this.records) {
+      if (r.isRendered) result.add(id);
+    }
+    return result;
+  }
+
+  // ── 激活屏障（Activation Barrier） ─────────────────────────────────────────
+
+  /** 将一个 api-call 加入插件的挂起队列（插件 ACTIVATING 期间调用） */
+  public enqueuePendingApiCall(pluginId: string, call: PendingApiCall): void {
+    this.getOrCreate(pluginId).pendingApiCalls.push(call);
+    console.log(`[PluginStateRegistry:Barrier] ${pluginId} queued ${call.apiName}.${call.methodName} (total=${this.records.get(pluginId)!.pendingApiCalls.length})`);
+  }
+
+  /**
+   * 取出并清空挂起队列，返回所有待执行的调用。
+   * 调用方负责逐一 replay 并 resolve/reject。
+   */
+  public flushPendingApiCalls(pluginId: string): PendingApiCall[] {
+    const record = this.records.get(pluginId);
+    if (!record || record.pendingApiCalls.length === 0) return [];
+    const calls = record.pendingApiCalls.splice(0);
+    console.log(`[PluginStateRegistry:Barrier] Flushing ${calls.length} pending calls for ${pluginId}`);
+    return calls;
+  }
+
+  /** 拒绝并清空挂起队列（插件启动失败时调用） */
+  public rejectPendingApiCalls(pluginId: string, err: Error): void {
+    const calls = this.flushPendingApiCalls(pluginId);
+    if (calls.length === 0) return;
+    console.warn(`[PluginStateRegistry:Barrier] Rejecting ${calls.length} pending calls for ${pluginId}: ${err.message}`);
+    for (const call of calls) {
+      call.reject(err);
+    }
+  }
+
+  // ── 批量查询 ────────────────────────────────────────────────────────────────
+
+  /** 获取所有已注册的插件 ID */
+  public getAllPluginIds(): string[] {
+    return Array.from(this.records.keys());
+  }
+
+  /** 获取某插件的完整状态快照（调试用） */
+  public getSnapshot(pluginId: string): Readonly<Omit<PluginRecord, 'pendingApiCalls'>> & { pendingCallCount: number } {
+    const r = this.records.get(pluginId);
+    if (!r) {
+      return { pluginId, phase: 'unregistered', lastActiveTime: 0, isRendered: false, pendingCallCount: 0 };
+    }
+    return {
+      pluginId: r.pluginId,
+      phase: r.phase,
+      lastActiveTime: r.lastActiveTime,
+      isRendered: r.isRendered,
+      pendingCallCount: r.pendingApiCalls.length,
+    };
+  }
+
+  /** 清除插件记录（仅用于卸载/测试） */
+  public remove(pluginId: string): void {
+    this.records.delete(pluginId);
+  }
+}
+
+// 导出单例快捷访问
+export const pluginStateRegistry = PluginStateRegistry.getInstance();

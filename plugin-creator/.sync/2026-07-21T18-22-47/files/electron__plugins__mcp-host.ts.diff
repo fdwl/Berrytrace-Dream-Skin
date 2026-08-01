@@ -1,0 +1,87 @@
+diff --git a/electron/plugins/mcp-host.ts b/electron/plugins/mcp-host.ts
+index 7945e66..c694e2b 100644
+--- a/electron/plugins/mcp-host.ts
++++ b/electron/plugins/mcp-host.ts
+@@ -133,9 +133,44 @@ export class McpHost {
+     const allTools = Array.from(this.tools.values());
+     const currentExt = (this.activeState.fileExtension || '').toLowerCase().replace(/^\./, '');
+ 
++    // 注入已注册的本地工作流作为虚拟 MCP 工具
++    try {
++      const { WorkflowEngine } = require('./workflow-engine');
++      const workflows = WorkflowEngine.getInstance().list();
++      workflows.forEach((wf: any) => {
++        const properties: Record<string, any> = {};
++        const required: string[] = [];
++        if (wf.inputs) {
++          for (const [key, inputDef] of Object.entries(wf.inputs) as any) {
++            properties[key] = {
++              type: inputDef.type || 'string',
++              description: inputDef.description || '',
++            };
++            if (inputDef.required) {
++              required.push(key);
++            }
++          }
++        }
++
++        allTools.push({
++          name: wf.id,
++          displayName: wf.name || wf.id,
++          description: `【本地 SOP 工作流】${wf.description || ''}。执行此工具将按顺序运行工作流的各个步骤。`,
++          inputSchema: {
++            type: 'object',
++            properties,
++            required,
++          },
++          pluginId: 'workflow-engine',
++        });
++      });
++    } catch (err) {
++      console.warn('[McpHost] Failed to list workflows as mcp tools:', err);
++    }
++
+     return allTools.filter(tool => {
+       // Host tools have pluginId 'berrytrace.host' or 'system' or 'berrytrace' -> always allow
+-      if (tool.pluginId === 'berrytrace.host' || tool.pluginId === 'system' || tool.pluginId === 'berrytrace') {
++      if (tool.pluginId === 'berrytrace.host' || tool.pluginId === 'system' || tool.pluginId === 'berrytrace' || tool.pluginId === 'workflow-engine') {
+         return true;
+       }
+ 
+@@ -179,6 +214,7 @@ export class McpHost {
+   }
+ 
+   public hasToolHandler(toolName: string): boolean {
++    if (!toolName) return false;
+     let resolvedName = toolName;
+     if (toolName.includes(':')) {
+       resolvedName = toolName.split(':').pop() || toolName;
+@@ -187,11 +223,29 @@ export class McpHost {
+   }
+ 
+   public async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
++    if (!toolName) throw new Error('Tool name is undefined or empty');
+     let resolvedName = toolName;
+     if (toolName.includes(':')) {
+       resolvedName = toolName.split(':').pop() || toolName;
+     }
+ 
++    // 优先拦截工作流调用
++    try {
++      const { WorkflowEngine } = require('./workflow-engine');
++      const wf = WorkflowEngine.getInstance().get(resolvedName);
++      if (wf) {
++        console.log(`[McpHost] Intercepting MCP call to execute workflow "${resolvedName}"...`);
++        const result = await WorkflowEngine.getInstance().execute(resolvedName, args, 'direct');
++        if (!result.success) {
++          throw new Error(result.error || '工作流执行失败');
++        }
++        return result.finalOutput || '工作流执行成功完成！';
++      }
++    } catch (err: any) {
++      console.error(`[McpHost] Failed to execute workflow tool "${resolvedName}":`, err);
++      throw err;
++    }
++
+     let handler = this.toolHandlers.get(resolvedName);
+     console.log(`[McpHost] callTool: toolName=${toolName}, resolvedName=${resolvedName}, hasHandler=${!!handler}`);

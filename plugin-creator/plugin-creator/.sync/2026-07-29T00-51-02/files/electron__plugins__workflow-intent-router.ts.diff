@@ -1,0 +1,15 @@
+diff --git a/electron/plugins/workflow-intent-router.ts b/electron/plugins/workflow-intent-router.ts
+index fa50b9f..80b204e 100644
+--- a/electron/plugins/workflow-intent-router.ts
++++ b/electron/plugins/workflow-intent-router.ts
+@@ -69,7 +69,9 @@ export class WorkflowIntentRouter {
+                 extractedParams: { matchGroup: match[1] },
+               };
+             }
+-          } catch {}
++          } catch {
++            // ignore
++          }
+         }
+ 
+         // 3. 包含关系匹配 (Confidence = 0.8)

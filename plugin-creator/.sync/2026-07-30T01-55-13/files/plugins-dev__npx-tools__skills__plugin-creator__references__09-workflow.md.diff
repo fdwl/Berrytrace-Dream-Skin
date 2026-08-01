@@ -1,0 +1,61 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/09-workflow.md b/plugins-dev/npx-tools/skills/plugin-creator/references/09-workflow.md
+index b4246ba..8a0e723 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/09-workflow.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/09-workflow.md
+@@ -43,45 +43,31 @@ CLI 模板生成后需手动修正（参考 [03-plugin-json.md](./03-plugin-json
+ 
+ ---
+ 
+-## Step 4：构建
++## Step 4：构建与热重载
+ 
+-创建 `scripts/bundle.mjs`：[08-build.md](./08-build.md)
++使用 `berrytrace-sdk` 一键完成编译与本地宿主通知（自动检测宿主 LocalServer 并重载/加载解包插件）：
+ 
+ ```bash
+-npm install
+-npm run build
++# 在插件根目录运行（无需依赖宿主代码或 MCP）
++npx berrytrace-plugin-sdk build --reload
+ ```
+ 
+ ---
+ 
+-## Step 5：加载到宿主
++## Step 5：极简迭代循环
+ 
++```bash
++# 每次修改代码后直接运行：
++npx berrytrace-plugin-sdk build --reload
+ ```
+-plugin_manager_load_unpacked
+-参数: { "path": "plugins-dev/<name>" }
+-```
+-
+----
+-
+-## Step 6：验证
+ 
+-```
+-plugin_manager_get_logs
+-参数: { "pluginId": "com.berrytrace.plugin.<name>-<uuid>", "limit": 30 }
+-```
++> CLI 会自动读取 `~/.berrytrace/local_server.json` 通信凭证，并向宿主 LocalServer (`http://127.0.0.1:31828`) 发送热重载指令；若插件首次载入，会自动退回解包加载（load-unpacked）。
+ 
+ ---
+ 
+-## Step 7：热重载迭代
+-
+-```bash
+-npm run build
+-```
++## Step 6：日志与验证 (可选 Host MCP 工具)
+ 
+-```
+-plugin_manager_reload
+-参数: { "pluginId": "com.berrytrace.plugin.<name>-<uuid>" }
+-```
++若 Agent 集成在宿主内部，可调用 MCP 工具查看插件日志：
+ 
+ ```
+ plugin_manager_get_logs

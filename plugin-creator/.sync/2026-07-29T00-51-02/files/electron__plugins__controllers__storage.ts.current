@@ -1,0 +1,475 @@
+import { app, shell, net } from 'electron';
+import Store from 'electron-store';
+import { join, resolve, relative, isAbsolute, dirname } from 'path';
+import { promises as fs, createReadStream, existsSync, mkdirSync } from 'fs';
+import { createHash } from 'crypto';
+import AdmZip from 'adm-zip';
+import { DatabaseSync } from 'node:sqlite';
+import type { ApiContext} from './api-context';
+import { BaseApiController } from './api-context';
+import { normalizePath } from '../../utils/path-utils';
+import { pluginDataDir, getModelsRootDir, SKILLS_DIR } from '../../config/paths';
+
+const storeInstances = new Map<string, Store>();
+
+export async function resolveStore(pluginId: string, context?: ApiContext): Promise<Store> {
+  const { PluginManager } = await import('../plugin-manager.js');
+  const plugin = PluginManager.getInstance().getPlugin(pluginId);
+  const manifest = plugin?.manifest;
+  const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+
+  let wsPath: string | null = null;
+  if (scope === 'workspace') {
+    const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+    if (context?.sender) {
+      wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
+    } else {
+      wsPath = WorkspaceManager.getInstance().getPath(null);
+    }
+  }
+
+  const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+  const cacheKey = wsPath ? `${wsPath}::${pluginId}` : pluginId;
+
+  if (!storeInstances.has(cacheKey)) {
+    const options: any = { name: `plugin_store_${cleanPluginId}` };
+    if (wsPath) {
+      const dataDir = join(wsPath, '.berrytrace', 'plugins', 'data', cleanPluginId);
+      if (!existsSync(dataDir)) {
+        mkdirSync(dataDir, { recursive: true });
+      }
+      options.cwd = dataDir;
+      options.name = 'config';
+    }
+    storeInstances.set(cacheKey, new Store(options));
+  }
+  return storeInstances.get(cacheKey)!;
+}
+
+// Keep getPluginStore for backward compatibility (defaults to global store)
+export function getPluginStore(pluginId: string): Store {
+  const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+  if (!storeInstances.has(pluginId)) {
+    storeInstances.set(pluginId, new Store({ name: `plugin_store_${cleanPluginId}` }));
+  }
+  return storeInstances.get(pluginId)!;
+}
+
+class PluginDbManager {
+  private static dbs = new Map<string, DatabaseSync>();
+
+  public static async getDbPath(pluginId: string, context?: ApiContext): Promise<string> {
+    const { PluginManager } = await import('../plugin-manager.js');
+    const plugin = PluginManager.getInstance().getPlugin(pluginId);
+    const manifest = plugin?.manifest;
+    const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+
+    let wsPath: string | null = null;
+    if (scope === 'workspace') {
+      const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+      if (context?.sender) {
+        wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
+      } else {
+        wsPath = WorkspaceManager.getInstance().getPath(null);
+      }
+    }
+
+    const cleanPluginId = pluginId.replace(/[^a-zA-Z0-9-]/g, '_');
+    let dataDir: string;
+    if (wsPath) {
+      dataDir = join(wsPath, '.berrytrace', 'plugins', 'data', cleanPluginId);
+    } else {
+      dataDir = pluginDataDir(cleanPluginId);
+    }
+
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir, { recursive: true });
+    }
+    return join(dataDir, 'db.sqlite');
+  }
+
+  public static async getDb(pluginId: string, context?: ApiContext): Promise<DatabaseSync> {
+    const { PluginManager } = await import('../plugin-manager.js');
+    const plugin = PluginManager.getInstance().getPlugin(pluginId);
+    const manifest = plugin?.manifest;
+    const scope = manifest?.scope || (manifest?.type === 'background' || manifest?.type === 'main' ? 'global' : 'workspace');
+
+    let wsPath: string | null = null;
+    if (scope === 'workspace') {
+      const { WorkspaceManager } = await import('../../services/workspace-manager.js');
+      if (context?.sender) {
+        wsPath = WorkspaceManager.getInstance().getPathForWebContents(context.sender);
+      } else {
+        wsPath = WorkspaceManager.getInstance().getPath(null);
+      }
+    }
+
+    const cacheKey = wsPath ? `${wsPath}::${pluginId}` : pluginId;
+
+    if (this.dbs.has(cacheKey)) {
+      return this.dbs.get(cacheKey)!;
+    }
+
+    const dbPath = await this.getDbPath(pluginId, context);
+    const db = new DatabaseSync(dbPath);
+    this.dbs.set(cacheKey, db);
+    return db;
+  }
+}
+
+async function executePluginSql(pluginId: string, sql: string, params: unknown[] = [], context?: ApiContext): Promise<unknown> {
+  const sqlClean = sql.trim();
+  const isQuery = /^\s*SELECT/i.test(sqlClean) || /^\s*PRAGMA/i.test(sqlClean);
+
+  try {
+    if (isQuery) {
+      const db = await PluginDbManager.getDb(pluginId, context);
+      const stmt = db.prepare(sql);
+      return stmt.all(...(params as any[]));
+    } else {
+      const dbPath = await PluginDbManager.getDbPath(pluginId, context);
+      const { DatabaseWriter } = await import('../../services/db-writer.js');
+      const result = await DatabaseWriter.getInstance().execute(dbPath, sql, params as any[]);
+      return {
+        lastInsertRowid: Number(result.lastInsertRowid),
+        lastID: Number(result.lastInsertRowid),
+        changes: Number(result.changes)
+      };
+    }
+  } catch (err) {
+    console.error(`[PluginDb] SQL error in plugin "${pluginId}":`, err);
+    throw err;
+  }
+}
+
+export class StorageController extends BaseApiController {
+  // ── storage.kv namespace ──
+
+  /**
+   * 读取键值对数据。
+   * @param key 键名
+   * @param defaultValue 键不存在时返回的默认值
+   */
+  async storage_kv_get(key: string, defaultValue: unknown, context: ApiContext): Promise<unknown> {
+    const store = await resolveStore(context.pluginId, context);
+    return store.get(key, defaultValue);
+  }
+
+  /**
+   * 写入键值对数据，会覆盖已有值。
+   * @param key 键名
+   * @param value 值（任意 JSON 可序列化类型）
+   */
+  async storage_kv_set(key: string, value: unknown, context: ApiContext): Promise<null> {
+    const store = await resolveStore(context.pluginId, context);
+    store.set(key, value);
+    return null;
+  }
+
+  /**
+   * 删除指定键值对。
+   * @param key 键名
+   */
+  async storage_kv_delete(key: string, context: ApiContext): Promise<null> {
+    const store = await resolveStore(context.pluginId, context);
+    store.delete(key);
+    return null;
+  }
+
+  /**
+   * 清空当前插件所有键值对数据。
+   */
+  async storage_kv_clear(context: ApiContext): Promise<null> {
+    const store = await resolveStore(context.pluginId, context);
+    store.clear();
+    return null;
+  }
+
+  // ── storage.db namespace ──
+
+  /**
+   * 执行 SQL 语句。SELECT / PRAGMA 返回查询结果数组，其他语句返回 lastInsertRowid 和 changes。
+   * @param sql SQL 语句
+   * @param params 参数化查询的参数数组
+   */
+  async storage_db_execute(sql: string, params: unknown[], context: ApiContext): Promise<unknown> {
+    return executePluginSql(context.pluginId, sql, params || [], context);
+  }
+
+  /**
+   * 执行 SQL 语句（别名，与 execute 行为一致）。
+   * @param sql SQL 语句
+   * @param params 参数化查询的参数数组
+   */
+  async storage_db_run(sql: string, params: unknown[], context: ApiContext): Promise<unknown> {
+    return executePluginSql(context.pluginId, sql, params || [], context);
+  }
+
+  // ── filesystem namespace ──
+
+  /**
+   * 读取文件内容。
+   * @param path 文件路径
+   * @param encoding 编码，默认 'utf-8'，可选 'base64'
+   */
+  async filesystem_readFile(path: string, encoding?: string): Promise<string> {
+    const filePath = normalizePath(path);
+    const enc = encoding || 'utf-8';
+    try {
+      const buffer = await fs.readFile(filePath);
+      return enc === 'base64' ? buffer.toString('base64') : buffer.toString('utf-8');
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        // 诊断：文件不存在时记录详细上下文，帮助定位是真正的文件不存在还是竞态条件
+        let parentExists = 'unknown';
+        let fileStat = 'unknown';
+        try {
+          const stat = await fs.stat(filePath);
+          fileStat = JSON.stringify({ isFile: stat.isFile(), isDirectory: stat.isDirectory(), size: stat.size });
+        } catch (statErr: any) {
+          fileStat = `stat failed: ${statErr.code || statErr.message}`;
+          // 检查父目录
+            const parentDir = dirname(filePath);
+            try {
+              await fs.access(parentDir);
+            parentExists = 'yes';
+          } catch {
+            parentExists = 'no';
+          }
+        }
+        console.error(
+          `[StorageController:filesystem_readFile:ENOENT] File not found.\n` +
+          `  requestedPath: "${path}"\n` +
+          `  normalizedPath: "${filePath}"\n` +
+          `  fileStat: ${fileStat}\n` +
+          `  parentDirExists: ${parentExists}\n` +
+          `  encoding: "${enc}"`
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * 列出目录下的文件和子目录。
+   * @param path 目录路径
+   * @returns 文件/目录列表，每项包含 name、isDirectory、isFile
+   */
+  async filesystem_readDir(path: string): Promise<Array<{ name: string; isDirectory: boolean; isFile: boolean }>> {
+    const dirPath = normalizePath(path);
+    const files = await fs.readdir(dirPath, { withFileTypes: true });
+    return files.map(f => ({
+      name: f.name,
+      isDirectory: f.isDirectory(),
+      isFile: f.isFile()
+    }));
+  }
+
+  /**
+   * 获取文件或目录的元信息。
+   * @param path 路径
+   * @returns isFile、isDirectory、size（字节）、mtimeMs（修改时间毫秒戳）
+   */
+  async filesystem_stat(path: string): Promise<{ isFile: boolean; isDirectory: boolean; size: number; mtimeMs: number }> {
+    const filePath = normalizePath(path);
+    const s = await fs.stat(filePath);
+    return {
+      isFile: s.isFile(),
+      isDirectory: s.isDirectory(),
+      size: s.size,
+      mtimeMs: s.mtimeMs,
+    };
+  }
+
+  /**
+   * 递归创建目录。
+   * @param path 目录路径
+   */
+  async filesystem_mkdir(path: string): Promise<null> {
+    const dirPath = normalizePath(path);
+    await fs.mkdir(dirPath, { recursive: true });
+    return null;
+  }
+
+  /**
+   * 写入文件内容（覆盖已有文件）。
+   * @param path 文件路径
+   * @param content 文件内容（字符串或 Buffer）
+   */
+  async filesystem_writeFile(path: string, content: string | Buffer): Promise<null> {
+    const filePath = normalizePath(path);
+    await fs.writeFile(filePath, content);
+    return null;
+  }
+
+  /**
+   * 重命名/移动文件。
+   * @param oldPath 原路径
+   * @param newPath 新路径
+   */
+  async filesystem_renameFile(oldPath: string, newPath: string): Promise<null> {
+    const op = normalizePath(oldPath);
+    const np = normalizePath(newPath);
+    await fs.rename(op, np);
+    return null;
+  }
+
+  /**
+   * 删除文件。
+   * @param path 文件路径
+   */
+  async filesystem_deleteFile(path: string): Promise<null> {
+    const filePath = normalizePath(path);
+    await fs.unlink(filePath);
+    return null;
+  }
+
+  /**
+   * 获取系统安全路径。仅允许 userData / documents / desktop / temp。
+   * @param name 路径名：'userData' | 'documents' | 'desktop' | 'temp'
+   */
+  async filesystem_getSafePath(name: string, context?: ApiContext): Promise<string> {
+    if (name === 'models') {
+      return getModelsRootDir();
+    }
+    if (name === 'skills') {
+      return SKILLS_DIR;
+    }
+    if (name === 'userData' || name === 'documents' || name === 'desktop' || name === 'temp') {
+      return app.getPath(name);
+    }
+    if (name === 'pluginData') {
+      const cleanId = (context?.pluginId || '').replace(/[^a-zA-Z0-9-]/g, '_');
+      const dir = pluginDataDir(cleanId);
+      await fs.mkdir(dir, { recursive: true });
+      return dir;
+    }
+    throw new Error(`Unauthorized filesystem path request: ${name}`);
+  }
+
+  /**
+   * 在系统文件管理器中显示文件。
+   * @param path 文件路径
+   */
+  async filesystem_showItemInFolder(path: string): Promise<null> {
+    shell.showItemInFolder(path);
+    return null;
+  }
+
+  /**
+   * 解压 zip 文件到目标目录。内置 Zip Slip 安全检查。
+   * @param zipPath zip 文件路径
+   * @param destDir 目标目录
+   * @param overwrite 是否覆盖已有文件，默认 true
+   */
+  async filesystem_extractZip(zipPath: string, destDir: string, overwrite?: boolean): Promise<null> {
+    const zp = normalizePath(zipPath);
+    const dd = normalizePath(destDir);
+    const ow = overwrite !== false; // 默认 true
+
+    const zip = new AdmZip(zp);
+    // Zip Slip 安全检查
+    for (const entry of zip.getEntries()) {
+      const targetPath = resolve(dd, entry.entryName);
+      const rel = relative(dd, targetPath);
+      if (rel.startsWith('..') || isAbsolute(rel)) {
+        throw new Error(`Zip Slip attack detected: ${entry.entryName}`);
+      }
+    }
+    zip.extractAllTo(dd, ow);
+    return null;
+  }
+
+  /**
+   * 递归复制目录。
+   * @param srcPath 源目录路径
+   * @param dstPath 目标目录路径
+   */
+  async filesystem_copyDir(srcPath: string, dstPath: string): Promise<null> {
+    const src = normalizePath(srcPath);
+    const dst = normalizePath(dstPath);
+    await fs.cp(src, dst, { recursive: true, force: true });
+    return null;
+  }
+
+  /**
+   * 递归删除目录。
+   * @param dirPath 目录路径
+   */
+  async filesystem_removeDir(dirPath: string): Promise<null> {
+    const dp = normalizePath(dirPath);
+    await fs.rm(dp, { recursive: true, force: true });
+    return null;
+  }
+
+  /**
+   * 计算文件的哈希值。
+   * @param filePath 文件路径
+   * @param algorithm 哈希算法，默认 'sha256'
+   * @returns 十六进制哈希字符串
+   */
+  async filesystem_hashFile(filePath: string, algorithm?: string): Promise<string> {
+    const fp = normalizePath(filePath);
+    const algo = algorithm || 'sha256';
+    return new Promise<string>((resolvePromise, rejectPromise) => {
+      const hash = createHash(algo);
+      const stream = createReadStream(fp);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('end', () => resolvePromise(hash.digest('hex')));
+      stream.on('error', rejectPromise);
+    });
+  }
+
+  /**
+   * 下载文件到本地。自动创建目标目录。
+   * @param url 下载 URL
+   * @param destPath 目标文件路径
+   */
+  /**
+   * 下载文件到本地。自动创建目标目录。
+   * @param url 下载 URL
+   * @param destPath 目标文件路径
+   */
+  async filesystem_downloadFile(url: string, destPath: string): Promise<null> {
+    const dp = normalizePath(destPath);
+    const response = await net.fetch(url, { redirect: 'follow' });
+    if (!response.ok) {
+      throw new Error(`Download failed: HTTP ${response.status} ${response.statusText}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    await fs.mkdir(join(dp, '..'), { recursive: true });
+    await fs.writeFile(dp, Buffer.from(arrayBuffer));
+    return null;
+  }
+
+  /**
+   * 按需切片读取文件。只读取指定 offset 和 length 范围的 Buffer，绝不全量装载超大文件。
+   */
+  async filesystem_readChunk(filePath: string, offset = 0, length = 512, encoding = 'base64'): Promise<string> {
+    const fp = normalizePath(filePath);
+    const fd = await fs.open(fp, 'r');
+    try {
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await fd.read(buffer, 0, length, offset);
+      const readBuf = buffer.subarray(0, bytesRead);
+      return encoding === 'base64' ? readBuf.toString('base64') : readBuf.toString('utf-8');
+    } finally {
+      await fd.close();
+    }
+  }
+
+  /**
+   * 获取指定文件/程序的原生 OS 图标（Base64 PNG data URL）。
+   */
+  async filesystem_getFileIcon(filePath: string): Promise<string> {
+    try {
+      const fp = normalizePath(filePath);
+      if (!existsSync(fp)) return '';
+      const icon = await app.getFileIcon(fp, { size: 'normal' });
+      return icon ? icon.toDataURL() : '';
+    } catch {
+      return '';
+    }
+  }
+}
+

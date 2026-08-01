@@ -1,0 +1,141 @@
+import { watch, type FSWatcher } from 'chokidar';
+import { homedir } from 'os';
+import { join } from 'path';
+import { BrowserWindow } from 'electron';
+
+/**
+ * PluginHotReload
+ * Dev 模式专用：监听 ~/.berrytrace/plugins/ 目录下所有插件的 dist/index.js 变化，
+ * 自动触发插件进程热重载，无需手动重启整个 App。
+ *
+ * 原理：
+ *  1. chokidar 监听 pluginsDir/*\/dist/index.js
+ *  2. 文件变化 → 500ms 防抖 → PluginManager.reloadPlugin(pluginId)
+ *  3. 通知所有 Renderer 窗口 plugin:hot-reloaded 事件
+ */
+export class PluginHotReload {
+  private static instance: PluginHotReload | null = null;
+  private watcher: FSWatcher | null = null;
+  private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pluginsDir: string;
+
+  private isStopped = false;
+
+  private constructor() {
+    this.pluginsDir = join(homedir(), '.berrytrace', 'plugins');
+  }
+
+  public static getInstance(): PluginHotReload {
+    if (!PluginHotReload.instance) {
+      PluginHotReload.instance = new PluginHotReload();
+    }
+    return PluginHotReload.instance;
+  }
+
+  public start(): void {
+    if (this.watcher) return;
+    this.isStopped = false;
+
+    console.log(`[PluginHotReload] 👀 Watching directory: ${this.pluginsDir}`);
+    this.watcher = watch(this.pluginsDir, {
+      ignoreInitial: true,
+      ignored: [
+        /node_modules/,
+        /\.git/,
+        /[/\\]src[/\\]/,
+        /[/\\]tests[/\\]/,
+        /[/\\]cline[/\\]/,
+        /\.kanban/,
+      ],
+      awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
+    });
+
+    this.watcher.on('all', (event: string, filePath: string) => {
+      if (this.isStopped) return;
+      if (!['add', 'change', 'unlink'].includes(event)) return;
+
+      const isPluginJson = filePath.endsWith('plugin.json');
+      const isInDist = /[\\\/]dist[\\\/].*\.js$/.test(filePath);
+      if (!isPluginJson && !isInDist) return;
+
+      const pluginId = this.extractPluginId(filePath);
+      if (!pluginId) return;
+
+      // 防抖：500ms 内多次写入只触发一次
+      const existing = this.debounceTimers.get(pluginId);
+      if (existing) clearTimeout(existing);
+      this.debounceTimers.set(
+        pluginId,
+        setTimeout(() => {
+          this.debounceTimers.delete(pluginId);
+          if (!this.isStopped) {
+            this.handleChange(pluginId, filePath);
+          }
+        }, 500),
+      );
+    });
+
+    this.watcher.on('error', (err: unknown) => {
+      console.error('[PluginHotReload] Watcher error:', err);
+    });
+  }
+
+  public stop(): void {
+    this.isStopped = true;
+    this.debounceTimers.forEach(t => clearTimeout(t));
+    this.debounceTimers.clear();
+    if (this.watcher) {
+      try {
+        this.watcher.close();
+      } catch (err) {
+        console.error('[PluginHotReload] Error closing watcher:', err);
+      }
+      this.watcher = null;
+    }
+    console.log('[PluginHotReload] Stopped.');
+  }
+
+  private extractPluginId(filePath: string): string | null {
+    // ~/.berrytrace/plugins/<plugin-id>/dist/index.js
+    const normalized = filePath.replace(/\\/g, '/');
+    const pluginsBase = this.pluginsDir.replace(/\\/g, '/');
+    if (!normalized.startsWith(pluginsBase)) return null;
+    const relative = normalized.slice(pluginsBase.length + 1); // "com.xxx.plugin/dist/index.js"
+    const pluginId = relative.split('/')[0];
+    return pluginId || null;
+  }
+
+  private async handleChange(pluginId: string, filePath: string): Promise<void> {
+    if (this.isStopped) return;
+    console.log(`[PluginHotReload] 🔄 Detected change in "${pluginId}" → ${filePath}`);
+
+    try {
+      const { PluginManager } = await import('./plugin-manager.js');
+      const pm = PluginManager.getInstance();
+
+      const plugin = pm.getPlugin(pluginId);
+      if (!plugin) {
+        console.warn(`[PluginHotReload] Plugin "${pluginId}" not found in registry, skipping reload.`);
+        return;
+      }
+
+      const reloaded = await pm.reloadPlugin(pluginId);
+      if (reloaded) {
+        console.log(`[PluginHotReload] ✅ Plugin "${pluginId}" reloaded successfully.`);
+        this.broadcastReloaded(pluginId);
+      } else {
+        console.warn(`[PluginHotReload] ⚠️ Plugin "${pluginId}" reload returned false (busy or skipped).`);
+      }
+    } catch (err) {
+      console.error(`[PluginHotReload] ❌ Failed to reload "${pluginId}":`, err);
+    }
+  }
+
+  private broadcastReloaded(pluginId: string): void {
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('plugin:hot-reloaded', { pluginId, timestamp: Date.now() });
+      }
+    });
+  }
+}

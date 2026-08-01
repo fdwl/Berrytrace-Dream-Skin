@@ -1,0 +1,26 @@
+diff --git a/electron/plugins/plugin-url-helper.ts b/electron/plugins/plugin-url-helper.ts
+index eca4cc8..d278e63 100644
+--- a/electron/plugins/plugin-url-helper.ts
++++ b/electron/plugins/plugin-url-helper.ts
+@@ -1,9 +1,10 @@
+ import { nativeTheme } from 'electron';
+-import { PluginManager } from './plugin-manager';
+-import { ScannedPlugin } from './plugin-scanner';
++import type { PluginManager } from './plugin-manager';
++import type { ScannedPlugin } from './plugin-scanner';
+ import { cache } from '../config/index';
+ import { CacheAttribute } from '../../src/config/CacheAttribute';
+-import { ElectronFloatBall } from '../windows/float-ball';
++import { ElectronFloatWeb } from '../windows/float-web';
++import { app } from 'electron';
+ 
+ export function getPluginsByExtension(pm: PluginManager, ext: string): ScannedPlugin[] {
+   const extLower = ext.toLowerCase().replace(/^\./, '');
+@@ -60,6 +61,6 @@ export async function openPluginWindow(pm: PluginManager, pluginId: string, quer
+   await pm.ensurePluginLoaded(pluginId);
+   const viewUrl = await getResolvedUrl(pm, pluginId, queryParams);
+   if (!viewUrl) return false;
+-  ElectronFloatBall.getInstance().openFloatWebWindow(viewUrl, false);
++  ElectronFloatWeb.getInstance().openFloatWebWindow(viewUrl, false);
+   return true;
+ }

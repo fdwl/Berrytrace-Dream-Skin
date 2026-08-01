@@ -1,0 +1,475 @@
+import { app, net } from 'electron';
+import * as path from 'path';
+import * as fs from 'fs';
+import { verifyPackage, confirmInstallPackage } from '../plugins/plugin-install';
+import { PluginManager } from '../plugins/plugin-manager';
+import { cache } from '../config/index';
+import { getModelsRootDir, PLUGINS_DIR } from '../config/paths';
+
+export type DownloadTaskStatus = 'pending' | 'downloading' | 'completed' | 'failed';
+
+export interface DownloadItem {
+  id: string;
+  name: string;
+  type: 'plugin' | 'model';
+  purpose: string;
+  status: DownloadTaskStatus;
+  progress: number;
+  downloadUrl: string;
+  destination: string;
+  /** 失败原因，仅在 status === 'failed' 时有值 */
+  error?: string;
+}
+
+class OnboardingDownloadManager {
+  private static instance: OnboardingDownloadManager | null = null;
+  private items: DownloadItem[] = [];
+  private isDownloading = false;
+  private hasFetched = false;
+
+  private constructor() {
+    this.cleanStaleFiles();
+    this.initItems();
+    this.registerProgressListener();
+  }
+
+  public static getInstance(): OnboardingDownloadManager {
+    if (!OnboardingDownloadManager.instance) {
+      OnboardingDownloadManager.instance = new OnboardingDownloadManager();
+    }
+    return OnboardingDownloadManager.instance;
+  }
+
+  private initItems() {
+    this.items = [];
+  }
+
+  private registerProgressListener() {
+    // voice-assistant 插件模型下载进度不再由 onboarding 管理，
+    // 模型下载由 voice 插件在 activate() 中自治处理
+  }
+
+  private saveState() {
+    try {
+      const state = {
+        lastUpdated: Date.now(),
+        items: this.items.map(item => ({
+          id: item.id,
+          status: item.status,
+          progress: item.progress,
+          error: item.error,
+        })),
+      };
+      cache.set('onboardingDownloadState', state);
+      console.log('[OnboardingDownload:saveState] Saved download state to cache.');
+    } catch (err) {
+      console.error('[OnboardingDownload:saveState] Failed to save state:', err);
+    }
+  }
+
+  private loadState(): Array<{ id: string; status: DownloadTaskStatus; progress: number }> | null {
+    try {
+      const state = cache.get<{ items: Array<{ id: string; status: DownloadTaskStatus; progress: number }> }>('onboardingDownloadState');
+      if (state && Array.isArray(state.items)) {
+        return state.items;
+      }
+    } catch (err) {
+      console.error('[OnboardingDownload:loadState] Failed to load state:', err);
+    }
+    return null;
+  }
+
+  private cleanStaleFiles() {
+    try {
+      console.log('[OnboardingDownload:cleanStaleFiles] Cleaning up stale temp files...');
+      
+      // 1. Clean app temp directory of .btp and .tmp files
+      const tempDir = app.getPath('temp');
+      if (fs.existsSync(tempDir)) {
+        const files = fs.readdirSync(tempDir);
+        for (const file of files) {
+          if (file.endsWith('.btp') || file.endsWith('.tmp') || file.endsWith('.part')) {
+            try {
+              fs.unlinkSync(path.join(tempDir, file));
+            } catch (_e) {
+              // ignore
+            }
+          }
+        }
+      }
+
+      // 2. Clean plugins directory of .new and .old directories
+      if (fs.existsSync(PLUGINS_DIR)) {
+        const dirs = fs.readdirSync(PLUGINS_DIR);
+        for (const dir of dirs) {
+          if (dir.endsWith('.new') || dir.endsWith('.old')) {
+            try {
+              fs.rmSync(path.join(PLUGINS_DIR, dir), { recursive: true, force: true });
+            } catch (_e) {
+              // ignore
+            }
+          }
+        }
+      }
+
+      // 3. Clean speech models temp files
+      const modelBaseDir = getModelsRootDir();
+      const cleanDirRecursive = (dirPath: string) => {
+        if (!fs.existsSync(dirPath)) return;
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(dirPath, entry.name);
+          if (entry.isDirectory()) {
+            cleanDirRecursive(fullPath);
+          } else if (entry.name.endsWith('.tmp') || entry.name.endsWith('.part')) {
+            try {
+              fs.unlinkSync(fullPath);
+            } catch (_e) {
+              // ignore
+            }
+          }
+        }
+      };
+      cleanDirRecursive(modelBaseDir);
+      
+    } catch (err) {
+      console.warn('[OnboardingDownload:cleanStaleFiles] Error cleaning up stale files:', err);
+    }
+  }
+
+  public getItems(): DownloadItem[] {
+    return this.items;
+  }
+
+  public isFinished(): boolean {
+    // 必须等 startSilentDownloads() 执行完（hasFetched=true）后才能做最终判断
+    // hasFetched=false 表示还没有向服务器请求必装插件列表，状态未知，不能视为完成
+    if (this.hasFetched && this.items.length === 0) {
+      return true; // fetch 完成且无待下载项 → 真正的"无需下载"
+    }
+    // 'failed' 也算终态：允许用户在失败的情况下继续进入主面板，而不是永久卡死
+    return this.items.length > 0 && this.items.every(item =>
+      item.status === 'completed' || item.status === 'failed'
+    );
+  }
+
+  /** 重置指定 item 为 pending 并重新触发 processItem（UI 重试按钮调用） */
+  public async retryItem(itemId: string): Promise<boolean> {
+    const item = this.items.find(x => x.id === itemId);
+    if (!item) {
+      console.warn(`[OnboardingDownload:retryItem] Item not found: ${itemId}`);
+      return false;
+    }
+    if (item.status !== 'failed' && item.status !== 'pending') {
+      console.warn(`[OnboardingDownload:retryItem] Item ${itemId} is not in failed/pending state, skipping retry.`);
+      return false;
+    }
+    console.log(`[OnboardingDownload:retryItem] Retrying item: ${itemId}`);
+    item.status = 'pending';
+    item.progress = 0;
+    item.error = undefined;
+    this.saveState();
+    this.processItem(item).catch(err => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[OnboardingDownload:retryItem] Error retrying ${itemId}:`, err);
+      item.status = 'failed';
+      item.error = errMsg;
+      this.saveState();
+    });
+    return true;
+  }
+
+  public async startSilentDownloads() {
+    if (this.isDownloading) {
+      console.log('[OnboardingDownload:startSilentDownloads] Silent downloads already in progress.');
+      return;
+    }
+    this.isDownloading = true;
+
+    // Await PluginManager initialization so all scanned plugins (both dev and prod) are fully loaded
+    console.log('[OnboardingDownload:startSilentDownloads] Waiting for PluginManager initialization...');
+    await PluginManager.getInstance().init();
+    console.log('[OnboardingDownload:startSilentDownloads] PluginManager initialized.');
+
+    console.log('[OnboardingDownload:startSilentDownloads] Fetching required plugins list from server...');
+
+    try {
+      const response = await net.fetch('https://berrytrace.getdear.cn/api/v1/plugins/install_required');
+      if (response.ok) {
+        const json = await response.json() as { code?: number; data?: Array<{ id: string; name: string; description?: string; downloadUrl?: string }> | { list?: Array<{ id: string; name: string; description?: string; downloadUrl?: string }> } };
+        if (json && json.code === 200) {
+          const rawList = Array.isArray(json.data) ? json.data : (json.data && 'list' in json.data && Array.isArray(json.data.list) ? json.data.list : null);
+          if (rawList) {
+            console.log(`[OnboardingDownload:startSilentDownloads] Fetched ${rawList.length} required plugins from server.`);
+            
+            this.items = this.items.filter(item => item.type !== 'plugin');
+
+            rawList.forEach((plugin: { id: string; name: string; description?: string; downloadUrl?: string }) => {
+              const destName = plugin.id.replace('com.berrytrace.plugin.', '');
+              this.items.push({
+                id: plugin.id,
+                name: plugin.name,
+                type: 'plugin',
+                purpose: plugin.description || '莓莓官方推荐的核心插件组件',
+                status: 'pending',
+                progress: 0,
+                downloadUrl: plugin.downloadUrl || '',
+                destination: destName
+              });
+            });
+          } else {
+            console.warn(`[OnboardingDownload:startSilentDownloads] Non-200 or invalid data from install_required API. Code: ${json?.code}.`);
+          }
+        } else {
+          console.warn(`[OnboardingDownload:startSilentDownloads] Non-200 or invalid data from install_required API. Code: ${json?.code}.`);
+        }
+      } else {
+        console.warn(`[OnboardingDownload:startSilentDownloads] Failed to fetch install_required plugins, status: ${response.status}.`);
+      }
+    } catch (err) {
+      console.error('[OnboardingDownload:startSilentDownloads] Error fetching install_required API:', err);
+    } finally {
+      this.hasFetched = true;
+    }
+
+    // Restore state from cache
+    const persisted = this.loadState();
+    if (persisted) {
+      this.items.forEach(item => {
+        const match = persisted.find(p => p.id === item.id);
+        if (match) {
+          item.status = match.status;
+          item.progress = match.progress;
+        }
+      });
+    }
+
+    // Verify local installation state（插件 zip 安装完成即视为完成，不再检查模型文件）
+    for (const item of this.items) {
+      const plugin = PluginManager.getInstance().getPlugin(item.id);
+      if (plugin) {
+        item.status = 'completed';
+        item.progress = 100;
+      } else if (item.status === 'completed') {
+        // Reset if it was marked complete but plugin is actually missing
+        item.status = 'pending';
+        item.progress = 0;
+      }
+    }
+    this.saveState();
+
+    console.log('[OnboardingDownload:startSilentDownloads] Starting parallel silent downloads...');
+    this.items.forEach(item => {
+      this.processItem(item).catch(err => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[OnboardingDownload:processItem] Error processing ${item.id}:`, err);
+        item.status = 'failed';
+        item.error = errMsg;
+        this.saveState();
+      });
+    });
+  }
+
+  private async processItem(item: DownloadItem): Promise<void> {
+    if (item.status === 'completed') return;
+
+    // Ensure PluginManager is ready before querying
+    await PluginManager.getInstance().init();
+
+    // Check if plugin is already scanned/installed locally
+    const plugin = PluginManager.getInstance().getPlugin(item.id);
+
+    if (plugin) {
+      console.log(`[OnboardingDownload:processItem] Plugin ${item.id} already exists locally.`);
+      item.status = 'completed';
+      item.progress = 100;
+      this.saveState();
+      // Auto-enable the plugin
+      try {
+        if (!PluginManager.getInstance().isPluginEnabled(item.id)) {
+          await PluginManager.getInstance().togglePlugin(item.id, true);
+        }
+      } catch (err) {
+        console.error(`[OnboardingDownload:processItem] Failed to enable plugin ${item.id}:`, err);
+      }
+      return;
+    }
+
+    if (item.type === 'model') {
+      if (fs.existsSync(item.destination) && fs.statSync(item.destination).size > 1000) {
+        console.log(`[OnboardingDownload:processItem] Model ${item.id} already exists locally.`);
+        item.status = 'completed';
+        item.progress = 100;
+        this.saveState();
+        return;
+      }
+
+      item.status = 'downloading';
+      this.saveState();
+      try {
+        await this.downloadFile(item);
+        console.log(`[OnboardingDownload:processItem] Successfully downloaded model: ${item.id}`);
+      } catch (err) {
+        console.warn(`[OnboardingDownload:processItem] Failed downloading model ${item.id}:`, err);
+        item.status = 'failed';
+        item.error = err instanceof Error ? err.message : `下载模型失败: ${String(err)}`;
+        this.saveState();
+      }
+    } else {
+      item.status = 'downloading';
+      this.saveState();
+      try {
+        await this.downloadAndInstallPluginPackage(item);
+        console.log(`[OnboardingDownload:processItem] Successfully downloaded and installed plugin: ${item.id}`);
+        // Auto-enable the plugin
+        try {
+          await PluginManager.getInstance().togglePlugin(item.id, true);
+        } catch (err) {
+          console.error(`[OnboardingDownload:processItem] Failed to enable plugin ${item.id}:`, err);
+        }
+      } catch (err) {
+        console.warn(`[OnboardingDownload:processItem] Remote plugin download/install failed for ${item.id}:`, err);
+        item.status = 'failed';
+        item.error = err instanceof Error ? err.message : `下载/安装插件失败: ${String(err)}`;
+        this.saveState();
+      }
+    }
+  }
+
+  private async downloadAndInstallPluginPackage(item: DownloadItem): Promise<void> {
+    await PluginManager.getInstance().init();
+    const plugin = PluginManager.getInstance().getPlugin(item.id);
+    if (plugin) {
+      console.log(`[OnboardingDownload:downloadAndInstallPluginPackage] Plugin ${item.id} already exists locally. Skipping download/install.`);
+      item.status = 'completed';
+      item.progress = 100;
+      this.saveState();
+      return;
+    }
+
+    const tempPkgPath = path.join(app.getPath('temp'), `${item.id}-${Date.now()}.btp`);
+    
+    const originalDest = item.destination;
+    item.destination = tempPkgPath;
+    try {
+      await this.downloadFile(item);
+    } finally {
+      item.destination = originalDest;
+    }
+
+    const packageInfo = await verifyPackage(tempPkgPath);
+    if (packageInfo.success && packageInfo.tempDir && packageInfo.manifest) {
+      const success = await confirmInstallPackage(
+        packageInfo.tempDir,
+        tempPkgPath,
+        packageInfo.manifest.id,
+        packageInfo.signature
+      );
+      try { fs.unlinkSync(tempPkgPath); } catch {
+        // ignore
+      }
+      if (success) {
+        item.status = 'completed';
+        item.progress = 100;
+        this.saveState();
+        return;
+      }
+    }
+    throw new Error(`Failed to install plugin package: ${item.id}`);
+  }
+
+  private downloadFile(item: DownloadItem, retriesLeft = 3): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        const destDir = path.dirname(item.destination);
+        if (!fs.existsSync(destDir)) {
+          fs.mkdirSync(destDir, { recursive: true });
+        }
+
+        const tempDest = `${item.destination}.tmp`;
+        let existingSize = 0;
+        if (fs.existsSync(tempDest)) {
+          existingSize = fs.statSync(tempDest).size;
+        }
+
+        const request = net.request({ url: item.downloadUrl, redirect: 'follow' });
+        
+        if (existingSize > 0) {
+          request.setHeader('Range', `bytes=${existingSize}-`);
+          console.log(`[OnboardingDownload] Resuming download for ${item.id} from byte ${existingSize}`);
+        }
+
+        request.on('response', (response) => {
+          let fileStream: fs.WriteStream;
+          let downloaded = 0;
+          let contentLength = 0;
+
+          if (response.statusCode === 206) {
+            fileStream = fs.createWriteStream(tempDest, { flags: 'a' });
+            downloaded = existingSize;
+            const rangeLength = parseInt(response.headers['content-length'] as string || '0', 10);
+            contentLength = rangeLength + existingSize;
+            console.log(`[OnboardingDownload] Server accepted Range request. Total size to download: ${contentLength}`);
+          } else if (response.statusCode === 200) {
+            fileStream = fs.createWriteStream(tempDest, { flags: 'w' });
+            downloaded = 0;
+            contentLength = parseInt(response.headers['content-length'] as string || '0', 10);
+            console.log(`[OnboardingDownload] Server returned 200. Downloading full file: ${contentLength}`);
+          } else if (response.statusCode === 416) {
+            console.warn(`[OnboardingDownload] Range 416 for ${item.id}. Clearing temp file and restarting.`);
+            try { fs.unlinkSync(tempDest); } catch {
+              // ignore
+            }
+            if (retriesLeft <= 0) {
+              reject(new Error('Server returned 416 Range Not Satisfiable repeatedly'));
+              return;
+            }
+            // Retry download with 0 size
+            this.downloadFile({ ...item }, retriesLeft - 1).then(resolve).catch(reject);
+            return;
+          } else {
+            reject(new Error(`HTTP status ${response.statusCode}`));
+            return;
+          }
+
+          response.on('data', (chunk) => {
+            fileStream.write(chunk);
+            downloaded += chunk.length;
+            if (contentLength > 0) {
+              item.progress = Math.round((downloaded / contentLength) * 100);
+            }
+          });
+
+          response.on('end', () => {
+            fileStream.end(() => {
+              try {
+                if (fs.existsSync(item.destination)) {
+                  fs.unlinkSync(item.destination);
+                }
+                fs.renameSync(tempDest, item.destination);
+                item.status = 'completed';
+                item.progress = 100;
+                this.saveState();
+                resolve();
+              } catch (err) {
+                reject(err);
+              }
+            });
+          });
+        });
+
+        request.on('error', (err) => {
+          reject(err);
+        });
+
+        request.end();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+
+}
+
+export const onboardingDownloadManager = OnboardingDownloadManager.getInstance();

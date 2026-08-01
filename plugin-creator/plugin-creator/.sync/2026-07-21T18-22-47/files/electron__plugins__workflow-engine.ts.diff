@@ -1,0 +1,785 @@
+diff --git a/electron/plugins/workflow-engine.ts b/electron/plugins/workflow-engine.ts
+new file mode 100644
+index 0000000..a62e9ef
+--- /dev/null
++++ b/electron/plugins/workflow-engine.ts
+@@ -0,0 +1,779 @@
++import { EventEmitter } from 'events';
++import { McpHost } from './mcp-host';
++import {
++  WorkflowDefinition,
++  WorkflowStep,
++  WorkflowExecutionContext,
++  WorkflowExecutionResult,
++  StepExecutionResult,
++} from './workflow-types';
++import * as fs from 'fs';
++import * as path from 'path';
++
++export interface RunStatus {
++  runId: string;
++  workflowId: string;
++  status: 'running' | 'paused' | 'completed' | 'failed' | 'canceled';
++  currentStepIndex: number;
++  totalSteps: number;
++  currentStepId?: string;
++  startedAt: number;
++  elapsedMs: number;
++  stepResults: StepExecutionResult[];
++}
++
++export class WorkflowEngine extends EventEmitter {
++  private static instance: WorkflowEngine | null = null;
++  private workflows = new Map<string, WorkflowDefinition>();
++  private activeExecutions = new Map<string, AbortController>();
++  private pausedRuns = new Set<string>();
++  private runStatuses = new Map<string, RunStatus>();
++
++  private constructor() {
++    super();
++  }
++
++  public static getInstance(): WorkflowEngine {
++    if (!WorkflowEngine.instance) {
++      WorkflowEngine.instance = new WorkflowEngine();
++    }
++    return WorkflowEngine.instance;
++  }
++
++  /**
++   * 注册 Workflow 定义
++   */
++  public register(definition: WorkflowDefinition): void {
++    if (!definition.id) {
++      throw new Error('[WorkflowEngine] Workflow definition must have an id.');
++    }
++    console.log(`[WorkflowEngine] Registering workflow "${definition.id}" (${definition.name || 'unnamed'})`);
++    this.workflows.set(definition.id, definition);
++  }
++
++  /**
++   * 注销 Workflow 定义
++   */
++  public unregister(workflowId: string, pluginId?: string): boolean {
++    const existing = this.workflows.get(workflowId);
++    if (!existing) return false;
++    if (pluginId && existing.pluginId && existing.pluginId !== pluginId) {
++      throw new Error(`[WorkflowEngine] Plugin "${pluginId}" cannot unregister workflow "${workflowId}" owned by "${existing.pluginId}"`);
++    }
++    this.workflows.delete(workflowId);
++    console.log(`[WorkflowEngine] Unregistered workflow "${workflowId}"`);
++    return true;
++  }
++
++  /**
++   * 插件注销时批量清理该插件注册的所有 Workflow
++   */
++  public unregisterPlugin(pluginId: string): number {
++    let count = 0;
++    for (const [id, def] of Array.from(this.workflows.entries())) {
++      if (def.pluginId === pluginId) {
++        this.workflows.delete(id);
++        count++;
++      }
++    }
++    if (count > 0) {
++      console.log(`[WorkflowEngine] Unregistered ${count} workflow(s) for plugin "${pluginId}"`);
++    }
++    return count;
++  }
++
++  /**
++   * 获取指定的 Workflow 定义
++   */
++  public get(workflowId: string): WorkflowDefinition | undefined {
++    return this.workflows.get(workflowId);
++  }
++
++  /**
++   * 列出已注册的 Workflow 定义
++   */
++  public list(pluginId?: string): WorkflowDefinition[] {
++    const result: WorkflowDefinition[] = [];
++    for (const def of this.workflows.values()) {
++      if (!pluginId || def.pluginId === pluginId) {
++        result.push(def);
++      }
++    }
++    return result;
++  }
++
++  /**
++   * 执行 Workflow（支持实时 IPC 进度推送）
++   */
++  public async execute(
++    workflowId: string,
++    input: Record<string, unknown> = {},
++    triggerType: WorkflowExecutionContext['triggerType'] = 'direct',
++    globalTimeoutMs: number = 600000,
++    startFromStepId?: string // 从指定步骤开始执行
++  ): Promise<WorkflowExecutionResult> {
++    const def = this.workflows.get(workflowId);
++    if (!def) {
++      throw new Error(`[WorkflowEngine] Workflow "${workflowId}" not found.`);
++    }
++
++    const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
++    const startedAt = Date.now();
++    const abortController = new AbortController();
++    this.activeExecutions.set(runId, abortController);
++
++    console.log(`[WorkflowEngine] Starting execution "${runId}" for workflow "${workflowId}" (${triggerType})${startFromStepId ? ` from step "${startFromStepId}"` : ''}`);
++
++    const ctx: WorkflowExecutionContext = { workflowId, runId, input, triggerType, startedAt };
++    const stepResults: StepExecutionResult[] = [];
++    const stepOutputs = new Map<string, unknown>();
++    stepOutputs.set('input', input);
++
++    // 初始化运行状态
++    this.runStatuses.set(runId, {
++      runId, workflowId,
++      status: 'running',
++      currentStepIndex: 0,
++      totalSteps: def.steps.length,
++      startedAt,
++      elapsedMs: 0,
++      stepResults: [],
++    });
++
++    if (def.preflight?.requiredMcpTools) {
++      for (const toolName of def.preflight.requiredMcpTools) {
++        if (!McpHost.getInstance().hasToolHandler(toolName)) {
++          console.warn(`[WorkflowEngine] Preflight warning: tool "${toolName}" may need on-demand lazy load.`);
++        }
++      }
++    }
++
++    let overallSuccess = true;
++    let finalError: string | undefined;
++    let skipUntilStepId = startFromStepId || null;
++
++    const timeoutTimer = setTimeout(() => {
++      abortController.abort();
++      console.error(`[WorkflowEngine] Execution "${runId}" timed out after ${globalTimeoutMs}ms!`);
++    }, globalTimeoutMs);
++
++    this.sendIpcProgress(runId, workflowId, 'workflow_started', null, { totalSteps: def.steps.length, triggerType });
++
++    try {
++      for (let stepIdx = 0; stepIdx < def.steps.length; stepIdx++) {
++        const step = def.steps[stepIdx];
++
++        // 等待恢复（暂停检查，Step 间轮询）
++        await this.waitIfPaused(runId, abortController.signal);
++
++        if (abortController.signal.aborted) {
++          throw new Error('Execution aborted or timed out.');
++        }
++
++        // 从指定步骤开始：跳过之前的步骤
++        if (skipUntilStepId) {
++          if (step.id === skipUntilStepId) {
++            skipUntilStepId = null;
++          } else {
++            // 标记为已跳过
++            const skipped: StepExecutionResult = { stepId: step.id, success: true, durationMs: 0, retriesUsed: 0, skipped: true };
++            stepResults.push(skipped);
++            this.sendIpcProgress(runId, workflowId, 'step_skipped', step.id, { stepName: step.name, stepIndex: stepIdx, totalSteps: def.steps.length });
++            continue;
++          }
++        }
++
++        // 更新运行状态
++        const status = this.runStatuses.get(runId);
++        if (status) {
++          status.currentStepIndex = stepIdx;
++          status.currentStepId = step.id;
++          status.elapsedMs = Date.now() - startedAt;
++          status.stepResults = [...stepResults];
++        }
++
++        this.sendIpcProgress(runId, workflowId, 'step_started', step.id, { stepName: step.name, stepIndex: stepIdx, totalSteps: def.steps.length });
++
++        const result = await this.executeStep(step, stepOutputs, ctx, abortController.signal);
++        stepResults.push(result);
++
++        if (result.success) {
++          stepOutputs.set(step.id, result.output);
++          if (step.outputDataPath && result.output !== undefined) {
++            this.writeOutputToWorkspace(step.outputDataPath, result.output);
++          }
++          this.sendIpcProgress(runId, workflowId, 'step_success', step.id, { stepName: step.name, stepIndex: stepIdx, totalSteps: def.steps.length, durationMs: result.durationMs, skipped: result.skipped, output: result.output, input: result.input });
++        } else {
++          console.error(`[WorkflowEngine] Step "${step.id}" failed: ${result.error}`);
++          this.sendIpcProgress(runId, workflowId, 'step_failed', step.id, { stepName: step.name, stepIndex: stepIdx, totalSteps: def.steps.length, durationMs: result.durationMs, error: result.error, input: result.input });
++          if (step.onError === 'skip') {
++            console.log(`[WorkflowEngine] Step "${step.id}" onError=skip, continuing workflow...`);
++          } else {
++            overallSuccess = false;
++            finalError = `Step "${step.id}" failed: ${result.error}`;
++            break;
++          }
++        }
++      }
++    } catch (err: any) {
++      overallSuccess = false;
++      finalError = err?.message || String(err);
++    } finally {
++      clearTimeout(timeoutTimer);
++      this.activeExecutions.delete(runId);
++      this.pausedRuns.delete(runId);
++    }
++
++    const totalDurationMs = Date.now() - startedAt;
++    const lastStep = stepResults[stepResults.length - 1];
++    const finalOutput = lastStep && lastStep.success ? lastStep.output : null;
++
++    const runResult: WorkflowExecutionResult = { runId, workflowId, success: overallSuccess, steps: stepResults, finalOutput, totalDurationMs, error: finalError, startedAt };
++
++    // 更新最终运行状态
++    const finalStatus = this.runStatuses.get(runId);
++    if (finalStatus) {
++      finalStatus.status = overallSuccess ? 'completed' : 'failed';
++      finalStatus.elapsedMs = totalDurationMs;
++      finalStatus.stepResults = stepResults;
++    }
++
++    this.sendIpcProgress(runId, workflowId, 'workflow_completed', null, { success: overallSuccess, totalDurationMs, error: finalError });
++    console.log(`[WorkflowEngine] Execution "${runId}" finished in ${totalDurationMs}ms (Success: ${overallSuccess})`);
++    this.saveRunTraceToDisk(runResult);
++    // 延迟清理状态（保留 5 分钟供查询）
++    setTimeout(() => this.runStatuses.delete(runId), 5 * 60 * 1000);
++
++    return runResult;
++  }
++
++  /**
++   * 暂停正在运行的 Workflow（在 Step 间检查）
++   */
++  public pause(runId: string): boolean {
++    if (!this.activeExecutions.has(runId)) return false;
++    this.pausedRuns.add(runId);
++    const status = this.runStatuses.get(runId);
++    if (status) status.status = 'paused';
++    this.sendIpcProgress(runId, '', 'workflow_paused', null, {});
++    console.log(`[WorkflowEngine] Paused run "${runId}"`);
++    return true;
++  }
++
++  /**
++   * 恢复已暂停的 Workflow
++   */
++  public resume(runId: string): boolean {
++    if (!this.pausedRuns.has(runId)) return false;
++    this.pausedRuns.delete(runId);
++    const status = this.runStatuses.get(runId);
++    if (status) status.status = 'running';
++    this.sendIpcProgress(runId, '', 'workflow_resumed', null, {});
++    console.log(`[WorkflowEngine] Resumed run "${runId}"`);
++    return true;
++  }
++
++  /**
++   * 从指定步骤开始重新执行
++   */
++  public async executeFrom(
++    workflowId: string,
++    fromStepId: string,
++    previousInput: Record<string, unknown> = {}
++  ): Promise<WorkflowExecutionResult> {
++    return this.execute(workflowId, previousInput, 'manual', 600000, fromStepId);
++  }
++
++  /**
++   * 获取当前工作流的活跃执行状态（如果有的话）
++   */
++  public getActiveRun(workflowId: string): RunStatus | null {
++    for (const status of this.runStatuses.values()) {
++      if (status.workflowId === workflowId && (status.status === 'running' || status.status === 'paused')) {
++        return status;
++      }
++    }
++    return null;
++  }
++
++  /**
++   * 获取当前运行状态
++   */
++  public getRunStatus(runId: string): RunStatus | null {
++    return this.runStatuses.get(runId) || null;
++  }
++
++  /**
++   * 列出历史运行记录（读取磁盘）
++   */
++  public listRecentRuns(workflowId?: string, limit = 20): WorkflowExecutionResult[] {
++    try {
++      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
++      if (!fs.existsSync(runsDir)) return [];
++      const files = fs.readdirSync(runsDir)
++        .filter(f => f.endsWith('.json'))
++        .sort()
++        .reverse()
++        .slice(0, limit * 3);
++      const results: WorkflowExecutionResult[] = [];
++      for (const file of files) {
++        try {
++          const content = fs.readFileSync(path.join(runsDir, file), 'utf-8');
++          const run = JSON.parse(content) as WorkflowExecutionResult;
++          if (!workflowId || run.workflowId === workflowId) {
++            results.push(run);
++          }
++          if (results.length >= limit) break;
++        } catch { /* skip corrupt files */ }
++      }
++      return results;
++    } catch {
++      return [];
++    }
++  }
++
++  /**
++   * 删除特定的运行记录
++   */
++  public deleteRun(runId: string): boolean {
++    try {
++      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
++      const filePath = path.join(runsDir, `${runId}.json`);
++      if (fs.existsSync(filePath)) {
++        fs.unlinkSync(filePath);
++        return true;
++      }
++    } catch (err) {
++      console.error(`[WorkflowEngine] Failed to delete run:`, err);
++    }
++    return false;
++  }
++
++  /**
++   * 清空指定 Workflow 的运行记录
++   */
++  public clearRuns(workflowId: string): boolean {
++    try {
++      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
++      if (!fs.existsSync(runsDir)) return true;
++      const files = fs.readdirSync(runsDir).filter(f => f.endsWith('.json'));
++      for (const file of files) {
++        const filePath = path.join(runsDir, file);
++        try {
++          const content = fs.readFileSync(filePath, 'utf-8');
++          const run = JSON.parse(content) as WorkflowExecutionResult;
++          if (run.workflowId === workflowId) {
++            fs.unlinkSync(filePath);
++          }
++        } catch {}
++      }
++      return true;
++    } catch (err) {
++      console.error(`[WorkflowEngine] Failed to clear runs:`, err);
++    }
++    return false;
++  }
++
++  /**
++   * Step 间暂停等待辅助（轮询）
++   */
++  private async waitIfPaused(runId: string, abortSignal: AbortSignal): Promise<void> {
++    while (this.pausedRuns.has(runId) && !abortSignal.aborted) {
++      await new Promise(r => setTimeout(r, 500));
++    }
++  }
++
++  /**
++   * 向渲染进程推送实时步骤进度 IPC 事件
++   */
++  private sendIpcProgress(runId: string, workflowId: string, event: string, stepId: string | null, data: Record<string, unknown>): void {
++    try {
++      const { BrowserWindow } = require('electron');
++      const wins = BrowserWindow.getAllWindows();
++      const payload = { runId, workflowId, event, stepId, timestamp: Date.now(), ...data };
++
++      // 触发主进程本地事件
++      this.emit('step-progress', payload);
++
++      for (const win of wins) {
++        if (!win.isDestroyed()) {
++          win.webContents.send('workflow:step-progress', payload);
++        }
++      }
++    } catch (err) {
++      // 非 Electron 环境（测试）忽略
++    }
++  }
++
++  /**
++   * 取消正在运行的 Workflow
++   */
++  public cancel(runId: string): boolean {
++    const controller = this.activeExecutions.get(runId);
++    if (controller) {
++      controller.abort();
++      this.activeExecutions.delete(runId);
++      console.log(`[WorkflowEngine] Canceled run "${runId}"`);
++      return true;
++    }
++    return false;
++  }
++
++  /**
++   * 执行单个 Step
++   */
++  private async executeStep(
++    step: WorkflowStep,
++    stepOutputs: Map<string, unknown>,
++    ctx: WorkflowExecutionContext,
++    abortSignal: AbortSignal
++  ): Promise<StepExecutionResult> {
++    const startMs = Date.now();
++
++    // 条件渲染检查
++    if (step.condition && !this.evaluateCondition(step.condition, stepOutputs)) {
++      console.log(`[WorkflowEngine] Step "${step.id}" condition "${step.condition}" evaluated to false, skipping.`);
++      return {
++        stepId: step.id,
++        success: true,
++        output: null,
++        durationMs: 0,
++        retriesUsed: 0,
++        skipped: true,
++      };
++    }
++
++    // 批处理循环解算 (forEach & maxConcurrency)
++    if (step.forEach) {
++      const items = this.resolveValue(step.forEach, stepOutputs);
++      if (Array.isArray(items)) {
++        console.log(`[WorkflowEngine] Step "${step.id}" executing forEach batch over ${items.length} items (concurrency=${step.maxConcurrency || 1}).`);
++        const singleStep: WorkflowStep = { ...step, forEach: undefined };
++        const batchOutputs: unknown[] = [];
++        const concurrency = Math.max(1, step.maxConcurrency || 1);
++
++        for (let i = 0; i < items.length; i += concurrency) {
++          const chunk = items.slice(i, i + concurrency);
++          const chunkPromises = chunk.map((item) => {
++            const itemOutputs = new Map(stepOutputs);
++            itemOutputs.set('item', item);
++            return this.executeStep(singleStep, itemOutputs, ctx, abortSignal);
++          });
++          const chunkResults = await Promise.all(chunkPromises);
++          for (const res of chunkResults) {
++            if (!res.success && step.onError !== 'skip') {
++              return {
++                stepId: step.id,
++                success: false,
++                error: res.error || `Batch item failed in step "${step.id}"`,
++                durationMs: Date.now() - startMs,
++                retriesUsed: res.retriesUsed,
++              };
++            }
++            batchOutputs.push(res.output);
++          }
++        }
++
++        return {
++          stepId: step.id,
++          success: true,
++          output: batchOutputs,
++          input: items,
++          durationMs: Date.now() - startMs,
++          retriesUsed: 0,
++        };
++      }
++    }
++
++    // 人机协作挂起步骤处理 (Human-in-the-Loop)
++    const isHumanInTheLoop = step.humanInTheLoop || (step as any).type === 'human_in_the_loop';
++    if (isHumanInTheLoop) {
++      const rawMessage = step.humanInTheLoop?.message || (step as any).message || '请确认当前步骤是否完成';
++      const resolvedMessage = String(this.resolveValue(rawMessage, stepOutputs) || rawMessage);
++      const timeoutMs = step.humanInTheLoop?.timeoutMs || (step as any).timeoutMs || 300000;
++      console.log(`[WorkflowEngine] Step "${step.id}" triggers Human-in-the-Loop check: ${resolvedMessage}`);
++
++      const approved = await this.promptHumanInTheLoop(step.id, resolvedMessage, timeoutMs);
++      if (!approved) {
++        return {
++          stepId: step.id,
++          success: false,
++          input: resolvedMessage,
++          error: `Human-in-the-Loop approval rejected or timed out for step "${step.id}"`,
++          durationMs: Date.now() - startMs,
++          retriesUsed: 0,
++        };
++      }
++
++      // 如果没有指定工具，说明这是一个纯人机交互步骤，直接执行成功并退场
++      if (!step.tool) {
++        return {
++          stepId: step.id,
++          success: true,
++          input: resolvedMessage,
++          output: 'Approved',
++          durationMs: Date.now() - startMs,
++          retriesUsed: 0,
++        };
++      }
++    }
++
++    // 解析参数引用 ($step1.field)
++    const resolvedParams = (this.resolveValue(step.params, stepOutputs) as Record<string, unknown>) || {};
++
++    const maxAttempts = 1 + (step.retryCount || 0);
++    let lastError: Error | null = null;
++    let aiFallbackUsed = false;
++
++    for (let attempt = 0; attempt < maxAttempts; attempt++) {
++      if (abortSignal.aborted) {
++        return {
++          stepId: step.id,
++          success: false,
++          input: resolvedParams,
++          error: 'Execution canceled by user or global timeout.',
++          durationMs: Date.now() - startMs,
++          retriesUsed: attempt,
++        };
++      }
++
++      try {
++        // 单 Step 硬超时封装
++        const stepTimeoutMs = step.timeout || 60000;
++        const toolPromise = McpHost.getInstance().callTool(step.tool, resolvedParams);
++        const output = await this.withTimeout(toolPromise, stepTimeoutMs, `Step "${step.id}" timeout after ${stepTimeoutMs}ms`);
++
++        return {
++          stepId: step.id,
++          success: true,
++          output,
++          input: resolvedParams,
++          durationMs: Date.now() - startMs,
++          retriesUsed: attempt,
++          aiFallbackUsed,
++        };
++      } catch (err: any) {
++        lastError = err as Error;
++        console.warn(`[WorkflowEngine] Step "${step.id}" attempt ${attempt + 1}/${maxAttempts} failed:`, err?.message || err);
++
++        // 真正的 AI 兜底降级处理 (AI Fallback Execution)
++        if (step.aiFallback && attempt === maxAttempts - 1) {
++          console.log(`[WorkflowEngine] Step "${step.id}" executing AI Fallback prompt: "${step.aiFallback.prompt}"`);
++          try {
++            const fallbackPrompt = (this.resolveValue(step.aiFallback.prompt, stepOutputs) as string) || step.aiFallback.prompt;
++            const fallbackOutput = await this.executeAiFallback(fallbackPrompt, step.aiFallback.model);
++
++            return {
++              stepId: step.id,
++              success: true,
++              output: fallbackOutput,
++              input: fallbackPrompt,
++              durationMs: Date.now() - startMs,
++              retriesUsed: maxAttempts,
++              aiFallbackUsed: true,
++            };
++          } catch (fallbackErr: any) {
++            console.error(`[WorkflowEngine] AI Fallback execution failed for step "${step.id}":`, fallbackErr?.message || fallbackErr);
++          }
++        }
++      }
++    }
++
++    return {
++      stepId: step.id,
++      success: false,
++      input: resolvedParams,
++      error: lastError?.message || 'Step execution failed.',
++      durationMs: Date.now() - startMs,
++      retriesUsed: maxAttempts - 1,
++      aiFallbackUsed,
++    };
++  }
++
++  /**
++   * 递归解析表达式与参数引用 ($input.xxx, $stepId.field)
++   */
++  private resolveValue(value: unknown, stepOutputs: Map<string, unknown>): unknown {
++    if (typeof value === 'string') {
++      if (value.startsWith('$')) {
++        return this.evaluateRefPath(value.slice(1), stepOutputs);
++      }
++      return value;
++    }
++
++    if (Array.isArray(value)) {
++      return value.map((item) => this.resolveValue(item, stepOutputs));
++    }
++
++    if (value && typeof value === 'object') {
++      const result: Record<string, unknown> = {};
++      for (const [k, v] of Object.entries(value)) {
++        result[k] = this.resolveValue(v, stepOutputs);
++      }
++      return result;
++    }
++
++    return value;
++  }
++
++  /**
++   * 路径求值: input.order_file -> stepOutputs.get('input').order_file
++   * 支持深层嵌套与数组语法如 $step1.items[0].id 或 $step1.items.0.id
++   */
++  private evaluateRefPath(pathStr: string, stepOutputs: Map<string, unknown>): unknown {
++    const normalizedPath = pathStr.replace(/\[(\d+)\]/g, '.$1');
++    const parts = normalizedPath.split('.');
++    const rootKey = parts[0];
++    let current = stepOutputs.get(rootKey);
++
++    for (let i = 1; i < parts.length; i++) {
++      if (current === undefined || current === null) return undefined;
++      if (typeof current === 'object') {
++        current = (current as Record<string, unknown>)[parts[i]];
++      } else {
++        return undefined;
++      }
++    }
++
++    return current;
++  }
++
++  /**
++   * 条件简易评估引擎 (安全转义与字符校验)
++   */
++  private evaluateCondition(condition: string, stepOutputs: Map<string, unknown>): boolean {
++    try {
++      const resolved = condition.replace(/\$([a-zA-Z0-9_\.\[\]]+)/g, (_, refPath) => {
++        const val = this.evaluateRefPath(refPath, stepOutputs);
++        return JSON.stringify(val ?? null);
++      });
++
++      // 仅允许基本字面量与运算符，防止代码注入
++      if (!/^[a-zA-Z0-9_\s\.\+\-\*\/\%\=\!\<\>\&\|"'`\[\]\{\}\:\,\(\)]+$/.test(resolved)) {
++        console.warn(`[WorkflowEngine] Condition contains unsafe characters: ${resolved}`);
++        return false;
++      }
++
++      return Boolean(Function(`"use strict"; return (${resolved})`)());
++    } catch (err) {
++      console.warn(`[WorkflowEngine] Condition evaluation failed for "${condition}":`, err);
++      return true;
++    }
++  }
++
++  /**
++   * Promise 单步骤超时封装
++   */
++  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
++    let timer: NodeJS.Timeout;
++    const timeoutPromise = new Promise<never>((_, reject) => {
++      timer = setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
++    });
++    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
++  }
++
++  /**
++   * 将运行 Trace 日志持久化落盘至 .berrytrace/runs/${runId}.json
++   */
++  private saveRunTraceToDisk(result: WorkflowExecutionResult): void {
++    try {
++      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
++      if (!fs.existsSync(runsDir)) {
++        fs.mkdirSync(runsDir, { recursive: true });
++      }
++      const filePath = path.join(runsDir, `${result.runId}.json`);
++      fs.writeFileSync(filePath, JSON.stringify(result, null, 2), 'utf-8');
++      console.log(`[WorkflowEngine] Saved run trace log to "${filePath}"`);
++    } catch (err) {
++      console.error(`[WorkflowEngine] Failed to save run trace log:`, err);
++    }
++  }
++
++  /**
++   * 写入产出数据至工作区（包含工作区沙箱安全防护）
++   */
++  private writeOutputToWorkspace(targetPath: string, data: unknown): void {
++    try {
++      const todayStr = new Date().toISOString().slice(0, 10);
++      const resolvedPath = targetPath.replace('$date', todayStr);
++      const wsRoot = process.cwd();
++      const absolutePath = path.isAbsolute(resolvedPath)
++        ? path.normalize(resolvedPath)
++        : path.resolve(wsRoot, resolvedPath);
++
++      // 工作区路径沙箱越界防护
++      const relative = path.relative(wsRoot, absolutePath);
++      if (relative.startsWith('..') || path.isAbsolute(relative)) {
++        console.error(`[WorkflowEngine] Security blocked: Output path "${targetPath}" is outside workspace root! (${absolutePath})`);
++        return;
++      }
++
++      const dir = path.dirname(absolutePath);
++      if (!fs.existsSync(dir)) {
++        fs.mkdirSync(dir, { recursive: true });
++      }
++
++      const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
++      fs.writeFileSync(absolutePath, content, 'utf-8');
++      console.log(`[WorkflowEngine] Successfully wrote output data to workspace path: ${absolutePath}`);
++    } catch (err) {
++      console.error(`[WorkflowEngine] Failed to write output data to workspace path: ${targetPath}`, err);
++    }
++  }
++
++  /**
++   * 执行真正的 AI Fallback 降级调起
++   */
++  private async executeAiFallback(prompt: string, model?: string): Promise<unknown> {
++    const mcpHost = McpHost.getInstance();
++    if (mcpHost.hasToolHandler('ai_generate_text')) {
++      return mcpHost.callTool('ai_generate_text', { prompt, model });
++    }
++    const { AiController } = await import('./controllers/ai');
++    const aiCtrl = new AiController();
++    return aiCtrl.ai_chat(
++      { messages: [{ role: 'user', content: prompt }], modelId: model },
++      { pluginId: 'workflow-engine', apiName: 'ai' }
++    );
++  }
++
++  /**
++   * 向渲染进程弹出 Human-in-the-Loop 阻塞式人工确认卡片
++   */
++  private async promptHumanInTheLoop(stepId: string, message: string, timeoutMs: number = 300000): Promise<boolean> {
++    const { ElectronMainWindow } = await import('../windows/main-window');
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++
++    if (!mainWindow || mainWindow.isDestroyed()) {
++      console.warn(`[WorkflowEngine] No active main window for Human-in-the-Loop prompt, defaulting to approved.`);
++      return true;
++    }
++
++    return new Promise<boolean>((resolve) => {
++      let timer: NodeJS.Timeout;
++
++      mainWindow.webContents.send('workflow:human-approval-request', {
++        stepId,
++        message,
++        timeoutMs,
++      });
++
++      const channel = `workflow:human-approval-response:${stepId}`;
++      const { ipcMain } = require('electron');
++
++      const handler = (_event: any, response: { approved: boolean }) => {
++        clearTimeout(timer);
++        ipcMain.removeListener(channel, handler);
++        resolve(Boolean(response?.approved));
++      };
++
++      ipcMain.once(channel, handler);
++
++      timer = setTimeout(() => {
++        ipcMain.removeListener(channel, handler);
++        console.warn(`[WorkflowEngine] Human-in-the-Loop approval timed out after ${timeoutMs}ms`);
++        resolve(false);
++      }, timeoutMs);
++    });
++  }
++}

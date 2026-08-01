@@ -1,0 +1,155 @@
+{
+  "$schema": "http://json.schemastore.org/api-map",
+  "description": "BerryTrace SDK API to Host Process implementation mapping file. Helps AI immediately resolve routing and handler code.",
+  "mappings": {
+    "system": {
+      "file": "electron/plugins/controllers/system.ts",
+      "methods": [
+        "getTheme",
+        "getDesktopCapturerSources",
+        "showNotification",
+        "toggleQuickPanel",
+        "openExternal",
+        "openUrl",
+        "clipboardWriteText",
+        "execCommand",
+        "resolveNpmCli",
+        "waitCommand",
+        "resolveCommandEarly",
+        "writeStdin",
+        "openCaptureWindow",
+        "triggerCapture",
+        "closeCaptureWindow",
+        "getFocusedInputInfo",
+        "insertText",
+        "listWindows",
+        "captureWindow",
+        "simulateClick",
+        "simulateType",
+        "simulateKeyPress",
+        "simulateDrag",
+        "launchApp"
+      ]
+    },
+    "dialog": {
+      "file": "electron/plugins/controllers/system.ts",
+      "methods": [
+        "showSaveDialog",
+        "showOpenDialog"
+      ]
+    },
+    "log": {
+      "file": "electron/plugins/controllers/system.ts",
+      "methods": [
+        "info",
+        "warn",
+        "error",
+        "debug"
+      ]
+    },
+    "window": {
+      "file": "electron/plugins/controllers/system.ts",
+      "methods": [
+        "create",
+        "show",
+        "hide",
+        "close",
+        "startDrag",
+        "move",
+        "maximize",
+        "minimize",
+        "getState",
+        "getNativeHandle",
+        "setIgnoreMouseEvents",
+        "updateWindowOptions",
+        "disableDefaultDrag"
+      ]
+    },
+    "user": {
+      "file": "electron/plugins/controllers/system.ts",
+      "methods": [
+        "getMembershipStatus"
+      ]
+    },
+    "storage": {
+      "file": "electron/plugins/controllers/storage.ts",
+      "methods": [
+        "kv.get",
+        "kv.set",
+        "kv.delete",
+        "kv.clear",
+        "db.execute",
+        "db.run"
+      ]
+    },
+    "filesystem": {
+      "file": "electron/plugins/controllers/storage.ts",
+      "methods": [
+        "readFile",
+        "readDir",
+        "stat",
+        "mkdir",
+        "writeFile",
+        "renameFile",
+        "deleteFile",
+        "getSafePath",
+        "showItemInFolder"
+      ]
+    },
+    "ai": {
+      "file": "electron/plugins/controllers/ai.ts",
+      "methods": [
+        "runAgentTask",
+        "cancelAgentTask",
+        "getAgentKernelStatus",
+        "chat",
+        "chatStream",
+        "getActiveLlmConfig"
+      ]
+    },
+    "mcp": {
+      "file": "electron/plugins/controllers/ai.ts",
+      "methods": [
+        "tool-response",
+        "registerDynamicTool",
+        "unregisterDynamicTool",
+        "listTools",
+        "callTool"
+      ]
+    },
+    "workspace": {
+      "file": "electron/plugins/controllers/workspace.ts",
+      "methods": [
+        "getPath",
+        "getMetadata"
+      ]
+    },
+    "scheduler": {
+      "file": "electron/plugins/controllers/workspace.ts",
+      "methods": [
+        "register",
+        "unregister",
+        "list"
+      ]
+    },
+    "articles": {
+      "file": "electron/plugins/controllers/workspace.ts",
+      "methods": [
+        "get",
+        "update"
+      ]
+    },
+    "publish": {
+      "file": "electron/plugins/controllers/publish.ts",
+      "methods": [
+        "createShare",
+        "deleteShare",
+        "listShares",
+        "updateShare",
+        "getShareByPath",
+        "addOrUpdateShare",
+        "removeShare"
+      ]
+    }
+  }
+}

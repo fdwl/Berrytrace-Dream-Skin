@@ -1,0 +1,461 @@
+/**
+ * WorkspaceContext — 工作区级常驻服务包（方案 C 核心）
+ *
+ * 职责：
+ *   1. 持有该工作区的文件 watcher（从 WorkspaceManager 迁移）
+ *   2. 执行 change workflow（从 WorkspaceManager 迁移）
+ *   3. 管理无窗口时的 AI 任务队列
+ *   4. 未来：持有该工作区的 background 插件实例（Phase 2）
+ *
+ * 生命周期：不依赖渲染进程窗口。只要工作区被"使用过"，Context 就常驻。
+ * 窗口切换只是改 WorkspaceContextManager 的 activeContext 指针。
+ *
+ * @see docs/workspace-plugin-reload-race-analysis.md 方案 C
+ */
+import type { BrowserWindow } from 'electron'
+import * as fs from 'fs'
+import { join } from 'path'
+import { WORKSPACE_DIR_NAME } from '../../src/config/constants'
+
+const TAG = '[WorkspaceContext]'
+
+export interface PendingAgentTask {
+  task: string
+  workDir: string
+  timestamp: number
+  scriptOutput?: string
+}
+
+/**
+ * 窗口解析器接口 — 用于解耦 WorkspaceContext 与 WorkspaceContextManager。
+ * WorkspaceContextManager 创建 Context 时注入自身实现，
+ * 避免 Context 反向 require Manager 导致的循环依赖。
+ */
+export interface WindowResolver {
+  /** 获取绑定到指定工作区路径的所有窗口 */
+  getWindowsForContext(workspacePath: string): BrowserWindow[]
+}
+
+export function shouldIgnoreWorkspaceFile(filename: string): boolean {
+  if (!filename) return true;
+  const normalized = filename.replace(/\\/g, '/');
+
+  // 1. 常见系统、构建与安装包产物目录
+  if (
+    normalized.includes('.git/') || normalized.endsWith('.git') ||
+    normalized.includes('node_modules/') || normalized.includes('/node_modules/') || normalized.startsWith('node_modules/') ||
+    normalized.includes(WORKSPACE_DIR_NAME) ||
+    normalized.includes('.berrytrace') ||
+    normalized.startsWith('release/') || normalized.includes('/release/') ||
+    normalized.startsWith('dist-electron/') || normalized.includes('/dist-electron/') ||
+    normalized.startsWith('dist/') || normalized.includes('/dist/') ||
+    normalized.startsWith('build/') || normalized.includes('/build/') ||
+    normalized.startsWith('out/') || normalized.includes('/out/') ||
+    normalized.startsWith('deply_download/') || normalized.includes('/deply_download/') ||
+    normalized.startsWith('logs/') || normalized.includes('/logs/')
+  ) {
+    return true;
+  }
+
+  // 2. macOS Bundle / Framework / Xcode 工程与安装包 (应用级文件与打包临时文件)
+  if (
+    normalized.includes('.app/') || normalized.endsWith('.app') ||
+    normalized.includes('.framework/') || normalized.endsWith('.framework') ||
+    normalized.includes('.xcodeproj/') || normalized.endsWith('.xcodeproj') ||
+    normalized.includes('.xcworkspace/') || normalized.endsWith('.xcworkspace') ||
+    normalized.includes('.dSYM/') || normalized.endsWith('.dSYM') ||
+    normalized.endsWith('.dmg') ||
+    normalized.endsWith('.pkg') ||
+    normalized.endsWith('.ipa')
+  ) {
+    return true;
+  }
+
+  // 3. Windows 可执行程序、动态库、系统文件与安装包
+  if (
+    normalized.endsWith('.exe') ||
+    normalized.endsWith('.dll') ||
+    normalized.endsWith('.sys') ||
+    normalized.endsWith('.msi') ||
+    normalized.endsWith('.cab') ||
+    normalized.endsWith('.iso')
+  ) {
+    return true;
+  }
+
+  // 4. 压缩包、块映射、日志、数据库与 IDE 缓存文件
+  if (
+    normalized.endsWith('.DS_Store') ||
+    normalized.endsWith('.log') ||
+    normalized.endsWith('.db') || normalized.endsWith('.db-journal') || normalized.endsWith('.db-wal') ||
+    normalized.endsWith('.sqlite') || normalized.endsWith('.sqlite3') || normalized.endsWith('.sqlite-journal') || normalized.endsWith('.sqlite-wal') ||
+    normalized.endsWith('.zip') || normalized.endsWith('.tar') || normalized.endsWith('.gz') || normalized.endsWith('.7z') ||
+    normalized.endsWith('.blockmap') ||
+    normalized.includes('.codebuddy') ||
+    normalized.includes('.vite') ||
+    normalized.includes('.next') ||
+    normalized.includes('.turbo') ||
+    normalized.includes('.cache')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export class WorkspaceContext {
+  readonly workspacePath: string
+
+  /** 文件 watcher */
+  private watcher: fs.FSWatcher | null = null
+
+  /** 文件变更防抖（结构变更，200ms） */
+  private structureDebounce: NodeJS.Timeout | null = null
+  /** 文件变更防抖（内容变更，3s 聚合） */
+  private contentDebounce: NodeJS.Timeout | null = null
+  /** 单文件修改防抖（100ms） */
+  private fileModifiedDebounces = new Map<string, NodeJS.Timeout>()
+  /** 聚合的变更文件列表 */
+  private changedFiles = new Set<string>()
+  /** change workflow 冷却时间记录 */
+  private lastTriggerTime = 0
+
+  /** 无窗口时的 AI 任务队列 */
+  private pendingAgentTasks: PendingAgentTask[] = []
+
+  /** 是否已激活（watcher 已启动） */
+  private _active = false
+
+  /** 窗口解析器（由 WorkspaceContextManager 注入） */
+  private windowResolver: WindowResolver
+
+  constructor(workspacePath: string, windowResolver: WindowResolver) {
+    this.workspacePath = workspacePath
+    this.windowResolver = windowResolver
+  }
+
+  /** 激活 Context：启动文件 watcher */
+  async activate(): Promise<void> {
+    if (this._active) return
+    if (!this.workspacePath || !fs.existsSync(this.workspacePath)) {
+      console.warn(`${TAG} Cannot activate: path does not exist: ${this.workspacePath}`)
+      return
+    }
+
+    this._active = true
+    this.startWatcher()
+    console.log(`${TAG} Activated for: ${this.workspacePath}`)
+  }
+
+  /** 停用 Context：停止 watcher，清理定时器 */
+  async deactivate(): Promise<void> {
+    if (!this._active) return
+    this._active = false
+
+    this.stopWatcher()
+
+    if (this.structureDebounce) {
+      clearTimeout(this.structureDebounce)
+      this.structureDebounce = null
+    }
+    if (this.contentDebounce) {
+      clearTimeout(this.contentDebounce)
+      this.contentDebounce = null
+    }
+    for (const timeout of this.fileModifiedDebounces.values()) {
+      clearTimeout(timeout)
+    }
+    this.fileModifiedDebounces.clear()
+
+    console.log(`${TAG} Deactivated for: ${this.workspacePath}`)
+  }
+
+  get isActive(): boolean {
+    return this._active
+  }
+
+  get pendingTasks(): PendingAgentTask[] {
+    return this.pendingAgentTasks
+  }
+
+  /** 清空并返回待处理的 AI 任务 */
+  drainPendingTasks(): PendingAgentTask[] {
+    const tasks = this.pendingAgentTasks.splice(0)
+    return tasks
+  }
+
+  /** 获取待处理任务数量（不清空） */
+  getPendingTaskCount(): number {
+    return this.pendingAgentTasks.length
+  }
+
+  // ─── 文件 watcher（从 WorkspaceManager 迁移） ──────────────────────
+
+  private startWatcher(): void {
+    if (this.watcher) return
+    try {
+      console.log(`${TAG} Starting watcher at: ${this.workspacePath}`)
+      this.watcher = fs.watch(this.workspacePath, { recursive: true }, (event, filename) => {
+        if (!filename || shouldIgnoreWorkspaceFile(filename)) return;
+
+        this.changedFiles.add(filename)
+
+        // 单文件修改即时广播（100ms 防抖）
+        const absPath = join(this.workspacePath, filename)
+        const debounceKey = filename
+        const existing = this.fileModifiedDebounces.get(debounceKey)
+        if (existing) clearTimeout(existing)
+        const timeout = setTimeout(() => {
+          this.broadcastToBoundWindows('file:modified', { absPath, filePath: absPath })
+          this.fileModifiedDebounces.delete(debounceKey)
+        }, 100)
+        // 诊断：记录 file:modified 即将发送（在 debounce 定时器挂载时）
+        // 此日志帮助判断事件是否是被 rename 触发的
+        if (event === 'rename') {
+          console.debug(`[WorkspaceContext:watcher:defer] file:modified will be broadcast after 100ms debounce for "${filename}" (triggered by rename)`)
+        }
+        this.fileModifiedDebounces.set(debounceKey, timeout)
+
+        if (event === 'rename') {
+          // 诊断：rename 事件可能是删除、重命名或原子保存（删旧+建新）
+          console.debug(`[WorkspaceContext:watcher:rename] event=rename filename="${filename}" absPath="${absPath}"`);
+          this.notifyStructureChanged()
+        } else {
+          this.notifyContentChanged()
+        }
+      })
+      this.watcher.on('error', (err) => {
+        console.error(`${TAG} Watcher error for ${this.workspacePath}:`, err)
+      })
+    } catch (err) {
+      console.error(`${TAG} Failed to start watcher:`, err)
+    }
+  }
+
+  private stopWatcher(): void {
+    if (this.watcher) {
+      try {
+        this.watcher.close()
+      } catch (err) {
+        console.error(`${TAG} Failed to stop watcher:`, err)
+      }
+      this.watcher = null
+    }
+  }
+
+  // ─── 文件变更通知 ──────────────────────────────────────────────────
+
+  private notifyStructureChanged(): void {
+    if (this.structureDebounce) clearTimeout(this.structureDebounce)
+    this.structureDebounce = setTimeout(() => {
+      console.log(`${TAG} Structure changed in ${this.workspacePath}`)
+      // 发送新的语义事件：文件结构变化，不触发插件 reload
+      this.broadcastToBoundWindows('workspace:files-structure-changed')
+      // 向后兼容：保留 workspace:changed（仅用于文件树刷新）
+      this.broadcastToBoundWindows('workspace:changed')
+    }, 200)
+    this.notifyContentChanged()
+  }
+
+  private notifyContentChanged(): void {
+    if (this.contentDebounce) clearTimeout(this.contentDebounce)
+    this.contentDebounce = setTimeout(async () => {
+      console.log(`${TAG} Content changed in ${this.workspacePath}, running change workflow`)
+      await this.runChangeWorkflow()
+    }, 3000) // 3s 聚合
+  }
+
+  /** 向绑定此工作区的窗口广播事件 */
+  private broadcastToBoundWindows(channel: string, data?: unknown): void {
+    const boundWindows = this.windowResolver.getWindowsForContext(this.workspacePath)
+    boundWindows.forEach((win: BrowserWindow) => {
+      if (!win.isDestroyed()) {
+        win.webContents.send(channel, data)
+      }
+    })
+  }
+
+  // ─── change workflow（从 WorkspaceManager 迁移） ───────────────────
+
+  private async runChangeWorkflow(): Promise<void> {
+    let changeMdPath = join(this.workspacePath, '.skills', 'change.md')
+    if (!fs.existsSync(changeMdPath)) {
+      changeMdPath = join(this.workspacePath, 'skills', 'change.md')
+    }
+    if (!fs.existsSync(changeMdPath)) {
+      this.changedFiles.clear()
+      return
+    }
+
+    if (this.changedFiles.size === 0) return
+
+    const changedFilesArray = Array.from(this.changedFiles)
+    this.changedFiles.clear()
+
+    try {
+      const content = fs.readFileSync(changeMdPath, 'utf8')
+      const config = this.parseChangeMd(content)
+
+      // 冷却检查
+      const now = Date.now()
+      if (now - this.lastTriggerTime < config.cooldown * 1000) {
+        console.log(`[ChangeWorkflow] Cooldown active. Skipping workflow.`)
+        return
+      }
+
+      // 文件过滤
+      const matchedFiles = changedFilesArray.filter(file => {
+        const relativePath = file.replace(/\\/g, '/')
+        let isWatched = config.watch.length === 0
+        if (config.watch.length > 0) {
+          isWatched = config.watch.some(pattern => {
+            const regex = this.globToRegex(pattern)
+            return regex.test(relativePath) || relativePath.startsWith(pattern.replace(/\/$/, ''))
+          })
+        }
+        let isIgnored = false
+        if (config.ignore.length > 0) {
+          isIgnored = config.ignore.some(pattern => {
+            const regex = this.globToRegex(pattern)
+            return regex.test(relativePath) || relativePath.includes(pattern)
+          })
+        }
+        return isWatched && !isIgnored
+      })
+
+      if (matchedFiles.length === 0) {
+        console.log('[ChangeWorkflow] No changed files matched triggers.')
+        return
+      }
+
+      console.log(`[ChangeWorkflow] Matched files:`, matchedFiles)
+      this.lastTriggerTime = now
+
+      let scriptSuccess = true
+      let scriptOutput = ''
+      if (config.execute) {
+        const absPaths = matchedFiles.map(f => `"${join(this.workspacePath, f)}"`).join(' ')
+        const command = config.execute.replace(/\{\{CHANGED_FILES\}\}/g, absPaths)
+        console.log(`[ChangeWorkflow] Executing local watchdog script: ${command}`)
+
+        const { exec } = await import('child_process')
+        const executionResult = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+          exec(command, { cwd: this.workspacePath }, (error, stdout, stderr) => {
+            resolve({
+              code: error ? (error.code || 1) : 0,
+              stdout,
+              stderr
+            })
+          })
+        })
+        scriptSuccess = executionResult.code === 0
+        scriptOutput = `STDOUT:\n${executionResult.stdout}\nSTDERR:\n${executionResult.stderr}`
+        console.log(`[ChangeWorkflow] Script exit code: ${executionResult.code}`)
+      }
+
+      let shouldWakeUpAI = false
+      if (config.ifStatus === 'failed') {
+        shouldWakeUpAI = !scriptSuccess
+      } else {
+        shouldWakeUpAI = true
+      }
+
+      if (shouldWakeUpAI && config.prompt) {
+        const fileListStr = matchedFiles.map(f => join(this.workspacePath, f)).join('\n')
+        let finalPrompt = config.prompt.replace(/\{\{CHANGED_FILES\}\}/g, fileListStr)
+        if (scriptOutput) {
+          finalPrompt += `\n\n本地脚本执行结果如下:\n${scriptOutput}`
+        }
+        this.triggerAgentTask(finalPrompt, scriptOutput)
+      }
+    } catch (err) {
+      console.error('[ChangeWorkflow] Error running change workflow:', err)
+    }
+  }
+
+  /**
+   * 触发 Agent 任务。
+   * 有窗口绑定时：实时发送 workspace:trigger-agent-task
+   * 无窗口时：任务入队，窗口恢复连接后提示
+   */
+  private triggerAgentTask(task: string, scriptOutput?: string): void {
+    const boundWindows = this.windowResolver.getWindowsForContext(this.workspacePath)
+
+    if (boundWindows.length > 0) {
+      console.log('[ChangeWorkflow] Broadcasting workspace:trigger-agent-task to bound windows')
+      boundWindows.forEach((win: BrowserWindow) => {
+        if (!win.isDestroyed()) {
+          win.webContents.send('workspace:trigger-agent-task', {
+            task,
+            workDir: this.workspacePath
+          })
+        }
+      })
+    } else {
+      // 无窗口绑定：任务入队
+      console.log(`[ChangeWorkflow] No bound window for ${this.workspacePath}, queuing agent task`)
+      this.pendingAgentTasks.push({
+        task,
+        workDir: this.workspacePath,
+        timestamp: Date.now(),
+        scriptOutput
+      })
+    }
+  }
+
+  // ─── change.md 解析（从 WorkspaceManager 迁移） ────────────────────
+
+  private globToRegex(glob: string): RegExp {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    const regexStr = '^' + escaped.replace(/\\\*\\\*/g, '.*').replace(/\\\*/g, '[^/]*').replace(/\\\?/g, '.') + '$'
+    return new RegExp(regexStr, 'i')
+  }
+
+  private parseChangeMd(content: string) {
+    const result = {
+      watch: [] as string[],
+      ignore: [] as string[],
+      cooldown: 10,
+      execute: '',
+      ifStatus: '',
+      prompt: ''
+    }
+
+    const watchMatches = [...content.matchAll(/-\s+Watch:\s*`([^`]+)`|watch:\s*\n?\s*-\s*"([^"]+)"/gi)]
+    const ignoreMatches = [...content.matchAll(/-\s+Ignore:\s*`([^`]+)`|ignore:\s*\n?\s*-\s*"([^"]+)"/gi)]
+    const cooldownMatch = content.match(/cooldown:\s*(\d+)s?|Cooldown:\s*`?(\d+)s?`?/i)
+    const executeMatch = content.match(/execute:\s*`([^`]+)`|execute:\s*([^\n]+)/i)
+    const ifStatusMatch = content.match(/if_status:\s*"([^"]+)"|if_status:\s*([^\n]+)/i)
+    const promptMatch = content.match(/prompt:\s*\|?\n?([\s\S]+)$/i)
+
+    result.watch = watchMatches.map(m => m[1] || m[2]).filter(Boolean)
+    result.ignore = ignoreMatches.map(m => m[1] || m[2]).filter(Boolean)
+    if (cooldownMatch) {
+      result.cooldown = parseInt(cooldownMatch[1] || cooldownMatch[2], 10)
+    }
+    if (executeMatch) {
+      result.execute = (executeMatch[1] || executeMatch[2]).trim()
+    }
+    if (ifStatusMatch) {
+      result.ifStatus = (ifStatusMatch[1] || ifStatusMatch[2]).trim()
+    }
+    if (promptMatch) {
+      result.prompt = promptMatch[1].trim()
+    }
+
+    if (result.watch.length === 0) {
+      const watchLines = content.match(/watch:\s*\n(\s*-\s*[^\n]+\n)+/i)
+      if (watchLines) {
+        result.watch = watchLines[0].split('\n').map(l => l.replace(/^\s*-\s*["']?|["']?\s*$/g, '').trim()).filter(l => l && !l.startsWith('watch:'))
+      }
+    }
+    if (result.ignore.length === 0) {
+      const ignoreLines = content.match(/ignore:\s*\n(\s*-\s*[^\n]+\n)+/i)
+      if (ignoreLines) {
+        result.ignore = ignoreLines[0].split('\n').map(l => l.replace(/^\s*-\s*["']?|["']?\s*$/g, '').trim()).filter(l => l && !l.startsWith('ignore:'))
+      }
+    }
+
+    return result
+  }
+}

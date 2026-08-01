@@ -1,0 +1,71 @@
+diff --git a/electron/plugins/plugin-install.ts b/electron/plugins/plugin-install.ts
+index 0008d25..34ea70e 100644
+--- a/electron/plugins/plugin-install.ts
++++ b/electron/plugins/plugin-install.ts
+@@ -239,15 +239,39 @@ function cleanupTempDir(dir: string) {
+  */
+ async function syncPluginSkills(pluginDir: string, pluginId: string): Promise<void> {
+   const skillsSrcDir = path.join(pluginDir, 'skills');
+-  if (!fs.existsSync(skillsSrcDir)) {
+-    return; // 该插件不包含 Skills，跳过
+-  }
+-
+   const sharedSkillsDir = SKILLS_DIR;
+   fs.mkdirSync(sharedSkillsDir, { recursive: true });
+ 
+   try {
+-    // 遍历 skills/<skillName>/ 子目录
++    // 1. 清理该插件此前已同步过但已被新版本移除的旧 Skill 目录
++    const existingSkills = fs.readdirSync(sharedSkillsDir);
++    for (const existingName of existingSkills) {
++      const existingDir = path.join(sharedSkillsDir, existingName);
++      if (!fs.statSync(existingDir).isDirectory()) continue;
++
++      const metaPath = path.join(existingDir, '.plugin_owner.json');
++      if (fs.existsSync(metaPath)) {
++        try {
++          const ownerMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
++          if (ownerMeta?.pluginId === pluginId) {
++            // 如果新版本的 skills/ 中不再包含这个 skill，清理残留的旧 Skill 目录
++            const stillExistsInSrc = fs.existsSync(skillsSrcDir) && 
++                                      fs.existsSync(path.join(skillsSrcDir, existingName)) && 
++                                      fs.statSync(path.join(skillsSrcDir, existingName)).isDirectory();
++            if (!stillExistsInSrc) {
++              fs.rmSync(existingDir, { recursive: true, force: true });
++              console.log(`[PluginInstall] 🗑️ Cleaned up obsolete skill [${existingName}] for updated plugin [${pluginId}]`);
++            }
++          }
++        } catch {}
++      }
++    }
++
++    if (!fs.existsSync(skillsSrcDir)) {
++      return; // 该插件不包含 Skills，跳过同步
++    }
++
++    // 2. 遍历 skills/<skillName>/ 子目录并同步（先清空目标目录保证干净）
+     const skillNames = fs.readdirSync(skillsSrcDir);
+     let copiedCount = 0;
+ 
+@@ -256,10 +280,22 @@ async function syncPluginSkills(pluginDir: string, pluginId: string): Promise<vo
+       if (!fs.statSync(srcSkillDir).isDirectory()) continue;
+ 
+       const destSkillDir = path.join(sharedSkillsDir, skillName);
++      // 先清空该 skill 目标目录，防止废弃文件残留
++      if (fs.existsSync(destSkillDir)) {
++        fs.rmSync(destSkillDir, { recursive: true, force: true });
++      }
+       fs.mkdirSync(destSkillDir, { recursive: true });
+ 
+       // 递归复制 skill 目录内所有文件
+       copyDirRecursive(srcSkillDir, destSkillDir);
++
++      // 写入所属插件标记文件，用于下次升级/重构时归属清理
++      fs.writeFileSync(
++        path.join(destSkillDir, '.plugin_owner.json'),
++        JSON.stringify({ pluginId, updatedAt: new Date().toISOString() }, null, 2),
++        'utf-8'
++      );
++
+       copiedCount++;
+     }

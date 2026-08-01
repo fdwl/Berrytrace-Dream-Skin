@@ -1,0 +1,394 @@
+/**
+ * 文件文本提取与大纲导航工具
+ * 支持 PDF、DOCX、PPTX、XLSX/XLS、Markdown、纯文本及图片 OCR
+ * 支持按页码范围 (startPage - endPage) 读取与大纲/目录结构提炼
+ */
+
+import * as fs from 'fs'
+import * as path from 'path'
+import { isImageExtension, parseImageOcr } from './ocr-image-parser'
+import { FULLTEXT_CONFIG } from '../config/paths'
+
+export interface PdfPageRangeResult {
+  text: string;
+  totalPages: number;
+  startPage: number;
+  endPage: number;
+  error?: string;
+}
+
+export interface DocumentOutlineResult {
+  filePath: string;
+  format: string;
+  totalPages?: number;
+  outline: Array<{ title: string; level?: number; page?: number | string }>;
+}
+
+/**
+ * 解析 PDF 文件，提取纯文本（异步 I/O 统一实现）
+ */
+export async function parsePdf(filePath: string): Promise<string> {
+  try {
+    const stats = await fs.promises.stat(filePath).catch(() => null)
+    if (stats && stats.size > 50 * 1024 * 1024) {
+      console.warn(`[FullTextParser] Skipping parsePdf for large file (${(stats.size / 1024 / 1024).toFixed(2)}MB > 50MB): ${filePath}`)
+      return '[Warning: PDF file exceeds 50MB size limit for full text parsing.]'
+    }
+
+    const mod = await import('pdf-parse')
+    const dataBuffer = await fs.promises.readFile(filePath)
+
+    if (mod.PDFParse) {
+      const parser = new mod.PDFParse({ data: dataBuffer })
+      const result = await parser.getText()
+      return result.text || ''
+    }
+
+    let pdfParse: any = mod
+    if (typeof pdfParse !== 'function' && pdfParse.default) {
+      pdfParse = pdfParse.default
+    }
+    if (typeof pdfParse !== 'function' && pdfParse.default) {
+      pdfParse = pdfParse.default
+    }
+
+    if (typeof pdfParse === 'function') {
+      const result = await pdfParse(dataBuffer)
+      return result.text || ''
+    }
+
+    throw new Error('Could not resolve pdf-parse module correctly')
+  } catch (err) {
+    console.error('[FullTextParser] PDF parse error:', err)
+    return ''
+  }
+}
+
+/**
+ * 按指定页码范围 (startPage 到 endPage) 解析 PDF 文件
+ * 带有 >50MB 文件大小前置拦截保护，防止主进程 OOM
+ */
+export async function parsePdfPageRange(
+  filePath: string,
+  startPage = 1,
+  endPage?: number
+): Promise<PdfPageRangeResult> {
+  try {
+    const stats = await fs.promises.stat(filePath).catch(() => null)
+    if (stats && stats.size > 50 * 1024 * 1024) {
+      const sizeMb = (stats.size / 1024 / 1024).toFixed(2)
+      console.warn(`[FullTextParser] PDF file too large for page reading (${sizeMb}MB > 50MB): ${filePath}`)
+      return {
+        text: `[Warning: PDF file is too large (${sizeMb}MB > 50MB) for full page reading to prevent memory crash. Please use 'read_document_outline' to inspect the structure instead.]`,
+        totalPages: 0,
+        startPage: 1,
+        endPage: 1,
+        error: `PDF file too large (${sizeMb}MB > 50MB).`
+      }
+    }
+
+    const mod = await import('pdf-parse')
+    const dataBuffer = await fs.promises.readFile(filePath)
+
+    if (mod.PDFParse) {
+      const parser = new mod.PDFParse({ data: dataBuffer })
+      const result = await parser.getText()
+      const totalPages = result.total || (result.pages ? result.pages.length : 1)
+      const sPage = Math.max(1, startPage)
+      const defaultLimit = FULLTEXT_CONFIG.DEFAULT_PDF_PAGE_RANGE
+      const ePage = endPage ? Math.min(totalPages, endPage) : Math.min(totalPages, sPage + defaultLimit - 1)
+
+      if (Array.isArray(result.pages) && result.pages.length > 0) {
+        const selectedPages = result.pages.filter((p: any) => p.num >= sPage && p.num <= ePage)
+        const text = selectedPages.map((p: any) => `--- 第 ${p.num} 页 ---\n${p.text}`).join('\n\n')
+        return { text, totalPages, startPage: sPage, endPage: ePage }
+      }
+
+      return { text: result.text || '', totalPages, startPage: 1, endPage: totalPages }
+    }
+
+    const text = await parsePdf(filePath)
+    return { text, totalPages: 1, startPage: 1, endPage: 1 }
+  } catch (err) {
+    console.error('[FullTextParser] PDF page range parse error:', err)
+    return { text: '', totalPages: 0, startPage: 1, endPage: 1 }
+  }
+}
+
+/**
+ * 提取文档大纲/目录结构（支持 PDF 书签、DOCX/MD 标题、XLSX 表格清单等）
+ * 带有 >100MB 文件大小前置拦截保护
+ */
+export async function extractDocumentOutline(filePath: string): Promise<DocumentOutlineResult> {
+  const ext = path.extname(filePath).slice(1).toLowerCase() || ''
+  const result: DocumentOutlineResult = { filePath, format: ext, outline: [] }
+
+  try {
+    if (ext === 'pdf') {
+      const stats = await fs.promises.stat(filePath).catch(() => null)
+      if (stats && stats.size > 100 * 1024 * 1024) {
+        console.warn(`[FullTextParser] PDF file too large for outline parsing (${(stats.size / 1024 / 1024).toFixed(2)}MB > 100MB): ${filePath}`)
+        return result
+      }
+
+      const mod = await import('pdf-parse')
+      const dataBuffer = await fs.promises.readFile(filePath)
+      if (mod.PDFParse) {
+        const parser = new mod.PDFParse({ data: dataBuffer })
+        const info = await parser.getInfo()
+        result.totalPages = info.total || 0
+
+        if (Array.isArray(info.outline) && info.outline.length > 0) {
+          result.outline = info.outline.map((item: any, index: number) => ({
+            title: item.title || `Chapter ${index + 1}`,
+            page: item.dest || item.page || (index + 1),
+            level: item.items && item.items.length > 0 ? 1 : 2
+          }))
+        } else if (result.totalPages && result.totalPages > 0 && result.totalPages <= 20) {
+          result.outline = Array.from({ length: result.totalPages }, (_, i) => ({
+            title: `第 ${i + 1} 页`,
+            page: i + 1,
+            level: 1
+          }))
+        }
+      }
+      return result
+    }
+
+    if (ext === 'xlsx' || ext === 'xls') {
+      const mod = await import('xlsx')
+      const XLSX: any = mod.default || mod
+      const workbook = XLSX.readFile(filePath)
+      result.outline = workbook.SheetNames.map((sheetName: string, i: number) => ({
+        title: `Sheet: ${sheetName}`,
+        page: i + 1,
+        level: 1
+      }))
+      return result
+    }
+
+    if (ext === 'docx' || ext === 'doc' || ext === 'md' || ext === 'txt') {
+      const content = await extractFileContent(filePath, `.${ext}`)
+      const lines = content.split('\n')
+      const outline: Array<{ title: string; level: number }> = []
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('#')) {
+          const match = trimmed.match(/^(#+)\s+(.*)/)
+          if (match) {
+            outline.push({ title: match[2], level: match[1].length })
+          }
+        } else if (/^(第[0-9一二三四五六七八九十]+[章节集篇]|\d+[\.、])\s*/.test(trimmed)) {
+          outline.push({ title: trimmed.slice(0, 100), level: 1 })
+        }
+      }
+
+      result.outline = outline
+      return result
+    }
+
+    return result
+  } catch (err) {
+    console.error(`[FullTextParser] Extract document outline error for ${filePath}:`, err)
+    return result
+  }
+}
+
+/**
+ * 解析 DOCX 文件，提取纯文本
+ */
+export async function parseDocx(filePath: string): Promise<string> {
+  try {
+    const mod = await import('mammoth')
+    let mammoth: any = mod
+    if (!mammoth.extractRawText && mammoth.default) {
+      mammoth = mammoth.default
+    }
+    if (!mammoth.extractRawText && mammoth.default) {
+      mammoth = mammoth.default
+    }
+    const result = await mammoth.extractRawText({ path: filePath })
+    return result.value || ''
+  } catch (err) {
+    console.error('[FullTextParser] DOCX parse error:', err)
+    return ''
+  }
+}
+
+
+
+/**
+ * 解析 XLSX / XLS 表格文件，提取单元格纯文本
+ */
+export async function parseXlsx(filePath: string): Promise<string> {
+  try {
+    const mod = await import('xlsx')
+    const XLSX: any = mod.default || mod
+    const workbook = XLSX.readFile(filePath)
+    const textParts: string[] = []
+
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName]
+      if (!sheet) continue
+      const csvContent = XLSX.utils.sheet_to_csv(sheet)
+      if (csvContent && csvContent.trim()) {
+        textParts.push(`--- Sheet: ${sheetName} ---`)
+        textParts.push(csvContent.trim())
+      }
+    }
+
+    return textParts.join('\n')
+  } catch (err) {
+    console.error('[FullTextParser] XLSX parse error:', err)
+    return ''
+  }
+}
+
+/**
+ * 从 officeparser v7 返回的 AST 对象中递归提取纯文本
+ * v7 返回结构化 AST（{ content: [...] }），paragraph 节点上有 text 属性
+ */
+function extractOfficeParserText(result: any): string {
+  // v7 以前：直接返回字符串
+  if (typeof result === 'string') return result
+
+  // v7+：返回 { content: [...] } 的 AST 对象
+  if (!result || !Array.isArray(result.content)) return ''
+
+  const texts: string[] = []
+  const walkNode = (node: any) => {
+    if (!node) return
+    // paragraph 节点：直接取 text
+    if (node.text && typeof node.text === 'string') {
+      texts.push(node.text)
+      return
+    }
+    // 递归子节点
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) walkNode(child)
+    }
+  }
+
+  for (const node of result.content) walkNode(node)
+  return texts.join('\n')
+}
+
+/**
+ * 解析 PPTX 文件，提取纯文本
+ * 兼容 officeparser v7（parseOffice 返回 AST）及旧版（返回字符串）
+ */
+export async function parsePptx(filePath: string): Promise<string> {
+  try {
+    const mod = await import('officeparser')
+    const parser: any = mod.default || mod
+
+    // v7+: parseOffice (async)
+    if (typeof parser.parseOffice === 'function') {
+      const result = await parser.parseOffice(filePath)
+      return extractOfficeParserText(result)
+    }
+
+    // 旧版兼容：parseOfficeAsync
+    if (typeof parser.parseOfficeAsync === 'function') {
+      const text = await parser.parseOfficeAsync(filePath)
+      return typeof text === 'string' ? text : extractOfficeParserText(text)
+    }
+
+    throw new Error('officeparser: no supported parse function found')
+  } catch (err) {
+    console.error('[FullTextParser] PPTX parse error:', err)
+    return ''
+  }
+}
+
+/**
+ * 解析旧版二进制 Office 文件 (.doc / .ppt / .xls)
+ * 兼容 officeparser v7（parseOffice 返回 AST）及旧版（返回字符串）
+ */
+export async function parseLegacyOffice(filePath: string, ext: string): Promise<string> {
+  const lowerExt = ext.toLowerCase()
+  if (lowerExt === '.xls') {
+    return parseXlsx(filePath)
+  }
+
+  try {
+    const mod = await import('officeparser')
+    const parser: any = mod.default || mod
+
+    // v7+: parseOffice (async)
+    if (typeof parser.parseOffice === 'function') {
+      const result = await parser.parseOffice(filePath)
+      return extractOfficeParserText(result)
+    }
+
+    // 旧版兼容：parseOfficeAsync
+    if (typeof parser.parseOfficeAsync === 'function') {
+      const text = await parser.parseOfficeAsync(filePath)
+      return typeof text === 'string' ? text : extractOfficeParserText(text)
+    }
+
+    throw new Error('officeparser: no supported parse function found')
+  } catch (err) {
+    console.warn(`[FullTextParser] Legacy office format (${ext}) parse skipped:`, err)
+    return ''
+  }
+}
+
+/**
+ * 根据文件扩展名自动选择解析器，提取文本内容
+ */
+export async function extractFileContent(filePath: string, ext: string): Promise<string> {
+  const lowerExt = ext.toLowerCase()
+
+  if (lowerExt === '.pdf') {
+    return parsePdf(filePath)
+  }
+
+  if (lowerExt === '.docx') {
+    return parseDocx(filePath)
+  }
+
+  if (lowerExt === '.pptx') {
+    return parsePptx(filePath)
+  }
+
+  if (lowerExt === '.xlsx' || lowerExt === '.xls') {
+    return parseXlsx(filePath)
+  }
+
+  if (lowerExt === '.doc' || lowerExt === '.ppt') {
+    return parseLegacyOffice(filePath, lowerExt)
+  }
+
+  if (isImageExtension(lowerExt)) {
+    return parseImageOcr(filePath)
+  }
+
+  // 纯文本文件（.md / .txt / 其他代码文件）
+  try {
+    return await fs.promises.readFile(filePath, 'utf8')
+  } catch (err) {
+    console.error('[FullTextParser] Text file read error:', err)
+    return ''
+  }
+}
+
+/**
+ * 异步版本别名（保持向下兼容）
+ */
+export async function extractFileContentAsync(filePath: string, ext: string): Promise<string> {
+  return extractFileContent(filePath, ext)
+}
+
+/**
+ * 获取支持的文件扩展名列表（用于文件过滤）
+ */
+export function getSupportedExts(): string[] {
+  return [
+    '.md', '.txt', '.pdf', '.docx', '.pptx', '.xlsx',
+    '.doc', '.ppt', '.xls',
+    '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.gif',
+    '.workflow'
+  ]
+}

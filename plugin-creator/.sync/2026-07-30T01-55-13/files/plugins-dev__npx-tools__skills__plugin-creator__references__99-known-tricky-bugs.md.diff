@@ -1,0 +1,389 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/99-known-tricky-bugs.md b/plugins-dev/npx-tools/skills/plugin-creator/references/99-known-tricky-bugs.md
+new file mode 100644
+index 0000000..30015fb
+--- /dev/null
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/99-known-tricky-bugs.md
+@@ -0,0 +1,383 @@
++# 99 — 高频奇葩问题 FAQ（Known Tricky Bugs）
++
++> **本文件专门收录那些：症状明显、根因反直觉、容易反复踩坑的奇葩 Bug。**
++>
++> 维护规则：每次修复一个"以前被修好但又复现"的问题，必须在此补录，并说明根因与防止复现的方法。
++
++---
++
++## Bug #001 — `AnimatePresence` 子元素缺少 `key` prop
++
++**严重程度**：⚠️ 低（不影响功能，但持续刷 warning，干扰调试）  
++**复现次数**：已复现 5+ 次（2026-07 前后多次反复修复）  
++**影响范围**：所有使用 `framer-motion` / `motion/react` 的插件和宿主组件
++
++### 错误症状
++
++```
++Each child in a list should have a unique "key" prop.
++Check the render method of `ForwardRef(motion.div)`.
++See https://react.dev/link/warning-keys for more information.
++```
++
++调用堆栈通常形如：
++
++```
++sv @ index.js
++a @ index.js
++<ForwardRef(motion.div)>
++Uv @ index.js          ← framer-motion 内部
++Se @ index.js          ← AnimatePresence
++yh @ index.js
++onOpen @ SomeView.tsx  ← 插件 View 的挂载入口
++```
++
++### 根本原因
++
++`AnimatePresence` 需要追踪每个子元素的"进入 / 存在 / 离开"状态来执行动画。因此，它的**所有直接子元素都必须有唯一 `key`**。
++
++问题高发的两种模式：
++
++**模式 A：条件渲染的 `motion.div` 忘加 key**
++
++```tsx
++// ❌ 错误 — AnimatePresence 里的 motion.div 没有 key
++<AnimatePresence>
++  {isVisible && (
++    <motion.div          // ← ⚠️ 缺少 key！
++      initial={{ opacity: 0 }}
++      animate={{ opacity: 1 }}
++      exit={{ opacity: 0 }}
++    >
++      内容
++    </motion.div>
++  )}
++</AnimatePresence>
++```
++
++**模式 B：三元运算符两个分支，空状态分支忘加 key**
++
++```tsx
++// ❌ 错误 — 空状态 <div> 没有 key
++<AnimatePresence initial={false}>
++  {items.length === 0 ? (
++    <div className="empty-state">  // ← ⚠️ 缺少 key！
++      暂无数据
++    </div>
++  ) : (
++    items.map(item => (
++      <motion.div key={item.id} ...>  // ← ✅ 这里有 key
++      </motion.div>
++    ))
++  )}
++</AnimatePresence>
++```
++
++### ✅ 正确写法
++
++```tsx
++// ✅ 正确 — 条件渲染的 motion.div 有 key
++<AnimatePresence>
++  {isVisible && (
++    <motion.div
++      key="my-panel"       // ← 必须有语义化的 key
++      initial={{ opacity: 0 }}
++      animate={{ opacity: 1 }}
++      exit={{ opacity: 0 }}
++    >
++      内容
++    </motion.div>
++  )}
++</AnimatePresence>
++
++// ✅ 正确 — 三元运算符每个分支都有 key
++<AnimatePresence initial={false}>
++  {items.length === 0 ? (
++    <div key="empty-state" className="empty-state">
++      暂无数据
++    </div>
++  ) : (
++    items.map(item => (
++      <motion.div key={item.id} ...>
++      </motion.div>
++    ))
++  )}
++</AnimatePresence>
++```
++
++### 防止复现的检查清单
++
++**每次写 `<AnimatePresence>` 之后，立即执行以下检查：**
++
++- [ ] 是否每个直接子元素都有 `key`？
++- [ ] 条件渲染（`&&`、`? :`）的**每个分支**都有 `key`？
++- [ ] `.map()` 返回的元素有 `key`？（通常已有，但也要确认）
++- [ ] `key` 值是否稳定、语义化（不要用 `Math.random()` 或数组 index 作为 key）？
++
++### 历史修复记录
++
++| 日期 | 文件 | 修复内容 |
++|------|------|---------|
++| 2026-07-29 | `voice-agents/jarvis-ai-voice-dialog/src/App.tsx` | 4 处 `AnimatePresence` 内 `motion.div` 缺 key |
++| 2026-07-29 | `voice-agents/jarvis-ai-voice-dialog/src/components/RemindersList.tsx` | 空状态 `<div>` 缺 key |
++| 2026-07-29 | `typeless-keyboard-shortcut-guide/src/components/SandboxWorkspace.tsx` | `motion.div` 缺 key |
++| 2026-07-29 | `typeless-keyboard-shortcut-guide/src/components/MacSettingsMockup.tsx` | `motion.div` 缺 key |
++
++---
++
++## Bug #002 — React 18 `createRoot` 重复挂载同一容器报错
++
++**严重程度**：🔴 高（视图白屏，React 树崩溃）  
++**复现次数**：已复现 3+ 次  
++**影响范围**：所有实现了 `View` 子类的插件（`onboarding:view`、`workspace:view` 等）
++
++### 错误症状
++
++```
++You are calling ReactDOMClient.createRoot() on a container that has already been 
++passed to createRoot() before. Instead, call root.render() on the existing root 
++instead if you want to update it.
++```
++
++### 根本原因
++
++1. 插件 View 的 `onOpen()` 被二次调用（热重载、路由切换、宿主重新挂载）；
++2. `this.container` 仍然保留着上次 React 18 在上面绑定的 `__reactContainer$` 内部属性；
++3. 直接对 `this.container` 调用 `createRoot()` 触发 React 18 的冲突检测报错。
++
++### ✅ 解决方案：DOM Sub-Container Pattern
++
++```typescript
++export class MyView extends View {
++  private root: ReturnType<typeof createRoot> | null = null;
++  private subContainer: HTMLDivElement | null = null;
++
++  async onOpen(opts?: { container?: HTMLDivElement }) {
++    if (opts?.container) this.container = opts.container;
++    if (!this.container) return;
++
++    // 每次都在新的 subContainer 上 createRoot，而不是直接在 this.container 上
++    if (!this.subContainer || !this.container.contains(this.subContainer)) {
++      this.container.innerHTML = '';
++      this.subContainer = document.createElement('div');
++      this.subContainer.className = 'w-full h-full';
++      this.container.appendChild(this.subContainer);
++      this.root = createRoot(this.subContainer);
++    } else if (!this.root) {
++      this.root = createRoot(this.subContainer);
++    }
++
++    this.root?.render(<MyComponent />);
++  }
++
++  async onClose() {
++    if (this.root) {
++      const rootToUnmount = this.root;
++      this.root = null;
++      // 微任务延迟 unmount，避免 React 批处理冲突
++      queueMicrotask(() => {
++        try { rootToUnmount.unmount(); } catch { /* ignore */ }
++      });
++    }
++    if (this.subContainer?.parentNode) {
++      this.subContainer.parentNode.removeChild(this.subContainer);
++    }
++    this.subContainer = null;
++    if (this.container) this.container.innerHTML = '';
++  }
++}
++```
++
++详见 [04-plugin-types.md](./04-plugin-types.md) 中的完整规范。
++
++---
++
++## Bug #003 — 插件 `activate()` 写了但从不执行（无声失败）
++
++**严重程度**：🔴 高（所有 MCP 工具不可用，完全静默）  
++**复现次数**：已复现 4+ 次  
++**影响范围**：`type: "background"` 或 `type: "hybrid"` 插件
++
++### 错误症状
++
++- `plugin_manager_get_logs` 没有任何输出（连"插件启动"日志都没有）
++- `plugin_manager_list_tools` 返回空列表
++- 调用 MCP 工具报 `tool not found`
++
++### 根本原因
++
++`background` 插件通过 `utilityProcess.fork()` 作为独立 Node.js 子进程运行。ESM 模块只负责**导出** `activate()` 函数，子进程启动后不会自动调用它。
++
++### ✅ 修复：在文件末尾手动调用
++
++```typescript
++// src/index.ts 末尾必须加这一行
++activate().catch(err => {
++  console.error('[Plugin] 激活失败:', err);
++});
++```
++
++---
++
++## Bug #004 — OEM 插件路径 / 环境 URL 在测试环境仍指向生产服务器
++
++**严重程度**：🟡 中（测试环境数据污染生产）  
++**复现次数**：已复现 2+ 次（2026-07-29）  
++**影响范围**：涉及网络请求的插件（如 voice-agents、berrytrace-online）
++
++### 错误症状
++
++开发/测试环境中，插件请求 URL 仍然是 `https://berrytrace.getdear.cn`（生产环境），而不是 `https://dev-berrytrace.getdear.cn`（测试环境）。
++
++### 根本原因
++
++插件内部硬编码了 API Base URL，没有读取宿主注入的环境配置；或者读取的是 `window.electronAPI.oem.getOEMConfig()` 但漏掉了对 `env` 字段的判断。
++
++### ✅ 解决方案
++
++插件中获取环境 URL 必须通过宿主 API 动态读取，**禁止硬编码**：
++
++```typescript
++const cfg = await window.electronAPI.oem.getOEMConfig();
++// cfg.env === 'development' | 'production' | 'test'
++// cfg.apiBaseUrl 由宿主根据当前环境自动注入
++const baseUrl = cfg.apiBaseUrl ?? 'https://berrytrace.getdear.cn';
++```
++
++---
++
++## Bug #005 — `window.electronAPI` 在插件 panel 渲染进程中为 `undefined`
++
++**严重程度**：🔴 高（功能完全不可用）  
++**复现次数**：已复现 3+ 次  
++**影响范围**：新创建的 panel 插件
++
++### 错误症状
++
++```
++TypeError: Cannot read properties of undefined (reading 'callApi')
++// 或
++window.electronAPI is undefined
++```
++
++### 根本原因
++
++panel 插件通过 `BrowserView` / `WebContents` 渲染，它运行在**受限的浏览器沙箱**中。`window.electronAPI` 由宿主 `preload.js` 注入，但插件沙箱的 preload 只注入了**通用插件 SDK**，而不是完整的 `electronAPI`。
++
++插件必须通过 **`berrytrace-plugin-sdk`** 提供的 `sdk.*` 方法访问宿主能力。
++
++**例外**：`builtin-plugins/` 内置插件直接运行在宿主渲染进程中，**可以**使用 `window.electronAPI`。
++
++### ✅ 解决方案
++
++```typescript
++// ❌ 错误 — panel 插件不能用 window.electronAPI
++const result = await window.electronAPI.filesystem.readFile(path);
++
++// ✅ 正确 — 用 SDK
++const result = await sdk.filesystem.readFile(path);
++
++// ✅ 也可以通过通用 callApi
++const result = await sdk.system.callApi('filesystem', 'readFile', [path]);
++```
++
++---
++
++## Bug #006 — 插件热重载后界面"闪回旧内容"（Stale Closure / 状态未清理）
++
++**严重程度**：🟡 中（视觉异常，不影响最终正确性）  
++**复现次数**：已复现 2+ 次  
++**影响范围**：使用 `zustand` store 或模块级单例的插件
++
++### 错误症状
++
++热重载后，界面短暂显示旧数据（旧的 store 状态），然后才更新为最新状态。
++
++### 根本原因
++
++插件 `onClose()` 未正确重置 Zustand store 或模块级单例（如 `OnboardingMachine.getInstance()`）的状态。热重载时，新代码重新挂载，但旧的全局状态仍然存在，导致 UI 短暂读到了旧值。
++
++### ✅ 解决方案
++
++在 `onClose()` 中显式重置所有 store 状态：
++
++```typescript
++async onClose() {
++  // 重置 store（推荐 store 提供标准 reset() action）
++  useMyStore.getState().reset();
++  // 销毁单例
++  MySingleton.destroy();
++  // 最后 unmount React 树
++  this.root?.unmount();
++  this.root = null;
++}
++```
++
++推荐在 Zustand store 中统一提供 `reset()` action：
++
++```typescript
++const useMyStore = create<MyState>((set) => ({
++  data: null,
++  loading: false,
++  reset: () => set({ data: null, loading: false }),  // 标准 reset
++}));
++```
++
++---
++
++## Bug #007 — `sdk.events.emit(...)` 在 background 进程中无法触发 UI 更新
++
++**严重程度**：🟡 中（事件丢失，UI 不响应）  
++**复现次数**：已复现 2+ 次  
++**影响范围**：hybrid 类型插件的 background → UI 通信
++
++### 错误症状
++
++background 进程调用 `sdk.events.emit('my:event', data)` 后，panel（UI）端的事件监听器没有收到消息。
++
++### 根本原因
++
++`sdk.events.emit` 在 background 进程中走 **IPC 管道**（`background → 宿主主进程 → 宿主渲染进程`）。如果 `plugin.json` 的 `contributes.events.emits` 中**没有声明**该事件，宿主主进程会过滤丢弃它。
++
++### ✅ 解决方案
++
++在 `plugin.json` 中显式声明所有要发射的事件：
++
++```json
++{
++  "contributes": {
++    "events": {
++      "emits": ["my:event", "my:other-event"],
++      "listens": ["system:ready"]
++    }
++  }
++}
++```
++
++**注意**：`emits`（我发射）和 `listens`（我接收）是两个独立字段，两者默认都不转发，必须显式声明。
++
++---
++
++## 维护指南
++
++当你修复了一个"修好又复发"的 Bug，按此模板追加：
++
++```markdown
++## Bug #XXX — [一句话描述问题]
++
++**严重程度**：🔴 高 / 🟡 中 / ⚠️ 低  
++**复现次数**：已复现 X+ 次  
++**影响范围**：[受影响的插件类型/场景]
++
++### 错误症状
++[控制台输出 / 现象描述]
++
++### 根本原因
++[为什么会这样，用"因为...所以..."的结构说清楚]
++
++### ✅ 解决方案
++[最小可行的修复代码/步骤]
++
++### 历史修复记录（可选）
++| 日期 | 文件 | 修复内容 |
++```

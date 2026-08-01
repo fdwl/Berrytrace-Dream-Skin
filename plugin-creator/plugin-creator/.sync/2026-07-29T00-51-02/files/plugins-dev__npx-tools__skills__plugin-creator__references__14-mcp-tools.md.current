@@ -1,0 +1,66 @@
+# 14 — MCP Host Tools 与工具命名规范
+
+## 一、 MCP 工具命名规范 (MCP Tool Naming Standard)
+
+为了防止不同插件注册的 MCP 工具产生命名冲突，以及在 Agent 检索和调用链路中保证 100% 的一致性，所有插件工具的命名必须严格遵守以下规范：
+
+### 1. 强制前缀命名空间
+任何插件声明的 MCP 工具，其名称必须以**插件 ID 的短后缀（Short Name）**作为下划线前缀：
+* **规则**：`[plugin_id_short]_[tool_name]`
+* **示例**：
+  - 插件 ID 为 `com.berrytrace.plugin.datahub` ──> 前缀为 `datahub_`。工具应命名为 `datahub_list_datasources`、`datahub_inspect_schema`。
+  - 插件 ID 为 `com.berrytrace.plugin.daily-chronicle` ──> 前缀为 `daily_chronicle_`。工具应命名为 `daily_chronicle_save_summary`。
+  - 插件 ID 为 `com.berrytrace.plugin.npx-tools` ──> 前缀为 `npx_` / `scheduler_` 等。
+
+### 2. 例外情况：核心平台能力工具
+对于核心推理内核（如 `cline-agent`）向外暴露的、会被前端界面（如图片渲染、视频渲染、窗口操控）和大量内置文档直接硬编码引用的**核心平台通用能力**，允许使用全局系统前缀（如 `os_`、`generate_`、`segment_`、`upload_`），例如 `generate_image`、`os_capture_window`。非核心业务插件严禁侵占此类命名空间。
+
+### 3. 静态声明与注册一致性
+* **禁止运行时动态改名**：宿主框架（`McpHost`）和插件 SDK 在注册工具时，将忠实地按声明载入，绝不对工具名称进行任何运行时的“前缀补全”或“动态替换”。
+* **前后端名称绝对一致**：
+  1. 必须在 `plugin.json` 的 `mcp.tools` 声明中写写好包含前缀的最终工具名（例如 `datahub_list_datasources`）。
+  2. 必须在插件后台代码中，以相同的名字进行注册绑定：
+     ```typescript
+     sdk.mcp.registerToolHandler('datahub_list_datasources', async (args) => { ... })
+     ```
+  这保证了在 `plugin.json` ──> `McpHost` ──> `McpGateway` ──> `SDK.register` 整个链条中名字绝对一致，杜绝任何名称分裂与调用阻断。
+
+---
+
+## 二、 物理调试与热重载通道
+
+开发过程中，AI 在 BerryTrace 宿主中可通过两种通道完成开发与加载。
+
+### 通道 1：berrytrace:// 协议（零依赖，任何开发工具可用）
+
+无需任何额外插件运行，只要宿主启动即可。适用于 CodeBuddy、Cursor、终端等任何编程工具。
+
+| 协议 | 用途 |
+|------|------|
+| `berrytrace://load-plugin?path=plugins-dev/my-plugin` | 首次加载开发模式插件 |
+| `berrytrace://reload-plugin?id=com.berrytrace.plugin.xxx` | 构建后热重载 |
+
+用法：
+```bash
+# 任何终端 / AI 工具都可执行
+open 'berrytrace://load-plugin?path=plugins-dev/my-plugin'
+open 'berrytrace://reload-plugin?id=com.berrytrace.plugin.my-plugin-xxx'
+```
+
+### 通道 2：MCP Host Tools（npx-tools 插件注册，需插件已加载）
+
+| 工具 | 用途 | 参数 |
+|------|------|------|
+| `plugin_manager_load_unpacked` | 首次加载开发模式插件 | `{ path: "plugins-dev/xxx" }` |
+| `plugin_manager_reload` | 构建后热重载 | `{ pluginId: "..." }` |
+| `plugin_manager_get_logs` | 查看插件日志 | `{ pluginId: "...", limit: 30 }` |
+| `plugin_manager_list_tools` | 查看插件注册的 MCP 工具列表 | `{ pluginId: "..." }` |
+| `plugin_manager_get_tool` | 查询单个 MCP 工具状态和 schema | `{ pluginId: "...", toolName: "..." }` |
+| `plugin_manager_enable_plugin` | 启用插件 | `{ pluginId: "..." }` |
+| `plugin_manager_disable_plugin` | 禁用插件 | `{ pluginId: "..." }` |
+| `capability_search` | 搜索 Agent 能力（MCP 工具 + Skill） | `{ query: "..." }` |
+
+### 完整开发循环：
+```
+改代码 → npm run build → berrytrace://reload-plugin? 或 plugin_manager_reload → plugin_manager_get_logs
+```

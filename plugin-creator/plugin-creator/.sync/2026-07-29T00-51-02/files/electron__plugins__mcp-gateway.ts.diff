@@ -1,0 +1,527 @@
+diff --git a/electron/plugins/mcp-gateway.ts b/electron/plugins/mcp-gateway.ts
+new file mode 100644
+index 0000000..db745c8
+--- /dev/null
++++ b/electron/plugins/mcp-gateway.ts
+@@ -0,0 +1,521 @@
++import type { IncomingMessage, ServerResponse } from 'http';
++import type { URL } from 'url';
++import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
++import { join } from 'path';
++import { app } from 'electron';
++import { McpHost, type McpToolDeclaration } from './mcp-host';
++
++export interface ScopeDefinition {
++  allowedTools?: string[];
++  allowedPlugins?: string[];
++  expiresAt?: number;
++}
++
++export interface McpProfile {
++  id: string;
++  name: string;
++  description?: string;
++  token: string;
++  allowedTools: string[];
++  allowedPlugins?: string[];
++  createdAt: number;
++}
++
++export type SessionToolsResolver = (sessionId: string) => ScopeDefinition | string[] | null | undefined;
++
++/**
++ * Common redundant built-in CLI tools that external ACP agents (CodeBuddy/OpenCLI/Claude)
++ * already implement natively. We filter these out to avoid tool duplication and context bloat.
++ */
++const REDUNDANT_BUILTIN_TOOLS = new Set([
++  'read_file',
++  'read_files',
++  'view_file',
++  'write_file',
++  'edit_file',
++  'execute_command',
++  'run_command',
++  'run_commands',
++  'bash',
++  'sh',
++  'shell',
++  'editor',
++  'apply_patch',
++  'execute_bash',
++  'execute_script',
++]);
++
++const getPrefix = (name: string): string | null => {
++  const parts = name.split('_');
++  if (parts.length > 1) {
++    const firstPart = parts[0];
++    if (firstPart.length >= 3) {
++      return firstPart;
++    }
++  }
++  return null;
++};
++
++export class McpGateway {
++  private static instance: McpGateway;
++  private scopeTokens = new Map<string, ScopeDefinition>();
++  private activeSseConnections = new Map<string, ServerResponse>();
++  private profiles = new Map<string, McpProfile>();
++  private sessionToolsResolver: SessionToolsResolver | null = null;
++  private profileStorePath: string;
++
++  private constructor() {
++    const configDir = join(app.getPath('home'), '.berrytrace');
++    try {
++      mkdirSync(configDir, { recursive: true });
++    } catch {
++      // ignore
++    }
++    this.profileStorePath = join(configDir, 'mcp_profiles.json');
++    this.loadProfiles();
++  }
++
++  public static getInstance(): McpGateway {
++    if (!McpGateway.instance) {
++      McpGateway.instance = new McpGateway();
++    }
++    return McpGateway.instance;
++  }
++
++  public setSessionToolsResolver(resolver: SessionToolsResolver): void {
++    this.sessionToolsResolver = resolver;
++    console.log('[McpGateway] Registered dynamic SessionToolsResolver.');
++  }
++
++  private loadProfiles(): void {
++    try {
++      if (existsSync(this.profileStorePath)) {
++        const text = readFileSync(this.profileStorePath, 'utf-8');
++        const list: McpProfile[] = JSON.parse(text || '[]');
++        this.profiles.clear();
++        for (const p of list) {
++          if (p && p.id && p.token) {
++            this.profiles.set(p.id, p);
++          }
++        }
++        console.log(`[McpGateway] Loaded ${this.profiles.size} persistent MCP Profiles.`);
++      }
++    } catch (err) {
++      console.error('[McpGateway] Failed to load MCP profiles:', err);
++    }
++  }
++
++  private saveProfilesToDisk(): void {
++    try {
++      const list = Array.from(this.profiles.values());
++      writeFileSync(this.profileStorePath, JSON.stringify(list, null, 2), 'utf-8');
++      console.log(`[McpGateway] Saved ${list.length} MCP Profiles to ${this.profileStorePath}`);
++    } catch (err) {
++      console.error('[McpGateway] Failed to save MCP profiles:', err);
++    }
++  }
++
++  public listProfiles(): McpProfile[] {
++    return Array.from(this.profiles.values());
++  }
++
++  public saveProfile(profileInput: Partial<McpProfile> & { name: string; allowedTools: string[] }): McpProfile {
++    const id = profileInput.id || `prof_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
++    const token = profileInput.token || `tok_${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 6)}`;
++    
++    const profile: McpProfile = {
++      id,
++      name: profileInput.name,
++      description: profileInput.description || '',
++      token,
++      allowedTools: profileInput.allowedTools || [],
++      allowedPlugins: profileInput.allowedPlugins || [],
++      createdAt: profileInput.createdAt || Date.now(),
++    };
++
++    this.profiles.set(id, profile);
++    this.saveProfilesToDisk();
++    return profile;
++  }
++
++  public deleteProfile(id: string): boolean {
++    const deleted = this.profiles.delete(id);
++    if (deleted) {
++      this.saveProfilesToDisk();
++    }
++    return deleted;
++  }
++
++  public registerScopeToken(token: string, scope: ScopeDefinition): void {
++    this.scopeTokens.set(token, scope);
++  }
++
++  public updateScopeToken(token: string, scope: Partial<ScopeDefinition>): void {
++    const existing = this.scopeTokens.get(token) || {};
++    let newTools = scope.allowedTools !== undefined ? scope.allowedTools : existing.allowedTools;
++    if (newTools && newTools.length > 15) {
++      newTools = newTools.slice(0, 15);
++    }
++    const updated = { ...existing, ...scope, allowedTools: newTools };
++    this.scopeTokens.set(token, updated);
++  }
++
++  public unregisterScopeToken(token: string): void {
++    this.scopeTokens.delete(token);
++    this.activeSseConnections.delete(token);
++  }
++
++  /**
++   * 解析请求对应的 Scope 授权声明
++   */
++  private resolveScope(sessionId: string | null, token: string | null): ScopeDefinition | null {
++    // 1. 如果有 Session ID（来自路径或参数），优先从 AgentChatSession 动态解析
++    if (sessionId) {
++      if (this.sessionToolsResolver) {
++        try {
++          const res = this.sessionToolsResolver(sessionId);
++          if (res !== undefined && res !== null) {
++            const allowedTools = Array.isArray(res) ? res : res.allowedTools;
++            const allowedPlugins = Array.isArray(res) ? undefined : res.allowedPlugins;
++            return { allowedTools, allowedPlugins };
++          }
++        } catch (err) {
++          console.error(`[McpGateway] Error resolving tools for session ${sessionId}:`, err);
++        }
++      }
++
++      const sessionScope = this.scopeTokens.get(sessionId) || this.scopeTokens.get(`acp_scope_${sessionId}`);
++      if (sessionScope) {
++        return sessionScope;
++      }
++
++      // 如果属于合法的 session 专属 URL 访问，默认开放当前有效自建 MCP 工具全集
++      return { allowedTools: undefined };
++    }
++
++    // 2. 检查 Token
++    if (token) {
++      // 从 scopeTokens 匹配
++      const directScope = this.scopeTokens.get(token);
++      if (directScope) return directScope;
++
++      // 从 持久化 MCP Profile 匹配
++      for (const p of this.profiles.values()) {
++        if (p.token === token) {
++          return {
++            allowedTools: p.allowedTools,
++            allowedPlugins: p.allowedPlugins,
++          };
++        }
++      }
++    }
++
++    return null;
++  }
++
++  /**
++   * 拦截并处理来自于 ElectronLocalServer 的 /mcp/* 路径请求
++   */
++  public async handleHttpRequest(req: IncomingMessage, res: ServerResponse, urlObj: URL): Promise<boolean> {
++    const pathname = urlObj.pathname;
++    if (!pathname.startsWith('/mcp')) {
++      return false;
++    }
++
++    // 解析 Session ID 与 Token（支持专属 URL 路径 /mcp/session/:sessionId/* 以及 Query 参数）
++    let sessionId: string | null = null;
++    const sessionMatch = pathname.match(/^\/mcp\/session\/([^/]+)(\/(sse|message))?/);
++    if (sessionMatch && sessionMatch[1]) {
++      sessionId = decodeURIComponent(sessionMatch[1]);
++    } else {
++      sessionId = urlObj.searchParams.get('sessionId') || urlObj.searchParams.get('session_id');
++    }
++
++    const tokenFromQuery = urlObj.searchParams.get('token');
++    const authHeader = req.headers['authorization'];
++    const tokenFromHeader = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
++    const token = tokenFromQuery || tokenFromHeader || (sessionId ? `acp_scope_${sessionId}` : null);
++
++    // 如果从 token 中包含 session_...，自动提取出 sessionId
++    if (!sessionId && token) {
++      if (token.includes('session_')) {
++        const match = token.match(/(session_[a-zA-Z0-9_]+)/);
++        if (match) {
++          sessionId = match[1];
++        }
++      }
++    }
++
++    // 严密 鉴权：解析 Session 属性或 Profile Token，无效时返回 401
++    const scope = this.resolveScope(sessionId, token);
++
++    if (!scope) {
++      res.writeHead(401, { 'Content-Type': 'application/json' });
++      res.end(JSON.stringify({
++        error: `Unauthorized: Invalid or inactive MCP Session/Profile. (sessionId=${sessionId || 'none'}, token=${token || 'none'})`
++      }));
++      return true;
++    }
++
++    const isSseRequest = req.method === 'GET' && (
++      pathname === '/mcp/sse' ||
++      pathname === '/mcp' ||
++      pathname.endsWith('/sse') ||
++      (sessionMatch && (!sessionMatch[3] || sessionMatch[3] === 'sse'))
++    );
++
++    // OpenCode/MiMo POSTs JSON-RPC messages directly to the /sse path (non-standard),
++    // while CodeBuddy/Claude use the standard /message path. Support both.
++    const isMessageRequest = req.method === 'POST' && (
++      pathname === '/mcp/message' ||
++      pathname.endsWith('/message') ||
++      pathname.endsWith('/sse') ||
++      pathname === '/mcp/sse' ||
++      (sessionMatch && (sessionMatch[3] === 'message' || sessionMatch[3] === 'sse'))
++    );
++
++    // ── 1. SSE 握手 (GET /mcp/session/:sessionId/sse 或 /mcp/sse) ─────────
++    if (isSseRequest) {
++      res.writeHead(200, {
++        'Content-Type': 'text/event-stream',
++        'Cache-Control': 'no-cache',
++        'Connection': 'keep-alive',
++        'Access-Control-Allow-Origin': '*',
++      });
++
++      const hostHeader = req.headers.host || '127.0.0.1:31828';
++      const messageEndpoint = sessionId
++        ? `http://${hostHeader}/mcp/session/${encodeURIComponent(sessionId)}/message`
++        : `http://${hostHeader}/mcp/message?token=${encodeURIComponent(token || '')}`;
++
++      res.write(`event: endpoint\ndata: ${messageEndpoint}\n\n`);
++      
++      const connKey = sessionId || token || 'anon';
++      this.activeSseConnections.set(connKey, res);
++
++      req.on('close', () => {
++        this.activeSseConnections.delete(connKey);
++      });
++      return true;
++    }
++
++    // ── 2. JSON-RPC 消息处理 (POST /mcp/session/:sessionId/message 或 /mcp/message) ─
++    if (isMessageRequest) {
++      let body = '';
++      req.on('data', (chunk) => { body += chunk; });
++      req.on('end', async () => {
++        try {
++          const json = JSON.parse(body || '{}');
++
++          // 遵循 MCP HTTP SSE 官方规范：对于 Notification 通知 (无 id 字段)，服务端返回 HTTP 202 Accepted 且无响应体
++          if (json.id === undefined) {
++            await this.handleJsonRpcMessage(json, scope);
++            res.writeHead(202, {
++              'Content-Type': 'application/json',
++              'Access-Control-Allow-Origin': '*',
++            });
++            res.end();
++            return;
++          }
++
++          const response = await this.handleJsonRpcMessage(json, scope);
++          const responseStr = JSON.stringify(response);
++
++          // 兼容性适配 (如 CodeBuddy)：部分 MCP SSE 客户端期望服务端处理完请求后，
++          // 通过之前建立的 SSE 连接 (GET /sse) 推送响应数据，而 POST 请求本身直接响应 202 Accepted 结束。
++          const connKey = sessionId || token || 'anon';
++          const sseRes = this.activeSseConnections.get(connKey);
++          if (sseRes && !sseRes.writableEnded) {
++            sseRes.write(`data: ${responseStr}\n\n`);
++            res.writeHead(202, {
++              'Content-Type': 'application/json',
++              'Access-Control-Allow-Origin': '*',
++            });
++            res.end();
++            return;
++          }
++
++          // 标准模式：若不存在活跃的 SSE 连接，直接在 POST 响应体中返回 (兼容 MiMo/OpenCode)
++          res.writeHead(200, {
++            'Content-Type': 'application/json',
++            'Access-Control-Allow-Origin': '*',
++          });
++          res.end(responseStr);
++        } catch (err) {
++          res.writeHead(400, { 'Content-Type': 'application/json' });
++          const errMsg = err instanceof Error ? err.message : String(err);
++          res.end(JSON.stringify({
++            jsonrpc: '2.0',
++            error: { code: -32700, message: `Parse error: ${errMsg}` },
++            id: null,
++          }));
++        }
++      });
++      return true;
++    }
++
++    return false;
++  }
++
++  /**
++   * 处理 MCP JSON-RPC 规范消息
++   */
++  private async handleJsonRpcMessage(msg: Record<string, unknown> | null | undefined, scope: ScopeDefinition): Promise<Record<string, unknown> | null> {
++    if (!msg || msg.jsonrpc !== '2.0') {
++      return {
++        jsonrpc: '2.0',
++        error: { code: -32600, message: 'Invalid Request: Must specify jsonrpc: "2.0"' },
++        id: msg?.id !== undefined ? msg.id : null,
++      };
++    }
++
++    const { method, params, id } = msg as { method?: string; params?: { name?: string; arguments?: Record<string, unknown> }; id?: unknown };
++
++    switch (method) {
++      case 'initialize':
++        return {
++          jsonrpc: '2.0',
++          result: {
++            protocolVersion: '2024-11-05',
++            capabilities: {
++              tools: {},
++            },
++            serverInfo: {
++              name: 'BerryTrace-MCP-Gateway',
++              version: '1.0.0',
++            },
++          },
++          id,
++        };
++
++      case 'notifications/initialized':
++        return { jsonrpc: '2.0', result: {}, id };
++
++      case 'tools/list': {
++        const allHostTools = McpHost.getInstance().listTools();
++
++        // 过滤掉与外部 ACP 代理重叠的内置通用文件/命令行工具
++        const filteredCustomTools = allHostTools.filter((t: McpToolDeclaration) => {
++          const nameLower = t.name.toLowerCase();
++          if (REDUNDANT_BUILTIN_TOOLS.has(nameLower)) {
++            return false;
++          }
++
++          // 核心辅助工具永远放行
++          if (nameLower === 'capability_search' || nameLower === 'workflow') {
++            return true;
++          }
++
++          // 按照该 Session / Profile 声明的工具与插件白名单过滤
++          let allowed = true;
++          if (scope.allowedTools && scope.allowedTools.length > 0) {
++            allowed = scope.allowedTools.some(at => at.toLowerCase() === nameLower || t.name.toLowerCase().includes(at.toLowerCase()));
++            
++            // 前缀命名空间感应 (e.g. datahub_*)
++            if (!allowed) {
++              const tPrefix = getPrefix(t.name);
++              if (tPrefix) {
++                allowed = scope.allowedTools.some(at => {
++                  const atPrefix = getPrefix(at);
++                  return atPrefix && atPrefix.toLowerCase() === tPrefix.toLowerCase();
++                });
++              }
++            }
++          }
++          if (!allowed && scope.allowedPlugins && scope.allowedPlugins.length > 0) {
++            allowed = scope.allowedPlugins.includes(t.pluginId);
++          }
++
++          return allowed;
++        });
++
++        // 由于上面白名单机制已自动过滤掉无关插件的工具，返回的工具总数处于极低安全线内，不再需要硬截断 (slice(0, 25))
++
++        const toolsFormatted = filteredCustomTools.map((t: McpToolDeclaration) => {
++          const nameLower = t.name.toLowerCase();
++          // 如果 scope.allowedTools 未定义，代表默认开放全部工具，视为显式命中
++          const isExplicitlyAllowed = !scope.allowedTools || scope.allowedTools.some(
++            at => at.toLowerCase() === nameLower || nameLower.includes(at.toLowerCase())
++          );
++          const isEssential = nameLower === 'capability_search' || nameLower === 'workflow';
++
++          // 如果既不是显式命中，也不是基础核心工具，但又是伴随工具，则返回 Stub 占位
++          if (!isExplicitlyAllowed && !isEssential) {
++            return {
++              name: t.name,
++              description: `[Companion Tool Placeholder] This companion tool is part of the same plugin/series as other matched tools. Its full parameter schema is hidden to save context tokens. If you need to invoke this tool, you MUST first run: capability_search("${t.name}") to fetch its real parameters and documentation. | ${t.description || ''}`,
++              inputSchema: { type: 'object', properties: {} },
++            };
++          }
++
++          return {
++            name: t.name,
++            description: t.description || `BerryTrace MCP tool: ${t.name}`,
++            inputSchema: t.inputSchema || { type: 'object', properties: {} },
++          };
++        });
++
++        console.log(`[McpGateway] Listed ${toolsFormatted.length} active custom MCP tools for session/profile.`);
++        return {
++          jsonrpc: '2.0',
++          result: {
++            tools: toolsFormatted,
++          },
++          id,
++        };
++      }
++
++      case 'tools/call': {
++        const { name, arguments: args } = params || {};
++        if (!name) {
++          return {
++            jsonrpc: '2.0',
++            error: { code: -32602, message: 'Invalid params: "name" is required' },
++            id,
++          };
++        }
++
++        console.log(`[McpGateway] Executing MCP tool call "${name}" via Gateway...`);
++        try {
++          const output = await McpHost.getInstance().callTool(name, args || {});
++          const textResult = typeof output === 'object' ? JSON.stringify(output, null, 2) : String(output ?? '');
++          return {
++            jsonrpc: '2.0',
++            result: {
++              content: [
++                {
++                  type: 'text',
++                  text: textResult,
++                },
++              ],
++            },
++            id,
++          };
++        } catch (err) {
++          console.error(`[McpGateway] Error executing tool "${name}":`, err);
++          const errMsg = err instanceof Error ? err.message : String(err);
++          return {
++            jsonrpc: '2.0',
++            result: {
++              content: [
++                {
++                  type: 'text',
++                  text: `Error executing MCP tool "${name}": ${errMsg}`,
++                },
++              ],
++              isError: true,
++            },
++            id,
++          };
++        }
++      }
++
++      default:
++        return {
++          jsonrpc: '2.0',
++          error: { code: -32601, message: `Method not found: ${method}` },
++          id,
++        };
++    }
++  }
++}

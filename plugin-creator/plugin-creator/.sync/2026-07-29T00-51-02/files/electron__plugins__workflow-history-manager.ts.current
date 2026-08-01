@@ -1,0 +1,173 @@
+import fs from 'fs';
+import path from 'path';
+// @ts-ignore
+import yaml from 'js-yaml';
+import type { WorkflowDefinition } from './workflow-types';
+
+export interface WorkflowHistorySnapshot {
+  workflowId: string;
+  timestamp: number;
+  dateStr: string;
+  filePath: string;
+  definition: WorkflowDefinition;
+  comment?: string;
+}
+
+export class WorkflowHistoryManager {
+  private static instance: WorkflowHistoryManager | null = null;
+
+  private constructor() {}
+
+  public static getInstance(): WorkflowHistoryManager {
+    if (!WorkflowHistoryManager.instance) {
+      WorkflowHistoryManager.instance = new WorkflowHistoryManager();
+    }
+    return WorkflowHistoryManager.instance;
+  }
+
+  private getHistoryDir(workflowId: string): string {
+    const historyDir = path.resolve(process.cwd(), '.berrytrace', 'workflow_history', workflowId);
+    if (!fs.existsSync(historyDir)) {
+      fs.mkdirSync(historyDir, { recursive: true });
+    }
+    return historyDir;
+  }
+
+  /**
+   * 保存零 Git 物理快照备份（仅在内容有实际变更时保存）
+   */
+  public saveSnapshot(def: WorkflowDefinition, comment?: string): WorkflowHistorySnapshot | null {
+    if (!def || !def.id) return null;
+    try {
+      const dir = this.getHistoryDir(def.id);
+
+      // 获取最近的一次快照以比对变更，防止重复保存
+      const latest = this.listSnapshots(def.id)[0];
+      if (latest) {
+        const cleanDef = { ...def, pluginId: undefined };
+        const cleanLatest = { ...latest.definition, pluginId: undefined };
+        
+        // 忽略下划线开头的元数据字段，避免因为时间戳/备注不同而判定为有变更
+        for (const key of Object.keys(cleanDef)) {
+          if (key.startsWith('_')) delete (cleanDef as any)[key];
+        }
+        for (const key of Object.keys(cleanLatest)) {
+          if (key.startsWith('_')) delete (cleanLatest as any)[key];
+        }
+
+        if (JSON.stringify(cleanDef) === JSON.stringify(cleanLatest)) {
+          console.log(`[WorkflowHistoryManager] Snapshot definition is identical to latest version, skipping duplicate save.`);
+          return latest;
+        }
+      }
+
+      const timestamp = Date.now();
+      const dateStr = new Date(timestamp).toISOString();
+      const fileName = `${timestamp}.workflow`;
+      const filePath = path.join(dir, fileName);
+
+      const snapshotData = {
+        _snapshotTimestamp: timestamp,
+        _snapshotDate: dateStr,
+        _comment: comment || '物理历史快照',
+        ...def,
+      };
+
+      const yamlContent = yaml.dump(snapshotData);
+      fs.writeFileSync(filePath, yamlContent, 'utf-8');
+      console.log(`[WorkflowHistoryManager] Saved history snapshot for "${def.id}" at "${filePath}"`);
+
+      return {
+        workflowId: def.id,
+        timestamp,
+        dateStr,
+        filePath,
+        definition: def,
+        comment,
+      };
+    } catch (err) {
+      console.error(`[WorkflowHistoryManager] Failed to save snapshot for "${def.id}":`, err);
+      return null;
+    }
+  }
+
+  /**
+   * 列出指定 Workflow 的所有历史快照
+   */
+  public listSnapshots(workflowId: string): WorkflowHistorySnapshot[] {
+    const snapshots: WorkflowHistorySnapshot[] = [];
+    try {
+      const dir = path.resolve(process.cwd(), '.berrytrace', 'workflow_history', workflowId);
+      if (!fs.existsSync(dir)) return [];
+
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.workflow'));
+      for (const file of files) {
+        const filePath = path.join(dir, file);
+        try {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const doc = yaml.load(content) as any;
+          const timestamp = doc._snapshotTimestamp || parseInt(file.replace('.workflow', ''), 10) || 0;
+          snapshots.push({
+            workflowId,
+            timestamp,
+            dateStr: doc._snapshotDate || new Date(timestamp).toISOString(),
+            filePath,
+            definition: doc as WorkflowDefinition,
+            comment: doc._comment,
+          });
+        } catch {
+          // ignore corrupt json
+        }
+      }
+
+      snapshots.sort((a, b) => b.timestamp - a.timestamp);
+    } catch (err) {
+      console.error(`[WorkflowHistoryManager] Failed to list snapshots for "${workflowId}":`, err);
+    }
+    return snapshots;
+  }
+
+  /**
+   * 读取特定快照定义
+   */
+  public getSnapshot(workflowId: string, timestamp: number): WorkflowDefinition | null {
+    const list = this.listSnapshots(workflowId);
+    const found = list.find((s) => s.timestamp === timestamp);
+    return found ? found.definition : null;
+  }
+
+  /**
+   * 删除指定时间戳的快照
+   */
+  public deleteSnapshot(workflowId: string, timestamp: number): boolean {
+    try {
+      const dir = path.resolve(process.cwd(), '.berrytrace', 'workflow_history', workflowId);
+      const filePath = path.join(dir, `${timestamp}.workflow`);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        return true;
+      }
+    } catch (err) {
+      console.error(`[WorkflowHistoryManager] Failed to delete snapshot:`, err);
+    }
+    return false;
+  }
+
+  /**
+   * 清空指定 Workflow 的所有历史快照
+   */
+  public clearSnapshots(workflowId: string): boolean {
+    try {
+      const dir = path.resolve(process.cwd(), '.berrytrace', 'workflow_history', workflowId);
+      if (!fs.existsSync(dir)) return true;
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith('.workflow'));
+      for (const file of files) {
+        fs.unlinkSync(path.join(dir, file));
+      }
+      return true;
+    } catch (err) {
+      console.error(`[WorkflowHistoryManager] Failed to clear snapshots:`, err);
+    }
+    return false;
+  }
+}

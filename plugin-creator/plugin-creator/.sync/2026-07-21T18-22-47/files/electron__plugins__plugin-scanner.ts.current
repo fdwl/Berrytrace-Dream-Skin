@@ -1,0 +1,119 @@
+import { join } from 'path';
+import { promises as fs } from 'fs';
+import { app } from 'electron';
+import { PluginManifest, PluginStatus, PluginVerifier } from './plugin-verifier';
+import { PLUGINS_DIR } from '../config/paths';
+
+export interface ScannedPlugin {
+  manifest: PluginManifest;
+  path: string;
+  status: PluginStatus;
+  isDevFolder: boolean;
+  installedAt?: string;
+  isObserving?: boolean;
+}
+
+export class PluginScanner {
+  public static async scanPluginFolder(fullPath: string, isDevFolder: boolean = false): Promise<ScannedPlugin | null> {
+    const manifestPath = join(fullPath, 'plugin.json');
+    const hasManifest = await fs.stat(manifestPath).then(s => s.isFile()).catch(() => false);
+    if (!hasManifest) return null;
+
+    try {
+      const content = await fs.readFile(manifestPath, 'utf-8');
+      const manifest: PluginManifest = JSON.parse(content);
+      if (manifest.id) {
+        const status = await PluginVerifier.getPluginStatus(manifest, fullPath, false);
+        const manifestStat = await fs.stat(manifestPath).catch(() => null);
+        const installedAt = manifestStat ? (manifestStat.birthtime || manifestStat.mtime || new Date()).toISOString() : new Date().toISOString();
+        const installedTime = new Date(installedAt).getTime();
+        const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+        const isObserving = !isDevFolder && status !== 'APPROVED' && (installedTime > thirtyDaysAgo);
+
+        return {
+          manifest,
+          path: fullPath,
+          status,
+          isDevFolder,
+          installedAt,
+          isObserving,
+        };
+      }
+    } catch (err) {
+      console.error(`[PluginScanner] Failed to read manifest at ${manifestPath}:`, err);
+    }
+    return null;
+  }
+
+  public static async scanDirectory(dir: string, isDevFolder: boolean): Promise<ScannedPlugin[]> {
+    const results: ScannedPlugin[] = [];
+    try {
+      const files = await fs.readdir(dir);
+      // 并行扫描所有子目录，避免串行 await 阻塞启动
+      const scannedList = await Promise.all(
+        files.map(async (file) => {
+          const fullPath = join(dir, file);
+          const stat = await fs.stat(fullPath).catch(() => null);
+          if (stat && stat.isDirectory()) {
+            return this.scanPluginFolder(fullPath, isDevFolder);
+          }
+          return null;
+        })
+      );
+      for (const scanned of scannedList) {
+        if (scanned) {
+          results.push(scanned);
+        }
+      }
+    } catch (err) {
+      console.error(`[PluginScanner] Error reading folder ${dir}:`, err);
+    }
+    return results;
+  }
+
+  public static async scanAll(): Promise<Map<string, ScannedPlugin>> {
+    const pluginsMap = new Map<string, ScannedPlugin>();
+    const { oemManager } = await import('../services/oem-manager');
+    const oemConfig = oemManager.getConfig();
+    const oemId = oemConfig.oemId || 'default';
+
+    // 1. Scan Prod Directory Only (user-installed plugins, isolated by OEM mode)
+    const oemPluginDir = oemId === 'default' ? PLUGINS_DIR : join(PLUGINS_DIR, 'oem_plugins', oemId);
+    await fs.mkdir(oemPluginDir, { recursive: true });
+    const prodScanned = await this.scanDirectory(oemPluginDir, false);
+    for (const item of prodScanned) {
+      pluginsMap.set(item.manifest.id, item);
+    }
+
+    // 2. Scan OEM Built-in Plugins
+    try {
+      const isPackaged = app.isPackaged;
+      const builtinPluginsDir = isPackaged
+        ? join(app.getAppPath(), 'dist', 'plugins')
+        : join(app.getAppPath(), 'builtin-plugins');
+
+      const stat = await fs.stat(builtinPluginsDir).catch(() => null);
+      if (stat && stat.isDirectory()) {
+        const { oemManager } = await import('../services/oem-manager');
+        const allowedBuiltins = oemManager.getConfig().builtinPlugins || [];
+
+        const builtinScanned = await this.scanDirectory(builtinPluginsDir, !isPackaged);
+        for (const item of builtinScanned) {
+          if (allowedBuiltins.includes(item.manifest.id)) {
+            if (isPackaged) {
+              item.status = 'APPROVED'; // Force APPROVED status in production for whitelisted built-ins
+            }
+            pluginsMap.set(item.manifest.id, item);
+            console.log(`[PluginScanner] Loaded OEM builtin plugin: ${item.manifest.id} (status: ${item.status})`);
+          } else {
+            console.log(`[PluginScanner] Ignored OEM builtin plugin: ${item.manifest.id} (not in whitelist)`);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[PluginScanner] Failed to scan OEM builtin plugins:', err);
+    }
+
+    return pluginsMap;
+  }
+}

@@ -1,0 +1,463 @@
+diff --git a/electron/plugins/controllers/system.ts b/electron/plugins/controllers/system.ts
+index 91eb5a6..a8c1627 100644
+--- a/electron/plugins/controllers/system.ts
++++ b/electron/plugins/controllers/system.ts
+@@ -9,10 +9,12 @@ import { spawn, execFileSync } from 'child_process';
+ import type { ChildProcess } from 'child_process';
+ import { ElectronMainWindow } from '../../windows/main-window';
+ import { addLog } from '../../services/logger';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { getMouseHook } from '../../services/mouse-hook';
+ import { cache, CacheAttribute } from '../../config/index';
+ import { SystemSleepAssertionManager } from '../../services/sleep-assertion';
++import type { SSHHostProfile } from '../../utils/ssh-config';
+ import { SSHConfigParser } from '../../utils/ssh-config';
+ 
+ 
+@@ -24,8 +26,13 @@ let _resolvedShellPath: string | null = null;
+ export function getShellPath(): string {
+   if (_resolvedShellPath !== null) return _resolvedShellPath;
+ 
+-  if (process.platform === 'win32') {
+-    const home = process.env.USERPROFILE || process.env.HOME || app.getPath('home');
++  const home = process.env.USERPROFILE || process.env.HOME || app.getPath('home');
++  const isWin = process.platform === 'win32';
++  const sep = isWin ? ';' : ':';
++
++  let baseSystemPath = '';
++
++  if (isWin) {
+     const extras = [
+       `${home}\\AppData\\Roaming\\npm`,
+       `${home}\\AppData\\Local\\Programs\\node`,
+@@ -34,40 +41,70 @@ export function getShellPath(): string {
+       'C:\\Program Files (x86)\\nodejs',
+     ].join(';');
+     const existing = process.env.PATH || '';
+-    _resolvedShellPath = existing ? `${existing};${extras}` : extras;
+-    return _resolvedShellPath;
+-  }
+-
+-  const loginShell = process.env.SHELL || '/bin/zsh';
+-  try {
+-    const result = execFileSync(loginShell, ['-l', '-i', '-c', 'echo $PATH'], {
+-      timeout: 5000,
+-      encoding: 'utf-8',
+-      env: { ...process.env, TERM: 'dumb' },
+-    }).trim();
+-    if (result) {
+-      _resolvedShellPath = result;
+-      return _resolvedShellPath;
+-    }
+-  } catch {
+-    // login shell failed — fall through to static fallback
+-  }
+-
+-  const home = process.env.HOME || app.getPath('home');
+-  _resolvedShellPath = [
+-    process.env.PATH || '',
+-    '/usr/local/bin',
+-    '/usr/bin',
+-    '/bin',
+-    '/usr/sbin',
+-    '/sbin',
+-    '/opt/homebrew/bin',
+-    '/opt/homebrew/sbin',
+-    '/opt/local/bin',
+-    `${home}/.npm-global/bin`,
+-    `${home}/.volta/bin`,
+-    `${home}/.cargo/bin`,
+-  ].filter(Boolean).join(':');
++    baseSystemPath = existing ? `${existing};${extras}` : extras;
++  } else {
++    const loginShell = process.env.SHELL || '/bin/zsh';
++    try {
++      const result = execFileSync(loginShell, ['-l', '-i', '-c', 'echo $PATH'], {
++        timeout: 5000,
++        encoding: 'utf-8',
++        env: { ...process.env, TERM: 'dumb' },
++      }).trim();
++      if (result) {
++        baseSystemPath = result;
++      }
++    } catch {
++      // login shell failed — fall through to static fallback
++    }
++
++    if (!baseSystemPath) {
++      baseSystemPath = [
++        process.env.PATH || '',
++        '/usr/local/bin',
++        '/usr/bin',
++        '/bin',
++        '/usr/sbin',
++        '/sbin',
++        '/opt/homebrew/bin',
++        '/opt/homebrew/sbin',
++        '/opt/local/bin',
++        `${home}/.npm-global/bin`,
++        `${home}/.volta/bin`,
++        `${home}/.cargo/bin`,
++      ].filter(Boolean).join(':');
++    }
++  }
++
++  // 确保应用内置降级 Node/NPM Shim 已经初始化
++  const bundled = getBundledNpmPaths();
++  const sandboxDir = join(app.getPath('userData'), 'npm-sandbox');
++  if (bundled) {
++    try {
++      ensureSandboxShims(sandboxDir, bundled);
++    } catch (err) {
++      console.warn('[SystemController] Failed to auto-create sandbox shims:', err);
++    }
++  }
++
++  // 附加 BerryTrace 应用专用全局 BIN 与降级 NPM 沙箱 BIN
++  const appExtraDirs = [
++    join(home, '.berrytrace', 'npm-global', 'bin'),
++    join(home, '.npm-global', 'bin'),
++    join(app.getPath('userData'), 'npx-tools-sandbox', 'bin'),
++    join(sandboxDir, 'bin'),
++  ];
++
++  const rawList = [...baseSystemPath.split(sep), ...appExtraDirs];
++  const uniqueList: string[] = [];
++
++  for (const item of rawList) {
++    const trimmed = item.trim();
++    if (trimmed && !uniqueList.includes(trimmed)) {
++      uniqueList.push(trimmed);
++    }
++  }
++
++  _resolvedShellPath = uniqueList.join(sep);
+   return _resolvedShellPath;
+ }
+ 
+@@ -101,7 +138,7 @@ export function killProcessesForSession(sessionId: string) {
+   }
+ }
+ 
+-ipcMain.on('agent:cancel-session', async (_event, payload: any) => {
++ipcMain.on('agent:cancel-session', async (_event, payload: { sessionId?: string }) => {
+   if (payload && typeof payload.sessionId === 'string') {
+     killProcessesForSession(payload.sessionId);
+     try {
+@@ -137,7 +174,7 @@ export function writeStdinForSession(sessionId: string, text: string): boolean {
+   return written;
+ }
+ 
+-ipcMain.on('agent:send-stdin', (_event, payload: any) => {
++ipcMain.on('agent:send-stdin', (_event, payload: { sessionId?: string; text?: string }) => {
+   if (payload && typeof payload.sessionId === 'string' && typeof payload.text === 'string') {
+     writeStdinForSession(payload.sessionId, payload.text);
+   }
+@@ -164,13 +201,17 @@ interface ExecCommandResult {
+   resolvedEarly?: boolean;
+ }
+ 
++interface SudoerInstance {
++  exec(command: string, options?: { env?: Record<string, string>; cwd?: string }): Promise<string | Buffer>;
++}
++
+ async function executeSudoCommand(
+   options: ExecCommandOptions,
+   sender?: Electron.WebContents,
+ ): Promise<ExecCommandResult> {
+   const mod = await import('electron-sudo-universal') as Record<string, unknown>;
+-  const SudoerClass = (mod.default as Record<string, unknown>)?.["electron-sudo"] as new (opts: { name: string }) => any
+-    || (mod as Record<string, unknown>)["electron-sudo"] as new (opts: { name: string }) => any;
++  const SudoerClass = (mod.default as Record<string, unknown>)?.["electron-sudo"] as new (opts: { name: string }) => SudoerInstance
++    || (mod as Record<string, unknown>)["electron-sudo"] as new (opts: { name: string }) => SudoerInstance;
+   if (!SudoerClass) {
+     throw new Error('Failed to load electron-sudo-universal: SudoerClass not found in module exports');
+   }
+@@ -247,10 +288,17 @@ async function executeSudoCommand(
+   });
+ }
+ 
++interface ExecStreamPayload {
++  stream: 'stdout' | 'stderr' | 'exit';
++  chunk?: string;
++  code?: number;
++  signal?: string | null;
++}
++
+ function emitExecStream(
+   sender: Electron.WebContents | undefined,
+   streamEventName: string | undefined,
+-  payload: any,
++  payload: ExecStreamPayload,
+ ): void {
+   if (!streamEventName) return;
+ 
+@@ -295,6 +343,8 @@ export function ensureSandboxShims(sandboxDir: string, bundled: { npmCli: string
+   }
+ 
+   const execPath = process.execPath;
++  const homeDir = app ? app.getPath('home') : (process.env.HOME || process.env.USERPROFILE || '');
++  const globalPrefix = join(homeDir, '.berrytrace', 'npm-global');
+ 
+   if (process.platform === 'win32') {
+     const shims = [
+@@ -304,11 +354,11 @@ export function ensureSandboxShims(sandboxDir: string, bundled: { npmCli: string
+       },
+       {
+         path: join(sandboxDir, 'npm.cmd'),
+-        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npmCli}" %*\r\n`
++        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\nif "%npm_config_prefix%"=="" set npm_config_prefix=${globalPrefix}\r\n"${execPath}" "${bundled.npmCli}" %*\r\n`
+       },
+       {
+         path: join(sandboxDir, 'npx.cmd'),
+-        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npxCli}" %*\r\n`
++        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\nif "%npm_config_prefix%"=="" set npm_config_prefix=${globalPrefix}\r\n"${execPath}" "${bundled.npxCli}" %*\r\n`
+       },
+       {
+         path: join(binDir, 'node.cmd'),
+@@ -316,11 +366,11 @@ export function ensureSandboxShims(sandboxDir: string, bundled: { npmCli: string
+       },
+       {
+         path: join(binDir, 'npm.cmd'),
+-        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npmCli}" %*\r\n`
++        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\nif "%npm_config_prefix%"=="" set npm_config_prefix=${globalPrefix}\r\n"${execPath}" "${bundled.npmCli}" %*\r\n`
+       },
+       {
+         path: join(binDir, 'npx.cmd'),
+-        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npxCli}" %*\r\n`
++        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\nif "%npm_config_prefix%"=="" set npm_config_prefix=${globalPrefix}\r\n"${execPath}" "${bundled.npxCli}" %*\r\n`
+       }
+     ];
+ 
+@@ -337,15 +387,15 @@ export function ensureSandboxShims(sandboxDir: string, bundled: { npmCli: string
+     const shims = [
+       {
+         path: join(binDir, 'node'),
+-        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec "${execPath}" "$@"\n`
++        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nif [ -z "$npm_config_prefix" ]; then\n  export npm_config_prefix="${globalPrefix}"\nfi\nexec "${execPath}" "$@"\n`
+       },
+       {
+         path: join(binDir, 'npm'),
+-        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec "${execPath}" "${bundled.npmCli}" "$@"\n`
++        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nif [ -z "$npm_config_prefix" ]; then\n  export npm_config_prefix="${globalPrefix}"\nfi\nexec "${execPath}" "${bundled.npmCli}" "$@"\n`
+       },
+       {
+         path: join(binDir, 'npx'),
+-        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec "${execPath}" "${bundled.npxCli}" "$@"\n`
++        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nif [ -z "$npm_config_prefix" ]; then\n  export npm_config_prefix="${globalPrefix}"\nfi\nexec "${execPath}" "${bundled.npxCli}" "$@"\n`
+       }
+     ];
+ 
+@@ -410,7 +460,7 @@ export async function executeSystemCommand(
+ 
+   const sandboxBinLocal = join(sandboxDir, 'node_modules', '.bin');
+   const separator = process.platform === 'win32' ? ';' : ':';
+-  let currentPath = options.env?.PATH || env.PATH || getShellPath();
++  const currentPath = options.env?.PATH || env.PATH || getShellPath();
+   const prependedPaths = [sandboxBinLocal, binDir];
+   if (process.platform === 'win32') {
+     prependedPaths.push(sandboxDir);
+@@ -599,7 +649,7 @@ export async function executeSystemCommand(
+         if (timeoutHandle) clearTimeout(timeoutHandle);
+         if (silenceTimer) clearTimeout(silenceTimer);
+ 
+-        const errorCode = (error as any).code;
++        const errorCode = (error as NodeJS.ErrnoException).code;
+         if ((errorCode === 'ENOENT' || errorCode === 'EACCES') && retryCount < 1 && bundled) {
+           retryCount++;
+           console.warn(`[PluginBridge] Command failed with ${errorCode}. Attempting shim self-healing and retry...`);
+@@ -716,6 +766,16 @@ export class SystemController extends BaseApiController {
+ 
+   // ── system namespace ──
+ 
++  /**
++   * 终止指定 Session 会话下的所有运行中子进程（终端、脚本）
++   */
++  async system_killSessionProcesses(sessionId: string): Promise<boolean> {
++    if (sessionId) {
++      killProcessesForSession(sessionId);
++    }
++    return true;
++  }
++
+   /**
+    * 获取当前系统主题。
+    * @returns 返回 'dark' 或 'light'
+@@ -769,7 +829,7 @@ export class SystemController extends BaseApiController {
+    * @example
+    * await callApi('system', 'showNotification', [{ title: '任务完成', body: '构建成功' }]);
+    */
+-  async system_showNotification(options: { title: string; body: string; silent?: boolean }, context: ApiContext): Promise<null> {
++  async system_showNotification(options: { title: string; body: string; silent?: boolean }, _context: ApiContext): Promise<null> {
+     if (Notification.isSupported()) {
+       const { oemManager } = await import('../../services/oem-manager');
+       const oemLogo = oemManager.getOEMLogoPath();
+@@ -1359,7 +1419,7 @@ Categories=Utility;`;
+         }
+         return {
+           label: item.label,
+-          type: item.type as any,
++          type: item.type as 'normal' | 'separator' | 'submenu' | 'checkbox' | 'radio',
+           checked: item.checked,
+           click: () => {
+             const dispatcher = ApiDispatcher.getInstance();
+@@ -1375,10 +1435,10 @@ Categories=Utility;`;
+         label: `关闭 ${context.pluginId}`,
+         type: 'normal' as const,
+         checked: undefined,
+-        click: () => {
++        click: async () => {
+           tray?.destroy();
+           this.trays.delete(context.pluginId);
+-          const { ElectronFloatBall } = require('../../windows/float-ball');
++          const { ElectronFloatBall } = await import('../../windows/float-ball');
+           ElectronFloatBall.getInstance().closePluginWindows(context.pluginId);
+         }
+       });
+@@ -1403,15 +1463,18 @@ Categories=Utility;`;
+    */
+   async system_registerGlobalShortcut(accelerator: string, commandId: string, context: ApiContext): Promise<boolean> {
+     try {
++      console.log(`⌨️ [GlobalShortcut:Register] Plugin "${context.pluginId}" registering global shortcut "${accelerator}" -> command "${commandId}"`);
+       const isRegistered = globalShortcut.register(accelerator, () => {
++        console.log(`⌨️ [GlobalShortcut:Triggered] [${new Date().toISOString()}] Accelerator "${accelerator}" fired -> executing command "${commandId}" (plugin: ${context.pluginId})`);
+         const dispatcher = ApiDispatcher.getInstance();
+         dispatcher.dispatch(context.pluginId, 'commands', 'execute', [commandId]).catch((err: unknown) => {
+-          console.error('[GlobalShortcut] Failed to execute hotkey command:', commandId, err);
++          console.error('❌ [GlobalShortcut:Error] Failed to execute hotkey command:', commandId, err);
+         });
+       });
++      console.log(`⌨️ [GlobalShortcut:Register] Status for "${accelerator}": ${isRegistered ? 'SUCCESS ✅' : 'FAILED/OCCUPIED ❌'}`);
+       return isRegistered;
+     } catch (err) {
+-      console.error('[GlobalShortcut] Registration failed:', err);
++      console.error('❌ [GlobalShortcut:Register:Error] Registration failed for accelerator:', accelerator, err);
+       return false;
+     }
+   }
+@@ -1421,6 +1484,7 @@ Categories=Utility;`;
+    * @param accelerator 快捷键
+    */
+   async system_unregisterGlobalShortcut(accelerator: string): Promise<null> {
++    console.log(`⌨️ [GlobalShortcut:Unregister] Unregistering accelerator "${accelerator}"`);
+     globalShortcut.unregister(accelerator);
+     return null;
+   }
+@@ -1759,7 +1823,7 @@ Categories=Utility;`;
+     if (process.platform === 'win32') {
+       const buf = win.getNativeWindowHandle();
+       // On x64 Windows, handle is 8 bytes; on 32-bit, 4 bytes
+-      const hwnd = typeof (buf as any).readBigUInt64LE === 'function'
++      const hwnd = typeof (buf as unknown as Record<string, unknown>).readBigUInt64LE === 'function'
+         ? (buf as Buffer).readBigUInt64LE(0)
+         : buf.readUInt32LE(0);
+       addLog('info', 'System', `[System:getNativeHandle] win32 HWND=${hwnd} title="${win.getTitle()}"`);
+@@ -1790,7 +1854,7 @@ Categories=Utility;`;
+   }): Promise<null> {
+     let win = this.floatWindows.get(targetWindowId);
+     if (!win || win.isDestroyed()) {
+-      const { ElectronFloatBall } = require('../../windows/float-ball');
++      const { ElectronFloatBall } = await import('../../windows/float-ball');
+       const floatBall = ElectronFloatBall.getInstance();
+       const instance = floatBall.getFloatWebWindowInstance(targetWindowId);
+       if (instance && !instance.win.isDestroyed()) {
+@@ -1879,7 +1943,7 @@ Categories=Utility;`;
+    * 注册命令。
+    * @param options id — 命令 ID（可选，不传自动生成），返回命令 ID
+    */
+-  async commands_register(options: any, _context: ApiContext): Promise<string> {
++  async commands_register(options: { id?: string } | undefined, _context: ApiContext): Promise<string> {
+     const id = options?.id || `cmd:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+     console.log(`[SystemController] commands_register: ${id}`);
+     return id;
+@@ -1903,7 +1967,7 @@ Categories=Utility;`;
+ 
+     // Hook 截流：调用 commands:beforeExecute
+     try {
+-      const { HookRegistry } = require('../hook-registry');
++      const { HookRegistry } = await import('../hook-registry');
+       const hookResult = await HookRegistry.getInstance().call(
+         'commands:beforeExecute',
+         [{ commandId: id, commandArgs: args }],
+@@ -1912,8 +1976,8 @@ Categories=Utility;`;
+         3000,
+       );
+ 
+-      if (hookResult && typeof hookResult === 'object' && (hookResult as any).block) {
+-        console.log(`[SystemController] 命令 "${id}" 被 hook 截流:`, (hookResult as any).reason || 'no reason');
++      if (hookResult && typeof hookResult === 'object' && (hookResult as Record<string, unknown>).block) {
++        console.log(`[SystemController] 命令 "${id}" 被 hook 截流:`, (hookResult as Record<string, unknown>).reason || 'no reason');
+         return;
+       }
+     } catch (err) {
+@@ -1929,10 +1993,10 @@ Categories=Utility;`;
+ 
+     // Notify background utility processes
+     try {
+-      const { PluginLauncher } = require('../plugin-launcher');
++      const { PluginLauncher } = await import('../plugin-launcher');
+       const backgroundProcesses = PluginLauncher.getInstance().getBackgroundProcesses();
+       console.log(`[SystemController] Notifying ${backgroundProcesses.size} background processes of command: ${id}`);
+-      for (const [pluginId, proc] of backgroundProcesses.entries()) {
++      for (const [, proc] of backgroundProcesses.entries()) {
+         proc.sendMessage({
+           type: 'sdk:events:on',
+           eventName: 'commands:execute',
+@@ -2125,7 +2189,7 @@ Categories=Utility;`;
+   async system_simulateKeyPress(options: { keys: string[] }): Promise<boolean> {
+     try {
+       const { keyboard, Key } = await import('@nut-tree-fork/nut-js');
+-      const keyMap: Record<string, any> = {
++      const keyMap: Record<string, number> = {
+         'enter': Key.Enter,
+         'escape': Key.Escape,
+         'space': Key.Space,
+@@ -2148,11 +2212,11 @@ Categories=Utility;`;
+       // Add a-z
+       for (let charCode = 65; charCode <= 90; charCode++) {
+         const char = String.fromCharCode(charCode);
+-        keyMap[char.toLowerCase()] = (Key as any)[char];
++        keyMap[char.toLowerCase()] = Key[char as keyof typeof Key];
+       }
+       // Add 0-9
+       for (let i = 0; i <= 9; i++) {
+-        keyMap[i.toString()] = (Key as any)[`Num${i}`] || (Key as any)[`N${i}`] || i;
++        keyMap[i.toString()] = Key[`Num${i}` as keyof typeof Key] || Key[`N${i}` as keyof typeof Key] || i;
+       }
+ 
+       const resolvedKeys = options.keys.map(k => {
+@@ -2312,7 +2376,7 @@ Categories=Utility;`;
+    * 自动读取解析用户主目录 ~/.ssh/config 配置文件与密钥列表
+    */
+   async system_getSSHConfigProfiles(_options: unknown, _context: ApiContext): Promise<{
+-    profiles: any[];
++    profiles: SSHHostProfile[];
+     keys: string[];
+     configExists: boolean;
+   }> {
+@@ -2321,23 +2385,10 @@ Categories=Utility;`;
+       const profiles = SSHConfigParser.parseUserSSHConfig();
+       console.log('[SystemController] 已成功解析 ~/.ssh/config 获取到', profiles.length, '个 Host 节点');
+       return { profiles, keys: dirInfo.keys, configExists: dirInfo.configExists };
+-    } catch (err: any) {
++    } catch (err: unknown) {
+       console.error('[SystemController] system_getSSHConfigProfiles failed:', err);
+       return { profiles: [], keys: [], configExists: false };
+     }
+   }
+-
+-  /**
+-   * 触发 4 阶段 SSH 堡垒机与内网 DB 连通性测试
+-   */
+-  async system_testSSHTunnelConnectivity(options: { sshConfig: any }, _context: ApiContext): Promise<any> {
+-    try {
+-      const { SSHTunnelEngine } = await import('../../../plugins-dev/datahub/src/network/SSHTunnelEngine');
+-      return await SSHTunnelEngine.testFullConnectivity(options.sshConfig);
+-    } catch (err: any) {
+-      console.error('[SystemController] system_testSSHTunnelConnectivity failed:', err);
+-      throw err;
+-    }
+-  }
+ }

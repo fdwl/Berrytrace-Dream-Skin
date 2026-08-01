@@ -1,0 +1,323 @@
+diff --git a/src/views/plugins/workspace/TerminalTabPanel.tsx b/src/views/plugins/workspace/TerminalTabPanel.tsx
+index 89faeca..f9881c0 100644
+--- a/src/views/plugins/workspace/TerminalTabPanel.tsx
++++ b/src/views/plugins/workspace/TerminalTabPanel.tsx
+@@ -1,6 +1,7 @@
+ import { useEffect, useRef, useState } from 'react';
+ import { Terminal, type ITheme } from 'xterm';
+ import { FitAddon } from 'xterm-addon-fit';
++import { SerializeAddon } from '@xterm/addon-serialize';
+ import { useWorkspaceStore } from '../../../stores/workspace';
+ import { useAppStore } from '../../../stores/app';
+ import 'xterm/css/xterm.css';
+@@ -65,6 +66,13 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+   const containerRef = useRef<HTMLDivElement>(null);
+   const terminalRef = useRef<Terminal | null>(null);
+   const fitAddonRef = useRef<FitAddon | null>(null);
++  const serializeAddonRef = useRef<SerializeAddon | null>(null);
++
++  const customParamsRef = useRef(customParams);
++  useEffect(() => {
++    customParamsRef.current = customParams;
++  }, [customParams]);
++
+   // Tracks how many times the main useEffect has mounted. Used to distinguish
+   // React StrictMode double-mount (generationRef increments on 2nd mount)
+   // from a real unmount (no increment). Prevents orphan-close from killing
+@@ -80,6 +88,38 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+   const themeMode = useAppStore((state) => state.theme);
+   const isLight = themeMode === 'light';
+ 
++  const saveScrollback = () => {
++    const term = terminalRef.current;
++    const serializeAddon = serializeAddonRef.current;
++    if (!term || !serializeAddon) return;
++    try {
++      const raw = serializeAddon.serialize({ scrollback: 1000 });
++      if (raw && raw.length > 0) {
++        const currentScrollback = customParamsRef.current?.scrollbackBuffer;
++        if (raw !== currentScrollback) {
++          useWorkspaceStore.getState().updateTabConfig(tabId, {
++            customParams: {
++              ...customParamsRef.current,
++              scrollbackBuffer: raw
++            }
++          });
++        }
++      }
++    } catch (e) {
++      console.warn('[TerminalTabPanel] Failed to save scrollback buffer:', e);
++    }
++  };
++
++  useEffect(() => {
++    const handleBeforeUnload = () => {
++      saveScrollback();
++    };
++    window.addEventListener('beforeunload', handleBeforeUnload);
++    return () => {
++      window.removeEventListener('beforeunload', handleBeforeUnload);
++    };
++  }, []);
++
+   // ─── Main terminal lifecycle ────────────────────────────────────────────────
+   // Why the delayed dispose:
+   //   xterm's Viewport constructor fires: setTimeout(0) → requestAnimationFrame → _innerRefresh.
+@@ -107,17 +147,41 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+       theme: isLight ? LIGHT_TERMINAL_THEME : DARK_TERMINAL_THEME,
+       fontSize: 13,
+       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
++      logLevel: 'off',
+     });
+     const fitAddon = new FitAddon();
++    const serializeAddon = new SerializeAddon();
+     term.loadAddon(fitAddon);
++    term.loadAddon(serializeAddon);
+ 
+     terminalRef.current = term;
+     fitAddonRef.current = fitAddon;
++    serializeAddonRef.current = serializeAddon;
+ 
+     // Open synchronously — the delayed dispose below prevents the Viewport crash.
+     term.open(el);
+ 
+-    // Fit after the browser has painted so xterm can measure cell sizes.
++    // Fit immediately if container has dimensions so term.cols/rows match DOM before writing initialBuffer or spawning PTY
++    try {
++      if (el.clientWidth > 0 && el.clientHeight > 0) {
++        fitAddon.fit();
++      }
++    } catch { /* ignore */ }
++
++    // Restore scrollback buffer if exists
++    const initialBuffer = customParamsRef.current?.scrollbackBuffer as string | undefined;
++    if (initialBuffer) {
++      try {
++        term.write(initialBuffer);
++        // Write new line and reset styles/modes (including exiting alternate screen buffer)
++        const POST_REPLAY_MODE_RESET = '\x1b[?1049l\x1b[?47l\x1b[0m\x1b[0 q\x1b[<99u\x1b[=0u\x1b[?25h\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1016l\x1b[?1004l\x1b[?2004l';
++        term.write('\r\n' + POST_REPLAY_MODE_RESET + '\r\n');
++      } catch (err) {
++        console.warn('[TerminalTabPanel] Failed to write restored scrollback:', err);
++      }
++    }
++
++    // Fit after the browser has painted so xterm can re-measure cell sizes if needed.
+     requestAnimationFrame(() => {
+       if (!isDestroyed && fitAddonRef.current) {
+         try { fitAddon.fit(); } catch { /* ignore */ }
+@@ -129,7 +193,7 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+       try {
+         const cols = term.cols || 80;
+         const rows = term.rows || 24;
+-        const initialCwd = customParams?.initialCwd;
++        const initialCwd = customParamsRef.current?.initialCwd || customParams?.initialCwd;
+ 
+         const sid = await window.electronAPI.callApi(
+           'terminal', 'create', [cols, rows, initialCwd, tabId]
+@@ -140,12 +204,11 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+         if (isDestroyed) {
+           if (generationRef.current > myGeneration) {
+             // React StrictMode double-mount: a newer effect run has already started and the
+-            // backend will warm-reattach to the SAME session (same tabId). Do NOT close —
+-            // closing here would kill the session that the next mount is currently using.
+-            console.warn(`[TerminalTabPanel:${tabId}] StrictMode first-mount orphan — leaving sid=${sid} for next mount (gen ${myGeneration} < ${generationRef.current})`);
++            // backend will warm-reattach to the SAME session (same tabId).
++            console.log(`[TerminalTabPanel:${tabId}] StrictMode first-mount orphan — leaving sid=${sid} for next mount (gen ${myGeneration} < ${generationRef.current})`);
+           } else {
+             // Real unmount (tab closed) before session was fully set up. Close the zombie PTY.
+-            console.warn(`[TerminalTabPanel:${tabId}] Closing orphaned sid=${sid} (no successor mount)`);
++            console.log(`[TerminalTabPanel:${tabId}] Closing orphaned sid=${sid} (no successor mount)`);
+             window.electronAPI.callApi('terminal', 'close', [sid]);
+           }
+           return;
+@@ -171,7 +234,7 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+ 
+         // PTY process exit.
+         const removeExitListener = window.electronAPI.ipc.on(`terminal:exit:${sid}`, (code: unknown) => {
+-          console.warn(`[TerminalTabPanel:${tabId}] terminal:exit sid=${sid}, code=${code}`);
++          console.log(`[TerminalTabPanel:${tabId}] terminal:exit sid=${sid}, code=${code}`);
+           if (!isDestroyed) {
+             setIsBusy(false);
+             if (code !== 0 && code !== undefined && code !== null) {
+@@ -194,13 +257,22 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+           }
+         });
+ 
++        // 预填充命令（但不自动敲回车）
++        if (customParams?.initialCommand && !customParams?.autoCommand) {
++          setTimeout(() => {
++            if (!isDestroyed && activeSessionId) {
++              window.electronAPI.callApi('terminal', 'write', [sid, customParams.initialCommand]);
++            }
++          }, 300);
++        }
++
+         // Auto-run a command if provided (e.g. from open_workspace_tab).
+         if (customParams?.autoCommand) {
+           setTimeout(() => {
+             if (!isDestroyed && activeSessionId) {
+               window.electronAPI.callApi('terminal', 'write', [sid, customParams.autoCommand + '\r']);
+             }
+-          }, 400);
++          }, 300);
+         }
+ 
+         // Replay any buffered output (shell prompt, etc.) captured during create.
+@@ -208,6 +280,13 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+           await window.electronAPI.callApi('terminal', 'attach', [sid]);
+         }
+ 
++        // Sync PTY to the fitted terminal size. The PTY was created with pre-fit dims
++        // (likely 80×24 before the rAF fitAddon.fit ran); by the time attach resolves,
++        // the rAF fit has fired and term.cols/rows reflect the actual container size.
++        if (!isDestroyed && term.cols >= 10 && term.rows >= 2) {
++          window.electronAPI.callApi('terminal', 'resize', [sid, term.cols, term.rows]);
++        }
++
+         sessionCleanupFn = () => {
+           removeDataListener();
+           removeStatusListener();
+@@ -224,7 +303,9 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+     initTerminal();
+ 
+     // Resize observer — fit terminal when container dimensions change.
+-    const resizeObserver = new ResizeObserver(() => {
++    let resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
++
++    const doFitAndResize = () => {
+       if (isDestroyed || !containerRef.current || !terminalRef.current) return;
+       const { clientWidth: w, clientHeight: h } = containerRef.current;
+       if (w < 100 || h < 50) return;
+@@ -236,13 +317,49 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+       } catch (err) {
+         console.warn('[TerminalTabPanel] Resize error:', err);
+       }
++    };
++
++    // ResizeObserver: fit xterm immediately (visual), debounce PTY resize to avoid
++    // SIGWINCH storm during splitter drag (60 events/sec → 1 PTY resize per 100ms).
++    const resizeObserver = new ResizeObserver(() => {
++      if (isDestroyed || !containerRef.current || !terminalRef.current) return;
++      const { clientWidth: w, clientHeight: h } = containerRef.current;
++      if (w < 100 || h < 50) return;
++      try {
++        fitAddon.fit(); // visual update immediately
++      } catch { /* ignore */ }
++      if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
++      resizeDebounceTimer = setTimeout(() => {
++        resizeDebounceTimer = null;
++        if (!isDestroyed && activeSessionId && term.cols >= 10 && term.rows >= 2) {
++          window.electronAPI.callApi('terminal', 'resize', [activeSessionId, term.cols, term.rows]);
++        }
++      }, 100);
+     });
+     resizeObserver.observe(el);
+ 
++    // Electron window resize (fullscreen, window drag)
++    const handleWindowResize = () => {
++      requestAnimationFrame(doFitAndResize);
++    };
++    window.addEventListener('resize', handleWindowResize);
++
++    // FlexLayout splitter drag → berrytrace:layout-resize dispatched by FlexWorkspace.onModelChange
++    const handleLayoutResize = () => doFitAndResize();
++    window.addEventListener('berrytrace:layout-resize', handleLayoutResize as EventListener);
++
+     return () => {
+       isDestroyed = true;
++      if (resizeDebounceTimer) { clearTimeout(resizeDebounceTimer); resizeDebounceTimer = null; }
++      window.removeEventListener('resize', handleWindowResize);
++      window.removeEventListener('berrytrace:layout-resize', handleLayoutResize as EventListener);
++
++      // Save final scrollback before disposal
++      saveScrollback();
++
+       terminalRef.current = null;
+       fitAddonRef.current = null;
++      serializeAddonRef.current = null;
+       sessionIdRef.current = null;
+       resizeObserver.disconnect();
+       sessionCleanupFn?.();
+@@ -251,7 +368,11 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+       // Disposing synchronously nulls _renderService before _innerRefresh fires → crash.
+       // The el.innerHTML='' at the top of the next effect run clears stale DOM before new open().
+       const termToDispose = term;
+-      setTimeout(() => { try { termToDispose.dispose(); } catch { /* ignore */ } }, 100);
++      const serializeAddonToDispose = serializeAddon;
++      setTimeout(() => {
++        try { serializeAddonToDispose.dispose(); } catch {}
++        try { termToDispose.dispose(); } catch {}
++      }, 100);
+     };
+   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+ 
+@@ -264,25 +385,36 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+ 
+   // ─── Re-fit when tab becomes visible ───────────────────────────────────────
+   useEffect(() => {
+-    if (visible && fitAddonRef.current && containerRef.current) {
+-      const timer = setTimeout(() => {
+-        if (!containerRef.current) return;
+-        const { clientWidth: w, clientHeight: h } = containerRef.current;
+-        if (w < 100 || h < 50) return;
+-        fitAddonRef.current?.fit();
+-        if (terminalRef.current && sessionIdRef.current && terminalRef.current.cols >= 10 && terminalRef.current.rows >= 2) {
++    if (!visible) return;
++    let cancelled = false;
++    const doFit = () => {
++      if (cancelled || !containerRef.current || !fitAddonRef.current || !terminalRef.current) return;
++      const { clientWidth: w, clientHeight: h } = containerRef.current;
++      if (w < 100 || h < 50) return;
++      try {
++        fitAddonRef.current.fit();
++        if (sessionIdRef.current && terminalRef.current.cols >= 10 && terminalRef.current.rows >= 2) {
+           window.electronAPI.callApi('terminal', 'resize', [
+             sessionIdRef.current,
+             terminalRef.current.cols,
+             terminalRef.current.rows,
+           ]);
+         }
+-      }, 100);
+-      return () => clearTimeout(timer);
+-    }
++      } catch { /* ignore */ }
++    };
++    // Three retries: layout may not be settled at first tick after display:none→flex.
++    const t1 = setTimeout(doFit, 50);
++    const t2 = setTimeout(doFit, 250);
++    const t3 = setTimeout(doFit, 600);
++    return () => {
++      cancelled = true;
++      clearTimeout(t1);
++      clearTimeout(t2);
++      clearTimeout(t3);
++    };
+   }, [visible]);
+ 
+-  // ─── Periodically save terminal CWD to tab config ──────────────────────────
++  // ─── Periodically save terminal CWD and scrollback buffer ──────────────────
+   useEffect(() => {
+     if (!visible) return;
+     const timer = setInterval(async () => {
+@@ -290,11 +422,18 @@ export default function TerminalTabPanel({ tabId, visible, customParams }: Termi
+       if (!sid) return;
+       try {
+         const cwd = await window.electronAPI.callApi('terminal', 'getCwd', [sid]) as string | null;
+-        if (cwd) {
+-          useWorkspaceStore.getState().updateTabConfig(tabId, { customParams: { initialCwd: cwd } });
++        const currentCwd = customParamsRef.current?.initialCwd;
++        if (cwd && cwd !== currentCwd) {
++          useWorkspaceStore.getState().updateTabConfig(tabId, {
++            customParams: {
++              ...customParamsRef.current,
++              initialCwd: cwd
++            }
++          });
+         }
++        saveScrollback();
+       } catch { /* ignore */ }
+-    }, 3000);
++    }, 10000);
+     return () => clearInterval(timer);
+   }, [visible, tabId]);

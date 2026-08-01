@@ -1,0 +1,557 @@
+import { BrowserWindow, ipcMain, screen, systemPreferences, clipboard, app } from 'electron'
+import { join, dirname } from 'path'
+import { cache, CacheAttribute } from '../config/index'
+import { createRequire } from 'module'
+import { fileURLToPath } from 'url'
+import { ElectronDesktopLock } from './desktop-lock'
+import { ElectronMainWindow } from '../windows/main-window'
+import { ElectronFloatBall } from '../windows/float-ball'
+import type { SelectionHookConstructor, SelectionHookInstance, TextSelectionData, MouseEventData, Point } from 'selection-hook'
+import type { SelectionMenuItem } from '../../src/plugins/SelectionMenuRegistry'
+
+const requireModule = createRequire(import.meta.url)
+const __dirname = dirname(fileURLToPath(import.meta.url))
+let SelectionHook: SelectionHookConstructor | null = null
+
+export class ElectronSelection {
+  private static instance: ElectronSelection
+  private selectionMenuWindow: BrowserWindow | null = null
+  private selectionHook: SelectionHookInstance | null = null
+  private currentSelectionData: TextSelectionData | null = null
+  private selectionMenuItems = new Map<string, SelectionMenuItem>()
+
+  private constructor() {}
+
+  public static getInstance(): ElectronSelection {
+    if (!ElectronSelection.instance) {
+      ElectronSelection.instance = new ElectronSelection()
+    }
+    return ElectronSelection.instance
+  }
+
+  public getSelectionMenuWindow(): BrowserWindow | null {
+    return this.selectionMenuWindow
+  }
+
+  public getCurrentSelectionData(): TextSelectionData | null {
+    return this.currentSelectionData
+  }
+
+  public destroySelectionMenuWindow(): void {
+    if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+      this.selectionMenuWindow.destroy()
+      this.selectionMenuWindow = null
+    }
+  }
+
+  public hideSelectionMenuWindow(): void {
+    if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+      this.selectionMenuWindow.hide()
+    }
+  }
+
+  private screenToDip(point: Point): Point {
+    if (process.platform !== 'win32') return point
+    return screen.screenToDipPoint(point)
+  }
+
+  private calculateWindowPosition(data: TextSelectionData): { x: number; y: number; width: number; height: number } {
+    const width = 340
+    const height = 40
+
+    let x: number = 0
+    let y: number = 0
+
+    console.debug('[SelectionMenu] 原始坐标数据:', {
+      mousePosEnd: data?.mousePosEnd,
+      endBottom: data?.endBottom,
+      posLevel: data?.posLevel,
+      method: data?.method,
+      platform: process.platform,
+    })
+
+    const hasMousePosEnd = data?.mousePosEnd && 
+                          typeof data.mousePosEnd.x === 'number' && 
+                          typeof data.mousePosEnd.y === 'number' && 
+                          !isNaN(data.mousePosEnd.x) && 
+                          !isNaN(data.mousePosEnd.y)
+
+    const hasEndBottom = data?.endBottom && 
+                         typeof data.endBottom.x === 'number' && 
+                         typeof data.endBottom.y === 'number' && 
+                         !isNaN(data.endBottom.x) && 
+                         !isNaN(data.endBottom.y)
+
+    if (hasMousePosEnd && (data.mousePosEnd.x > 0 || data.mousePosEnd.y > 0)) {
+      const dip = this.screenToDip(data.mousePosEnd)
+      console.debug('[SelectionMenu] screenToDip 转换:', { original: data.mousePosEnd, dip })
+      x = Math.round(dip.x - width / 2)
+      y = Math.round(dip.y + 15)
+    } else if (hasEndBottom && (data.endBottom.x > 0 || data.endBottom.y > 0)) {
+      const dip = this.screenToDip(data.endBottom)
+      console.debug('[SelectionMenu] screenToDip 转换:', { original: data.endBottom, dip })
+      x = Math.round(dip.x - width / 2)
+      y = Math.round(dip.y + 15)
+    } else {
+      const cursor = screen.getCursorScreenPoint()
+      const dip = this.screenToDip(cursor)
+      console.debug('[SelectionMenu] screenToDip 转换:', { original: cursor, dip })
+      x = Math.round(dip.x - width / 2)
+      y = Math.round(dip.y + 15)
+    }
+
+    // Safety fallback for NaN or non-finite values
+    if (isNaN(x) || !isFinite(x) || isNaN(y) || !isFinite(y)) {
+      console.warn('[SelectionMenu] Window coordinates were invalid, using cursor fallback.')
+      const cursor = screen.getCursorScreenPoint()
+      const dip = this.screenToDip(cursor)
+      x = Math.round(dip.x - width / 2)
+      y = Math.round(dip.y + 15)
+    }
+
+    try {
+      // 限制在屏幕工作区内，防止窗口移出屏幕
+      const activeDisplay = screen.getDisplayMatching({ x, y, width: 1, height: 1 })
+      const workArea = activeDisplay?.workArea || screen.getPrimaryDisplay().workArea
+      console.debug('[SelectionMenu] 工作区:', workArea)
+
+      if (x < workArea.x) {
+        console.debug(`[SelectionMenu] x ${x} 超出左边界 ${workArea.x}，调整为 ${workArea.x}`)
+        x = workArea.x
+      }
+      if (x + width > workArea.x + workArea.width) {
+        const newX = workArea.x + workArea.width - width
+        console.debug(`[SelectionMenu] x+width ${x + width} 超出右边界 ${workArea.x + workArea.width}，调整为 ${newX}`)
+        x = newX
+      }
+      if (y < workArea.y) {
+        console.debug(`[SelectionMenu] y ${y} 超出上边界 ${workArea.y}，调整为 ${workArea.y}`)
+        y = workArea.y
+      }
+      if (y + height > workArea.y + workArea.height) {
+        console.debug(`[SelectionMenu] y+height ${y + height} 超出下边界 ${workArea.y + workArea.height}`)
+        if (hasMousePosEnd && (data.mousePosEnd.x > 0 || data.mousePosEnd.y > 0)) {
+          const dip = this.screenToDip(data.mousePosEnd)
+          y = Math.round(dip.y - height - 15)
+          console.debug(`[SelectionMenu] 使用 mousePosEnd 向上调整 y 为 ${y}`)
+        } else {
+          y = Math.round(workArea.y + workArea.height - height)
+          console.debug(`[SelectionMenu] 使用 workArea 调整 y 为 ${y}`)
+        }
+      }
+    } catch (e) {
+      console.error('[SelectionMenu] Failed to clamp position within workArea:', e)
+    }
+
+    // Final sanitize
+    x = Math.round(x)
+    y = Math.round(y)
+    if (isNaN(x) || !isFinite(x)) x = 0
+    if (isNaN(y) || !isFinite(y)) y = 0
+
+    return { x, y, width, height }
+  }
+
+  public createSelectionMenuWindow(data: TextSelectionData): void {
+    const { x, y, width, height } = this.calculateWindowPosition(data)
+
+    console.debug('[SelectionMenu] 最终窗口位置:', { x, y, width, height })
+
+    // 如果窗口已存在，复用它
+    if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+      console.debug('[SelectionMenu] 复用现有窗口')
+      this.selectionMenuWindow.setSize(width, height)
+      this.selectionMenuWindow.setPosition(x, y, false)
+      if (process.platform === 'darwin') {
+        this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver', 1)
+      } else {
+        this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver')
+      }
+      // 发送新的选中文本数据到渲染进程
+      this.selectionMenuWindow.webContents.send('selection:update', data)
+      this.selectionMenuWindow.showInactive()
+      return
+    }
+
+    const preloadPath = join(__dirname, 'preload.cjs')
+    console.debug('[SelectionMenu] preload 文件路径:', preloadPath)
+
+    try {
+      this.selectionMenuWindow = new BrowserWindow({
+        type: process.platform === 'darwin' ? 'panel' : 'normal',
+        width,
+        height,
+        x,
+        y,
+        frame: false,
+        resizable: false,
+        show: false,
+        skipTaskbar: true,
+        alwaysOnTop: true,
+        transparent: true,
+        backgroundColor: '#00000000',
+        focusable: true,
+        webPreferences: {
+          preload: preloadPath,
+          nodeIntegration: false,
+          contextIsolation: true,
+          webSecurity: false,
+        },
+        // Windows 透明窗口修复
+        enableLargerThanScreen: false,
+        // Windows 高 DPI 支持
+        useContentSize: true,
+      })
+
+      if (process.platform === 'darwin') {
+        this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver', 1)
+      } else {
+        this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver')
+      }
+
+      console.debug('[SelectionMenu] 窗口对象创建成功')
+    } catch (error) {
+      console.error('[SelectionMenu] 窗口创建失败:', error)
+      return
+    }
+    console.debug('[SelectionMenu] 窗口初始 bounds:', this.selectionMenuWindow.getBounds())
+    console.debug('[SelectionMenu] 窗口 isVisible:', this.selectionMenuWindow.isVisible())
+
+    const wc = this.selectionMenuWindow.webContents
+
+    wc.on('did-start-loading', () => {
+        console.debug('[SelectionMenu] 页面开始加载')
+    })
+
+    wc.on('did-finish-load', () => {
+        console.debug('[SelectionMenu] 页面加载完成')
+      console.debug('[SelectionMenu] 页面 URL:', wc.getURL())
+      // 首次加载完成后发送初始数据
+      wc.send('selection:update', data)
+    })
+
+    wc.on('did-fail-load', (_event, errorCode, errorDescription) => {
+      console.error('[SelectionMenu] 页面加载失败:', { errorCode, errorDescription })
+    })
+
+    if (process.env.VITE_DEV_SERVER_URL) {
+      console.debug('[SelectionMenu] 加载开发服务器:', `${process.env.VITE_DEV_SERVER_URL}?window=selection-menu#/selection-menu`)
+      this.selectionMenuWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}?window=selection-menu#/selection-menu`)
+    } else {
+      const filePath = join(__dirname, '../dist/index.html')
+      console.debug('[SelectionMenu] 加载本地文件:', filePath)
+      this.selectionMenuWindow.loadFile(filePath, {
+        query: { window: 'selection-menu' },
+        hash: 'selection-menu'
+      })
+    }
+
+    this.selectionMenuWindow.once('ready-to-show', () => {
+      console.debug('[SelectionMenu] ready-to-show 事件触发')
+      if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+        console.debug('[SelectionMenu] 准备显示窗口，当前 bounds:', this.selectionMenuWindow.getBounds())
+        console.debug('[SelectionMenu] 准备显示窗口，isVisible:', this.selectionMenuWindow.isVisible())
+        if (process.platform === 'darwin') {
+          this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver', 1)
+        } else {
+          this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver')
+        }
+        this.selectionMenuWindow.showInactive()
+        console.debug('[SelectionMenu] 窗口已调用 showInactive()')
+        setTimeout(() => {
+          if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+            console.debug('[SelectionMenu] 窗口显示后 bounds:', this.selectionMenuWindow.getBounds())
+            console.debug('[SelectionMenu] 窗口显示后 isVisible:', this.selectionMenuWindow.isVisible())
+            console.debug('[SelectionMenu] 窗口显示后 isFocused:', this.selectionMenuWindow.isFocused())
+          }
+        }, 100)
+      }
+    })
+
+    let ignoreBlur = false
+
+    this.selectionMenuWindow.webContents.on('before-input-event', () => {
+      ignoreBlur = true
+      setTimeout(() => {
+        ignoreBlur = false
+      }, 100)
+    })
+
+    this.selectionMenuWindow.on('blur', () => {
+      console.debug('[SelectionMenu] blur 事件触发, ignoreBlur:', ignoreBlur)
+      if (ignoreBlur) {
+        console.debug('[SelectionMenu] 忽略 blur 事件（用户正在交互）')
+        return
+      }
+      setTimeout(() => {
+        if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed() && !this.selectionMenuWindow.isFocused()) {
+          this.selectionMenuWindow.hide()
+          console.debug('[SelectionMenu] 窗口已隐藏（复用模式）')
+        }
+      }, 150)
+    })
+
+    this.selectionMenuWindow.on('closed', () => {
+      console.debug('[SelectionMenu] closed 事件触发')
+      this.selectionMenuWindow = null
+    })
+  }
+
+  public initSelectionHook(): void {
+    const bufferEnabled = (cache.get(CacheAttribute.prefBufferEnabled) ?? false) as boolean
+    if (!bufferEnabled) {
+      console.log('[SelectionMenu] SelectionHook is disabled by settings, skipping initialization.')
+      return
+    }
+    if (this.selectionHook) {
+      return
+    }
+
+    if (process.platform === 'darwin') {
+      if (!systemPreferences.isTrustedAccessibilityClient(false)) {
+        // 如果未完成引导，延迟权限请求到引导流程处理
+        const onboardingCompleted = (cache.get(CacheAttribute.prefOnboardingCompleted) as boolean) ?? false
+        if (onboardingCompleted) {
+          systemPreferences.isTrustedAccessibilityClient(true)
+          console.warn('⚠️ [SelectionHook] 需要辅助功能权限，已向系统发起请求')
+        } else {
+          console.log('[SelectionHook] Onboarding not completed — deferring permission request to onboarding flow')
+        }
+      }
+    }
+
+    try {
+      if (!SelectionHook) {
+        SelectionHook = requireModule('selection-hook') as SelectionHookConstructor
+      }
+      this.selectionHook = new SelectionHook()
+
+      // 监听全局鼠标按下事件，如果在划词浮窗外点击，立即销毁浮窗，避免成为用户负担
+      this.selectionHook.on('mouse-down', (data: MouseEventData) => {
+        if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+          const bounds = this.selectionMenuWindow.getBounds()
+          // Windows 下需要将 screen pixels 转换为 DIP
+          const dipPoint = this.screenToDip({ x: data.x, y: data.y })
+          // console.log('检测到全局鼠标按下:', data, '转换后DIP:', dipPoint, '划词浮窗位置和大小:', bounds)
+          const mouseX = dipPoint.x
+          const mouseY = dipPoint.y
+          const isInside = mouseX >= bounds.x && mouseX <= bounds.x + bounds.width &&
+                           mouseY >= bounds.y && mouseY <= bounds.y + bounds.height
+          if (!isInside) {
+            // console.log('检测到外部鼠标点击，自动隐藏划词浮窗（复用模式）')
+            this.selectionMenuWindow.hide()
+          } else {
+            // console.log('鼠标点击在浮窗内部，忽略')
+          }
+        }
+      })
+
+      // 监听全局键盘按下事件，如果划词浮窗正在显示，立即隐藏它
+      this.selectionHook.on('key-down', () => {
+        if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed() && this.selectionMenuWindow.isVisible()) {
+          this.selectionMenuWindow.hide()
+        }
+      })
+
+      this.selectionHook.on('text-selection', (data: TextSelectionData) => {
+        if (!ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+          console.debug('[SelectionMenu] 用户尚未进入主界面，忽略划词事件')
+          return
+        }
+
+        const text = data.text?.trim()
+        if (!text || text.length < 2) return
+
+        // 检查桌面是否被锁定
+        if (ElectronDesktopLock.getInstance().isDesktopLocked()) {
+          console.debug('[SelectionMenu] 桌面已锁定，忽略划词事件')
+          return
+        }
+
+        // 1) 检查总开关
+        const bufferEnabled = (cache.get(CacheAttribute.prefBufferEnabled) ?? false) as boolean
+        if (!bufferEnabled) return
+
+        // 2) 过滤掉自身应用的选中文本
+        const appName = app.name
+        if (data.programName === appName || data.programName?.includes(appName)) return
+
+        // 3) 检查 App 禁用名单
+        const disabledAppsRaw = (cache.get(CacheAttribute.prefBufferDisabledApps) as string) || '[]'
+        let disabledApps: string[] = []
+        try {
+          disabledApps = JSON.parse(disabledAppsRaw)
+        } catch {
+          // Ignore JSON parse errors and fallback to default empty array
+        }
+        if (disabledApps.includes(data.programName)) return
+
+        // 延迟验证选择，防止双击空白区域时因目标应用未完成选择重置而触发误判
+        setTimeout(() => {
+          if (!this.selectionHook) return
+
+          const currentSel = this.selectionHook.getCurrentSelection()
+          if (!currentSel) {
+            console.debug('[SelectionMenu] 延迟验证失败：当前已无选中文本')
+            return
+          }
+          const currentText = currentSel.text?.trim()
+          if (!currentText || currentText.length < 2) {
+            console.debug('[SelectionMenu] 延迟验证失败：当前已无选中文本或文本长度小于2')
+            return
+          }
+
+          console.log('检测到外部选中文本，准备打开浮窗菜单:', currentText, '来自:', data.programName)
+
+          this.currentSelectionData = {
+            ...data,
+            text: currentText,
+            startTop: currentSel.startTop || data.startTop,
+            startBottom: currentSel.startBottom || data.startBottom,
+            endTop: currentSel.endTop || data.endTop,
+            endBottom: currentSel.endBottom || data.endBottom,
+          }
+
+          // 创建/显示划词浮窗工具栏
+          this.createSelectionMenuWindow(this.currentSelectionData)
+        }, 150)
+      })
+
+      this.selectionHook.on('error', (err: Error) => {
+        console.error('SelectionHook Error:', err)
+      })
+
+      this.selectionHook.start({ enableClipboard: false })
+      console.log('✅ SelectionHook 划词监听已启动')
+    } catch (err) {
+      console.error('❌ SelectionHook 启动失败:', err)
+    }
+  }
+
+  public stopSelectionHook(): void {
+    if (this.selectionHook) {
+      this.selectionHook.stop()
+      this.selectionHook.cleanup()
+      this.selectionHook = null
+      console.log('✅ SelectionHook 已安全注销')
+    }
+  }
+
+  public registerIpcHandlers(
+    deps: {
+      showMainWindow: () => void
+      mainWindow: BrowserWindow | null
+      bufferItems: unknown[]
+      ensureBufferWindow: () => BrowserWindow
+      bufferWindowController: { bringToFront: () => void } | null
+      bringWindowToFront: (win: BrowserWindow) => void
+      broadcastBufferItems: () => void
+    }
+  ): void {
+    ipcMain.handle('selection:get-current', () => {
+      return this.currentSelectionData
+    })
+
+    ipcMain.handle('selection:action', async (_event, type: string, text: string) => {
+      const activeText = text || this.currentSelectionData?.text || ''
+      if (type === 'copy') {
+        clipboard.writeText(activeText)
+        if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+          this.selectionMenuWindow.hide()
+        }
+        return true
+      } else if (type === 'ai') {
+        // 打开/切换到莓莓对话 float-web 窗口，并通过 DbCache + IPC 传入划词文本（不通过 URL）
+        cache.set(CacheAttribute.tempFloatWebInput, activeText)
+        const scheme = !app.isPackaged ? 'berrytrace-dev' : 'berrytrace'
+        const url = `${scheme}://meimei`
+        ElectronFloatBall.getInstance().openFloatWebWindow(url, true)
+        // 如果窗口已 mount，直接通过 IPC 发送输入文本
+        ElectronFloatBall.getInstance().sendInputToMeimeiWindow(activeText)
+      } else if (type === 'plugin-action') {
+        // 插件划词菜单 action - 由插件自行处理
+        // 这里只是一个中转点，实际的 action 处理在插件侧
+        console.debug(`[SelectionMenu] Plugin action: ${text}`)
+      }
+
+      if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+        this.selectionMenuWindow.hide()
+      }
+      return true
+    })
+
+    ipcMain.handle('selection:disable-app', async (_event, appName: string, type: 'app' | 'global') => {
+      if (type === 'global') {
+        cache.set(CacheAttribute.prefBufferEnabled, false)
+      } else if (type === 'app' && appName) {
+        const disabledAppsRaw = (cache.get(CacheAttribute.prefBufferDisabledApps) as string) || '[]'
+        let disabledApps: string[] = []
+        try {
+          disabledApps = JSON.parse(disabledAppsRaw)
+        } catch {
+          // Ignore JSON parse errors and fallback to default empty array
+        }
+        if (!disabledApps.includes(appName)) {
+          disabledApps.push(appName)
+          cache.set(CacheAttribute.prefBufferDisabledApps, JSON.stringify(disabledApps))
+        }
+      }
+
+      // Broadcast preferences changed
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (win.isDestroyed()) return
+        if (win.webContents.id !== _event.sender.id) {
+          win.webContents.send('pref:changed')
+        }
+      })
+
+      if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+        this.selectionMenuWindow.hide()
+      }
+      return true
+    })
+
+    ipcMain.handle('selection:resize', (_event, width: number, height: number) => {
+      if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+        this.selectionMenuWindow.setSize(width, height)
+      }
+    })
+
+    ipcMain.handle('selection:open-settings', () => {
+      deps.showMainWindow()
+      if (deps.mainWindow && !deps.mainWindow.isDestroyed()) {
+        deps.mainWindow.webContents.send('navigate', '/preferences')
+      }
+      if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+        this.selectionMenuWindow.hide()
+      }
+    })
+
+    // 划词菜单插件按钮列表
+    ipcMain.handle('selection:getMenuItems', () => {
+      return this.getSelectionMenuItems()
+    })
+  }
+
+  // ─── 划词菜单插件按钮管理 ────────────────────────────────────────────────
+
+  public registerSelectionMenuItem(item: SelectionMenuItem): void {
+    this.selectionMenuItems.set(item.id, item)
+    this.pushMenuItemsToSelectionWindow()
+  }
+
+  public unregisterSelectionMenuItem(id: string): void {
+    this.selectionMenuItems.delete(id)
+    this.pushMenuItemsToSelectionWindow()
+  }
+
+  public getSelectionMenuItems(): SelectionMenuItem[] {
+    return Array.from(this.selectionMenuItems.values())
+  }
+
+  private pushMenuItemsToSelectionWindow(): void {
+    if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {
+      this.selectionMenuWindow.webContents.send('selection:menuItemsUpdate', this.getSelectionMenuItems())
+    }
+  }
+}

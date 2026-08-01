@@ -1,0 +1,42 @@
+diff --git a/electron/plugins/signature-verifier.ts b/electron/plugins/signature-verifier.ts
+index 4438abb..3555130 100644
+--- a/electron/plugins/signature-verifier.ts
++++ b/electron/plugins/signature-verifier.ts
+@@ -157,7 +157,8 @@ export function verifyPluginSignature(manifest: PluginManifest): boolean {
+  */
+ export function verifyPackageSignature(
+   tempExtractDir: string,
+-  signatureJson: SignatureJson | null | undefined
++  signatureJson: SignatureJson | null | undefined,
++  checkFileIntegrity: boolean = true
+ ): PackageVerificationResult {
+ 
+   try {
+@@ -193,16 +194,18 @@ export function verifyPackageSignature(
+       return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: '数字签名验证失败' };
+     }
+ 
+-    // 2. Validate all files listed in the signature
+-    for (const [relPath, expectedHash] of Object.entries(files)) {
+-      const fullPath = path.join(tempExtractDir, relPath);
+-      if (!fs.existsSync(fullPath)) {
+-        return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `缺少包文件: ${relPath}` };
+-      }
+-
+-      const actualHash = getFileHash(fullPath);
+-      if (actualHash !== expectedHash) {
+-        return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `文件已被修改: ${relPath}` };
++    // 2. Validate all files listed in the signature (only when checkFileIntegrity is true)
++    if (checkFileIntegrity) {
++      for (const [relPath, expectedHash] of Object.entries(files)) {
++        const fullPath = path.join(tempExtractDir, relPath);
++        if (!fs.existsSync(fullPath)) {
++          return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `缺少包文件: ${relPath}` };
++        }
++
++        const actualHash = getFileHash(fullPath);
++        if (actualHash !== expectedHash) {
++          return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `文件已被修改: ${relPath}` };
++        }
+       }
+     }

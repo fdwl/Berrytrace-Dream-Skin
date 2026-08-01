@@ -1,0 +1,355 @@
+import { app, net } from 'electron';
+import { Worker } from 'worker_threads';
+import * as path from 'path';
+import * as fs from 'fs';
+import { fileURLToPath } from 'url';
+import AdmZip from 'adm-zip';
+import type { PluginManifest, SignatureJson } from './signature-verifier';
+import { verifyPackageSignature } from './signature-verifier';
+import { PluginManager, getPluginRootDir } from './plugin-manager';
+import { ElectronMainWindow } from '../windows/main-window';
+import { ElectronFloatBall } from '../windows/float-ball';
+import { SKILLS_DIR } from '../config/paths';
+import eventBus from '../../src/services/event_bus';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+export interface PackageInfo {
+  success: boolean;
+  error?: string;
+  tempDir?: string;
+  packagePath?: string;
+  manifest?: PluginManifest;
+  signature?: SignatureJson;
+  verification?: {
+    isValid: boolean;
+    isOfficial: boolean;
+    publicKey: string;
+    pluginId: string;
+    version: string;
+    error?: string;
+  };
+}
+
+class PluginInstallerWorkerManager {
+  private static worker: Worker | null = null;
+  private static pendingRequests = new Map<string, { resolve: Function; reject: Function }>();
+  private static nextTaskId = 0;
+
+  private static getWorker(): Worker {
+    if (this.worker) return this.worker;
+
+    // Resolve worker path
+    let workerPath = path.join(__dirname, 'workers/plugin-installer.worker.js');
+    if (!fs.existsSync(workerPath)) {
+      const appPath = app.isPackaged ? process.resourcesPath : process.cwd();
+      const altPath = path.join(appPath, 'dist-electron/workers/plugin-installer.worker.js');
+      if (fs.existsSync(altPath)) {
+        workerPath = altPath;
+      } else {
+        const legacyPath = path.join(__dirname, '../workers/plugin-installer.worker.js');
+        if (fs.existsSync(legacyPath)) {
+          workerPath = legacyPath;
+        } else {
+          // Dev fallback
+          const devPath = path.join(process.cwd(), 'dist-electron/workers/plugin-installer.worker.js');
+          if (fs.existsSync(devPath)) {
+            workerPath = devPath;
+          }
+        }
+      }
+    }
+
+    console.log(`[PluginInstallerWorker] Initializing Worker Thread at path: ${workerPath}`);
+    this.worker = new Worker(workerPath);
+
+    this.worker.on('message', (response) => {
+      const { taskId, success, result, error } = response;
+      const req = this.pendingRequests.get(taskId);
+      if (req) {
+        if (success) {
+          req.resolve(result);
+        } else {
+          req.reject(new Error(error));
+        }
+        this.pendingRequests.delete(taskId);
+      }
+    });
+
+    this.worker.on('error', (err) => {
+      console.error('[PluginInstallerWorker] Worker error:', err);
+      this.worker = null;
+    });
+
+    this.worker.on('exit', (code) => {
+      if (code !== 0) {
+        console.error(`[PluginInstallerWorker] Worker stopped with exit code ${code}`);
+      }
+      this.worker = null;
+    });
+
+    return this.worker;
+  }
+
+  public static runTask(action: 'verify' | 'copy-files', payload: Record<string, any>): Promise<any> {
+    return new Promise((resolve, reject) => {
+      try {
+        const worker = this.getWorker();
+        const taskId = `${Date.now()}-${this.nextTaskId++}`;
+        this.pendingRequests.set(taskId, { resolve, reject });
+        worker.postMessage({ action, taskId, ...payload });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+}
+
+/**
+ * Verifies a plugin package's integrity and signature.
+ * Extracts the contents to a temporary directory for analysis in background worker.
+ */
+export async function verifyPackage(packagePath: string): Promise<PackageInfo> {
+  const tempDir = path.join(app.getPath('temp'), `berrytrace-install-${Date.now()}`);
+
+  try {
+    console.log(`[PluginInstall] Verifying plugin package in background worker: ${packagePath}`);
+    const result = await PluginInstallerWorkerManager.runTask('verify', { packagePath, tempDir });
+    return {
+      success: true,
+      ...result
+    };
+  } catch (err: unknown) {
+    console.error('[PluginInstall] Verification failed in worker:', err);
+    cleanupTempDir(tempDir);
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, error: `校验插件时发生错误: ${msg}` };
+  }
+}
+
+/**
+ * Copies the pre-verified package files to the production directory.
+ */
+export async function confirmInstallPackage(
+  tempDir: string,
+  packagePath: string,
+  pluginId: string,
+  signatureJson: SignatureJson | null | undefined
+): Promise<boolean> {
+  try {
+    console.log(`[PluginInstall] Confirming installation for plugin: ${pluginId}`);
+    PluginManager.getInstance().markPluginLifecycle(pluginId, 'install', 'setup');
+    const prodPluginsDir = getPluginRootDir();
+    const destDir = path.join(prodPluginsDir, pluginId);
+    const tempDestDir = destDir + '.new';
+
+    if (fs.existsSync(tempDestDir)) {
+      fs.rmSync(tempDestDir, { recursive: true, force: true });
+    }
+    fs.mkdirSync(tempDestDir, { recursive: true });
+
+    // 1. Offload heavy file copying to the background worker thread
+    await PluginInstallerWorkerManager.runTask('copy-files', { tempDir, tempDestDir, signatureJson });
+
+    // 2. Perform fast deactivation & rename operations synchronously
+    // Deactivate first before atomic replacement
+    await PluginManager.getInstance().deactivatePlugin(pluginId);
+
+    const oldDestDir = destDir + '.old';
+    if (fs.existsSync(oldDestDir)) {
+      fs.rmSync(oldDestDir, { recursive: true, force: true });
+    }
+
+    if (fs.existsSync(destDir)) {
+      fs.renameSync(destDir, oldDestDir);
+    }
+
+    try {
+      fs.renameSync(tempDestDir, destDir);
+      if (fs.existsSync(oldDestDir)) {
+        fs.rmSync(oldDestDir, { recursive: true, force: true });
+      }
+    } catch (renameErr) {
+      console.error('[PluginInstall] Atomic rename failed. Rolling back...', renameErr);
+      if (fs.existsSync(oldDestDir)) {
+        try {
+          if (fs.existsSync(destDir)) {
+            fs.rmSync(destDir, { recursive: true, force: true });
+          }
+          fs.renameSync(oldDestDir, destDir);
+        } catch (rollBackErr) {
+          console.error('[PluginInstall] Rollback failed!', rollBackErr);
+        }
+      }
+      throw renameErr;
+    }
+
+    console.log(`[PluginInstall] Successfully installed plugin to: ${destDir}`);
+
+    // ── Skills 同步：将插件内的 skills/ 目录复制 to 公共 Skills 目录 ───────────────
+    // 公共 Skills 目录：BERRYTRACE_HOME/skills/<pluginId>/
+    // AI 内核（mastra-kernel）从此固定路径读取，不再依赖插件目录
+    await syncPluginSkills(destDir, pluginId);
+
+    // Re-scan all plugins and notify renderer for JS-level hot-swap
+    await PluginManager.getInstance().init(true);
+
+    // Also reload open UI windows for the just-installed plugin so that
+    // any already-open floating/workspace windows immediately show the new version.
+    ElectronFloatBall.getInstance().reloadPluginWindows(pluginId);
+
+    // 触发全文索引重建（skills + tools）
+    // 与 enable/disable/uninstall 保持一致，安装后也需要更新 FtsAgentIndex
+    console.log(`[PluginInstall] Emitting plugin:changed to trigger FTS index rebuild for ${pluginId}`);
+    eventBus.emit('plugin:changed', { action: 'install', pluginId }, { broadcast: true });
+
+    cleanupTempDir(tempDir);
+    return true;
+
+  } catch (err: unknown) {
+    console.error('[PluginInstall] Confirmation failed:', err);
+    cleanupTempDir(tempDir);
+    return false;
+  }
+}
+
+function cleanupTempDir(dir: string) {
+  try {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(`[PluginInstall] Cleaned up temporary directory: ${dir}`);
+    }
+  } catch (err) {
+    console.warn(`[PluginInstall] Failed to cleanup temporary directory: ${dir}`, err);
+  }
+}
+
+/**
+ * 将插件内的 skills/ 目录同步到公共 Skills 目录。
+ *
+ * 结构：
+ *   <pluginDir>/skills/<skillName>/SKILL.md
+ *       ↓
+ *   BERRYTRACE_HOME/skills/<skillName>/SKILL.md
+ *
+ * 说明：
+ *  - skillName 层级由插件自定义（如 ffmpeg、scheduler），与 pluginId 无关
+ *  - 重新安装插件时覆盖旧 Skills 文件，保持版本同步
+ *  - 卸载时保留 Skills（用户可能已有依赖），由用户手动清理
+ */
+async function syncPluginSkills(pluginDir: string, pluginId: string): Promise<void> {
+  const skillsSrcDir = path.join(pluginDir, 'skills');
+  const sharedSkillsDir = SKILLS_DIR;
+  fs.mkdirSync(sharedSkillsDir, { recursive: true });
+
+  try {
+    // 1. 清理该插件此前已同步过但已被新版本移除的旧 Skill 目录
+    const existingSkills = fs.readdirSync(sharedSkillsDir);
+    for (const existingName of existingSkills) {
+      const existingDir = path.join(sharedSkillsDir, existingName);
+      if (!fs.statSync(existingDir).isDirectory()) continue;
+
+      const metaPath = path.join(existingDir, '.plugin_owner.json');
+      if (fs.existsSync(metaPath)) {
+        try {
+          const ownerMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+          if (ownerMeta?.pluginId === pluginId) {
+            // 如果新版本的 skills/ 中不再包含这个 skill，清理残留的旧 Skill 目录
+            const stillExistsInSrc = fs.existsSync(skillsSrcDir) && 
+                                      fs.existsSync(path.join(skillsSrcDir, existingName)) && 
+                                      fs.statSync(path.join(skillsSrcDir, existingName)).isDirectory();
+            if (!stillExistsInSrc) {
+              fs.rmSync(existingDir, { recursive: true, force: true });
+              console.log(`[PluginInstall] 🗑️ Cleaned up obsolete skill [${existingName}] for updated plugin [${pluginId}]`);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    if (!fs.existsSync(skillsSrcDir)) {
+      return; // 该插件不包含 Skills，跳过同步
+    }
+
+    // 2. 遍历 skills/<skillName>/ 子目录并同步（先清空目标目录保证干净）
+    const skillNames = fs.readdirSync(skillsSrcDir);
+    let copiedCount = 0;
+
+    for (const skillName of skillNames) {
+      const srcSkillDir = path.join(skillsSrcDir, skillName);
+      if (!fs.statSync(srcSkillDir).isDirectory()) continue;
+
+      const destSkillDir = path.join(sharedSkillsDir, skillName);
+      // 先清空该 skill 目标目录，防止废弃文件残留
+      if (fs.existsSync(destSkillDir)) {
+        fs.rmSync(destSkillDir, { recursive: true, force: true });
+      }
+      fs.mkdirSync(destSkillDir, { recursive: true });
+
+      // 递归复制 skill 目录内所有文件
+      copyDirRecursive(srcSkillDir, destSkillDir);
+
+      // 写入所属插件标记文件，用于下次升级/重构时归属清理
+      fs.writeFileSync(
+        path.join(destSkillDir, '.plugin_owner.json'),
+        JSON.stringify({ pluginId, updatedAt: new Date().toISOString() }, null, 2),
+        'utf-8'
+      );
+
+      copiedCount++;
+    }
+
+    if (copiedCount > 0) {
+      console.log(`[PluginInstall] ✅ Synced ${copiedCount} skill(s) from [${pluginId}] to ${sharedSkillsDir}`);
+    }
+  } catch (err) {
+    console.warn(`[PluginInstall] Failed to sync skills for plugin [${pluginId}]:`, err);
+  }
+}
+
+function copyDirRecursive(src: string, dest: string): void {
+  const entries = fs.readdirSync(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const destPath = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      fs.mkdirSync(destPath, { recursive: true });
+      copyDirRecursive(srcPath, destPath);
+    } else {
+      fs.copyFileSync(srcPath, destPath);
+    }
+  }
+}
+
+
+/**
+ * Downloads a .btp plugin package from a remote URL to a temporary location,
+ * then triggers installer page in main window.
+ */
+export async function downloadAndInstallPlugin(btpUrl: string): Promise<boolean> {
+  try {
+    console.log(`[PluginInstall] Downloading plugin from: ${btpUrl}`);
+    const response = await net.fetch(btpUrl, { redirect: 'follow' });
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    const tempPath = path.join(app.getPath('temp'), `downloaded-plugin-${Date.now()}.btp`);
+    fs.writeFileSync(tempPath, buffer);
+
+    // Redirect preferences page to install the downloaded plugin package
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('navigate', `/preferences?installPkgPath=${encodeURIComponent(tempPath)}`);
+    }
+    return true;
+  } catch (err: unknown) {
+    console.error('[PluginInstall] Failed to download plugin:', err);
+    return false;
+  }
+}

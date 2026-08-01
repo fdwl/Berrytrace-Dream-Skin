@@ -1,0 +1,241 @@
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+
+// BerryTrace Official Ed25519 Public Key (Hex format)
+const OFFICIAL_PUBLIC_KEY_HEX = 'c59c9688de040ad16e671f62d89945cef7506b603446b12b71c5e02d6355393c';
+
+// BerryTrace Official ECDSA P-256 Public Key (Legacy, for backward compatibility)
+const OFFICIAL_PUBLIC_KEY_ECDSA = `-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2SX7FB1FQh2uaycXZg9KBSaml/56
+AZRVkJV1Vr5tx+0l0lmZ42160HdIpNl3u1rVLBry3PPP6J3B2tlXDJdePA==
+-----END PUBLIC KEY-----`;
+
+export interface PackageVerificationResult {
+  isValid: boolean;
+  isOfficial: boolean;
+  publicKey: string;
+  pluginId: string;
+  version: string;
+  error?: string;
+}
+
+export interface PluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  description?: string;
+  author?: string;
+  main: string;
+  permissions?: string[];
+  mcp?: Record<string, unknown>;
+  signature?: string;
+  fileAssociations?: string[];
+  supportTabs?: boolean;
+  startupPriority?: 'high' | 'normal';
+  berrytrace?: {
+    id: string;
+    label?: string;
+    icon?: string;
+    startupPriority?: 'high' | 'normal';
+    requiredFiles?: Array<{ path: string; minSize: number }>;
+  };
+}
+
+export interface SignatureJson {
+  pluginId: string;
+  version: string;
+  publicKey: string;
+  signature: string;
+  files: Record<string, string>;
+}
+
+
+/**
+ * Loads a public key dynamically supporting both 32-byte hex (Ed25519) and standard PEM format.
+ */
+function loadPublicKey(keyStr: string): crypto.KeyObject {
+  const trimmed = keyStr.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    // 32-byte raw hex Ed25519 public key
+    const rawKey = Buffer.from(trimmed, 'hex');
+    const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+    const der = Buffer.concat([spkiPrefix, rawKey]);
+    return crypto.createPublicKey({
+      key: der,
+      format: 'der',
+      type: 'spki'
+    });
+  }
+  return crypto.createPublicKey(trimmed);
+}
+
+/**
+ * Creates a deterministic, canonical representation of a plugin manifest.
+ * Only signs core immutable identity fields.
+ */
+export function getCanonicalManifestString(manifest: PluginManifest): string {
+  const canonicalObj = {
+    id: manifest.id || '',
+    name: manifest.name || '',
+    version: manifest.version || '',
+    author: manifest.author || '',
+    main: manifest.main || '',
+  };
+  return JSON.stringify(canonicalObj);
+}
+
+
+/**
+ * Creates a deterministic, canonical representation of a package files map.
+ */
+export function getCanonicalPackageString(pluginId: string, version: string, files: Record<string, string>): string {
+  const sortedFiles: Record<string, string> = {};
+  for (const key of Object.keys(files).sort()) {
+    sortedFiles[key] = files[key];
+  }
+  const canonicalObj = {
+    pluginId,
+    version,
+    files: sortedFiles
+  };
+  return JSON.stringify(canonicalObj);
+}
+
+/**
+ * Computes SHA-256 hash of a file.
+ */
+function getFileHash(filePath: string): string {
+  const content = fs.readFileSync(filePath);
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * Cryptographically verifies if the plugin manifest was signed by BerryTrace Official.
+ */
+export function verifyPluginSignature(manifest: PluginManifest): boolean {
+  if (!manifest || !manifest.signature) {
+    return false;
+  }
+
+
+  try {
+    const dataStr = getCanonicalManifestString(manifest);
+    const signature = manifest.signature;
+    const dataBuffer = Buffer.from(dataStr, 'utf8');
+    const signatureBuffer = Buffer.from(signature, 'hex');
+
+    // 1. Try new Ed25519 official key
+    try {
+      const officialKeyEd25519 = loadPublicKey(OFFICIAL_PUBLIC_KEY_HEX);
+      if (crypto.verify(null, dataBuffer, officialKeyEd25519, signatureBuffer)) {
+        return true;
+      }
+    } catch (e) {
+      console.warn('[SignatureVerifier] Ed25519 official verification failed, trying legacy...', e);
+    }
+
+    // 2. Try legacy ECDSA official key
+    try {
+      const officialKeyECDSA = loadPublicKey(OFFICIAL_PUBLIC_KEY_ECDSA);
+      if (crypto.verify('SHA256', dataBuffer, officialKeyECDSA, signatureBuffer)) {
+        return true;
+      }
+    } catch (e) {
+      console.warn('[SignatureVerifier] Legacy ECDSA official verification failed.', e);
+    }
+
+    return false;
+  } catch (err) {
+    console.error('[SignatureVerifier] Error during verification:', err);
+    return false;
+  }
+}
+
+/**
+ * Cryptographically verifies the package signature and integrity.
+ */
+export function verifyPackageSignature(
+  tempExtractDir: string,
+  signatureJson: SignatureJson | null | undefined,
+  checkFileIntegrity: boolean = true
+): PackageVerificationResult {
+
+  try {
+    if (!signatureJson) {
+      return { isValid: false, isOfficial: false, publicKey: '', pluginId: '', version: '', error: '签名文件不存在' };
+    }
+
+    const { pluginId, version, publicKey, signature, files } = signatureJson;
+    if (!pluginId || !version || !publicKey || !signature || !files) {
+      return { isValid: false, isOfficial: false, publicKey: '', pluginId: '', version: '', error: '签名文件结构不完整' };
+    }
+
+    // 1. Cryptographic Signature check
+    const canonicalStr = getCanonicalPackageString(pluginId, version, files);
+    const dataBuffer = Buffer.from(canonicalStr, 'utf8');
+    const publicKeyObj = loadPublicKey(publicKey);
+    const signatureBuffer = Buffer.from(signature, 'hex');
+
+    let isCryptoValid = false;
+    try {
+      if (publicKeyObj.asymmetricKeyType === 'ed25519') {
+        isCryptoValid = crypto.verify(null, dataBuffer, publicKeyObj, signatureBuffer);
+      } else {
+        isCryptoValid = crypto.verify('SHA256', dataBuffer, publicKeyObj, signatureBuffer);
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `数字签名验证异常: ${msg}` };
+    }
+
+
+    if (!isCryptoValid) {
+      return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: '数字签名验证失败' };
+    }
+
+    // 2. Validate all files listed in the signature (only when checkFileIntegrity is true)
+    if (checkFileIntegrity) {
+      for (const [relPath, expectedHash] of Object.entries(files)) {
+        const fullPath = path.join(tempExtractDir, relPath);
+        if (!fs.existsSync(fullPath)) {
+          return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `缺少包文件: ${relPath}` };
+        }
+
+        const actualHash = getFileHash(fullPath);
+        if (actualHash !== expectedHash) {
+          return { isValid: false, isOfficial: false, publicKey, pluginId, version, error: `文件已被修改: ${relPath}` };
+        }
+      }
+    }
+
+    // 3. Official signature check
+    const officialKeyEd25519 = loadPublicKey(OFFICIAL_PUBLIC_KEY_HEX);
+    const officialKeyECDSA = loadPublicKey(OFFICIAL_PUBLIC_KEY_ECDSA);
+
+    const publicKeyDer = publicKeyObj.export({ type: 'spki', format: 'der' });
+    const isOfficial = publicKeyDer.equals(officialKeyEd25519.export({ type: 'spki', format: 'der' })) ||
+                       publicKeyDer.equals(officialKeyECDSA.export({ type: 'spki', format: 'der' }));
+
+    return {
+      isValid: true,
+      isOfficial,
+      publicKey,
+      pluginId,
+      version
+    };
+
+  } catch (err: unknown) {
+    console.error('[SignatureVerifier] Error verifying package signature:', err);
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      isValid: false,
+      isOfficial: false,
+      publicKey: signatureJson?.publicKey || '',
+      pluginId: signatureJson?.pluginId || '',
+      version: signatureJson?.version || '',
+      error: `验证抛出异常: ${msg}`
+    };
+  }
+
+}

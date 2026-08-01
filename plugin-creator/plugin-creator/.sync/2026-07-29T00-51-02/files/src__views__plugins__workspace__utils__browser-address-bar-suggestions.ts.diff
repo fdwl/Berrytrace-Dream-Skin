@@ -1,0 +1,134 @@
+diff --git a/src/views/plugins/workspace/utils/browser-address-bar-suggestions.ts b/src/views/plugins/workspace/utils/browser-address-bar-suggestions.ts
+new file mode 100644
+index 0000000..e7f843b
+--- /dev/null
++++ b/src/views/plugins/workspace/utils/browser-address-bar-suggestions.ts
+@@ -0,0 +1,128 @@
++import type { BrowserHistoryEntry } from '../../../../stores/browserHistory';
++
++export const MAX_BROWSER_ADDRESS_BAR_SUGGESTIONS = 8;
++
++export type BrowserAddressBarSuggestion = {
++  url: string;
++  title: string;
++  subtitle: string;
++  lastVisitedAt: number;
++  visitCount: number;
++  isSearch: boolean;
++};
++
++export function looksLikeSearchQuery(query: string): boolean {
++  const trimmed = query.trim();
++  if (!trimmed) return false;
++  if (/^https?:\/\//i.test(trimmed)) return false;
++  if (/\s/.test(trimmed)) return true;
++  if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(:\d+)?(\/\S*)?$/.test(trimmed)) return false;
++  if (trimmed.startsWith('localhost') || trimmed.startsWith('127.0.0.1')) return false;
++  return true;
++}
++
++export function buildSearchUrl(query: string): string {
++  return `https://www.google.com/search?q=${encodeURIComponent(query.trim())}`;
++}
++
++export function normalizeBrowserNavigationUrl(query: string): string | null {
++  const trimmed = query.trim();
++  if (!trimmed) return null;
++  if (/^https?:\/\//i.test(trimmed)) return trimmed;
++  if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(:\d+)?(\/\S*)?$/.test(trimmed)) {
++    return `https://${trimmed}`;
++  }
++  if (trimmed.startsWith('localhost') || trimmed.startsWith('127.0.0.1')) {
++    return `http://${trimmed}`;
++  }
++  return null;
++}
++
++function scoreBrowserAddressBarSuggestion(
++  entry: { url: string; title: string; lastVisitedAt: number; visitCount: number },
++  query: string
++): number {
++  const lowerQuery = query.toLowerCase();
++  const lowerUrl = entry.url.toLowerCase();
++  const lowerTitle = entry.title.toLowerCase();
++
++  if (!lowerUrl.includes(lowerQuery) && !lowerTitle.includes(lowerQuery)) {
++    return -1;
++  }
++
++  let score = 0;
++  if (lowerUrl.startsWith(lowerQuery) || lowerUrl.startsWith(`https://${lowerQuery}`)) {
++    score += 100;
++  }
++  score += Math.min(entry.visitCount, 50);
++  const ageHours = (Date.now() - entry.lastVisitedAt) / (1000 * 60 * 60);
++  score += Math.max(0, 24 - ageHours);
++  return score;
++}
++
++export function buildBrowserAddressBarSuggestions({
++  browserUrlHistory,
++  value,
++}: {
++  browserUrlHistory: readonly BrowserHistoryEntry[];
++  value: string;
++}): BrowserAddressBarSuggestion[] {
++  const trimmed = value.trim();
++  if (trimmed === '' || trimmed === 'about:blank' || trimmed.startsWith('data:')) {
++    if (browserUrlHistory.length === 0) return [];
++    return [...browserUrlHistory]
++      .sort((a, b) => b.lastVisitedAt - a.lastVisitedAt)
++      .slice(0, MAX_BROWSER_ADDRESS_BAR_SUGGESTIONS)
++      .map((entry) => ({ ...entry, subtitle: entry.url, isSearch: false }));
++  }
++
++  const historySuggestions: BrowserAddressBarSuggestion[] =
++    browserUrlHistory.length > 0
++      ? browserUrlHistory
++          .map((entry) => ({
++            entry,
++            score: scoreBrowserAddressBarSuggestion(entry, trimmed),
++          }))
++          .filter((item) => item.score >= 0)
++          .sort((a, b) => b.score - a.score)
++          .slice(0, MAX_BROWSER_ADDRESS_BAR_SUGGESTIONS - 1)
++          .map((item) => ({ ...item.entry, subtitle: item.entry.url, isSearch: false }))
++      : [];
++
++  const isQuery = looksLikeSearchQuery(trimmed);
++  let topAction: BrowserAddressBarSuggestion | null = null;
++
++  if (isQuery) {
++    topAction = {
++      url: buildSearchUrl(trimmed),
++      title: trimmed,
++      subtitle: 'Google 搜索',
++      lastVisitedAt: 0,
++      visitCount: 0,
++      isSearch: true,
++    };
++  } else {
++    const normalizedUrl = normalizeBrowserNavigationUrl(trimmed);
++    topAction = normalizedUrl
++      ? {
++          url: normalizedUrl,
++          title: trimmed,
++          subtitle: '',
++          lastVisitedAt: 0,
++          visitCount: 0,
++          isSearch: false,
++        }
++      : null;
++  }
++
++  if (!topAction) {
++    return historySuggestions.slice(0, MAX_BROWSER_ADDRESS_BAR_SUGGESTIONS);
++  }
++
++  const duplicateIdx = historySuggestions.findIndex((h) => h.url === topAction!.url);
++  if (duplicateIdx >= 0) {
++    return historySuggestions.slice(0, MAX_BROWSER_ADDRESS_BAR_SUGGESTIONS);
++  }
++
++  return [topAction, ...historySuggestions].slice(0, MAX_BROWSER_ADDRESS_BAR_SUGGESTIONS);
++}

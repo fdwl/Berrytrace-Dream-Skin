@@ -1,0 +1,182 @@
+diff --git a/electron/plugins/plugin-ipc.ts b/electron/plugins/plugin-ipc.ts
+index 353b00f..99f5018 100644
+--- a/electron/plugins/plugin-ipc.ts
++++ b/electron/plugins/plugin-ipc.ts
+@@ -1,12 +1,12 @@
+ import { ipcMain, BrowserWindow, dialog, IpcMainEvent, net, app } from 'electron';
+-import { PluginManager } from './plugin-manager';
++import type { PluginManager } from './plugin-manager';
+ import { McpHost } from './mcp-host';
+ import { cache } from '../config/index';
+ import { CacheAttribute } from '../../src/config/CacheAttribute';
+ import { PluginUpdater } from './plugin-update';
+ import { verifyPackage, confirmInstallPackage } from './plugin-install';
+ import { dispatchPluginApiCall } from './api-dispatcher';
+-import { SignatureJson } from './signature-verifier';
++import type { SignatureJson } from './signature-verifier';
+ import path, { join } from 'path';
+ import { promises as fs } from 'fs';
+ import * as fsSync from 'fs';
+@@ -17,6 +17,51 @@ import { isVersionNewer } from './plugin-utils';
+ export function registerIpcHandlers(pm: PluginManager): void {
+   console.log('[plugin-ipc] registerIpcHandlers called');
+ 
++  function buildPluginEntry(p: any, isActive: boolean, pinnedList: string[], override?: any) {
++    const updateInfo = PluginUpdater.getInstance().getUpdate(p.manifest.id);
++    const hasUpdate = updateInfo && isVersionNewer(updateInfo.version, p.manifest.version);
++    const scope = p.manifest.scope || (p.manifest.type === 'background' || p.manifest.type === 'main' ? 'global' : 'workspace');
++
++    return {
++      id: p.manifest.id,
++      name: p.manifest.name,
++      version: p.manifest.version,
++      description: p.manifest.description,
++      isActive,
++      isLoaded: pm.isPluginActive(p.manifest.id),
++      isPinned: pinnedList.includes(p.manifest.id),
++      hasBackend: false,
++      status: p.status,
++      isDevFolder: p.isDevFolder,
++      isCustomDev: false,
++      type: p.manifest.type,
++      windowScope: p.manifest.windowScope,
++      scope,
++      view: p.manifest.view,
++      keywords: p.manifest.keywords ?? [],
++      fileAssociations: p.manifest.fileAssociations ?? [],
++      documentCreators: p.manifest.documentCreators ?? [],
++      triggerPrefix: p.manifest.triggerPrefix,
++      quickPanelMode: p.manifest.quickPanelMode || 'window',
++      disableDefaultDrag: p.manifest.disableDefaultDrag ?? false,
++      supportTabs: p.manifest.supportTabs ?? false,
++      startupPriority: p.manifest.startupPriority || 'normal',
++      uiMode: 'iframe',
++      nativeElectron: p.manifest.nativeElectron ?? false,
++      updateVersion: hasUpdate ? updateInfo?.version : undefined,
++      updateUrl: hasUpdate ? updateInfo?.url : undefined,
++      updateChangelog: hasUpdate ? updateInfo?.changelog : undefined,
++      main: p.manifest.main,
++      settingsSchema: p.manifest.settingsSchema,
++      auth: p.manifest.auth,
++      activationEvents: p.manifest.activationEvents,
++      contributes: p.manifest.contributes,
++      processIsolation: p.manifest.processIsolation ?? 'optional',
++      pluginLifecycle: pm.getLifecycleContext(p.manifest.id),
++      workspaceOverride: override,
++    };
++  }
++
+   // 注册一等公民开发者 MCP 工具，供 AI 调试和管理开发插件
+   McpHost.getInstance().registerHostTool(
+     {
+@@ -351,9 +396,40 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     }
+   );
+ 
++  // 注册一等公民内置宿主 MCP 工具：Agent 能力检索 (FTS5 + Vector 语义搜索)
++  McpHost.getInstance().registerHostTool(
++    {
++      name: 'capability_search',
++      description: '在已安装的能力库中检索相关的 Agent 技能 (Skills) 与工具 (MCP Tools)。支持自然语言语义和模糊查询。',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          query: {
++            type: 'string',
++            description: '搜索词，例如 "文件读取"、"数据库查询"、"系统截图"'
++          }
++        },
++        required: ['query']
++      }
++    },
++    async (args) => {
++      try {
++        const query = String(args.query || '').trim();
++        const { FtsHybridSearcher } = await import('../services/fts-hybrid-searcher.js');
++        const { WorkspaceManager, getDefaultWorkspacePath } = require('../services/workspace-manager');
++        const workspacePath = WorkspaceManager.getInstance().getPath() || getDefaultWorkspacePath();
++        const results = await FtsHybridSearcher.searchAgentCapabilities(query, workspacePath);
++        return results;
++      } catch (err: any) {
++        return { error: err.message || String(err) };
++      }
++    }
++  );
++
+   ipcMain.handle('plugins:get-list', async (event) => {
+     await pm.init();
+     const enabledList = cache.get(CacheAttribute.prefEnabledPlugins) as string[] | undefined;
++    const disabledList = cache.get('prefDisabledPlugins') as string[] | undefined || [];
+     const pinnedList = cache.get(CacheAttribute.prefPinnedPlugins) as string[] | undefined || [];
+ 
+     // Phase 3: Load per-workspace plugin overrides
+@@ -373,6 +449,10 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     const allowedBuiltins = oemManager.getConfig().builtinPlugins || [];
+ 
+     return pm.getPluginsList().map(p => {
++      // 用户显式禁用优先级最高，无论 isBuiltin/resident 均强制 isActive=false
++      if (disabledList.includes(p.manifest.id)) {
++        return buildPluginEntry(p, false, pinnedList);
++      }
+       const isBuiltin = allowedBuiltins.includes(p.manifest.id);
+       const globalEnabled = isBuiltin
+         ? true
+@@ -526,12 +606,36 @@ export function registerIpcHandlers(pm: PluginManager): void {
+ 
+   ipcMain.handle('plugins:api-call', async (_event, apiName: string, methodName: string, args: unknown[], callerPluginId?: string) => {
+     const safeArgs = Array.isArray(args) ? args : [];
+-    const isVerbosePolling = 
+-      (apiName === 'terminal' && (methodName === 'getCwd' || methodName === 'getPromptState')) ||
++    const isSilentPolling = 
++      (apiName === 'workspace' && (methodName === 'scanPorts' || methodName === 'getHistory')) ||
++      (apiName === 'terminal' && (methodName === 'getAllStatus' || methodName === 'getCwd' || methodName === 'getPromptState')) ||
+       (apiName === 'window' && (methodName === 'updateWindowOptions' || methodName === 'startDrag'));
+-    if (!isVerbosePolling) {
+-      console.log(`[PluginIPC] plugins:api-call: api=${apiName} method=${methodName} args=${JSON.stringify(safeArgs)} caller=${callerPluginId || 'auto'}`);
++
++    const cleanArgs = safeArgs.map(arg => {
++      if (arg instanceof Uint8Array || ArrayBuffer.isView(arg) || Buffer.isBuffer(arg)) {
++        return `<Binary Data: ${(arg as any).length || (arg as any).byteLength} bytes>`;
++      }
++      if (arg && typeof arg === 'object') {
++        const keys = Object.keys(arg);
++        if (keys.length > 100) {
++          return `<Large Object: ${keys.length} keys>`;
++        }
++        const str = JSON.stringify(arg);
++        if (str.length > 500) {
++          return `${str.slice(0, 300)}... <truncated ${str.length - 300} chars>`;
++        }
++      }
++      return arg;
++    });
++
++    if (isSilentPolling) {
++      if (console.debug) {
++        console.debug(`[PluginIPC:debug] api=${apiName} method=${methodName} caller=${callerPluginId || 'auto'}`);
++      }
++    } else {
++      console.log(`[PluginIPC:api-call] api=${apiName} method=${methodName} args=${JSON.stringify(cleanArgs)} caller=${callerPluginId || 'auto'}`);
+     }
++
+     try {
+       await pm.init();
+       let callerId = callerPluginId || 'generic-ui';
+@@ -546,7 +650,7 @@ export function registerIpcHandlers(pm: PluginManager): void {
+       }
+       return await dispatchPluginApiCall(callerId, apiName, methodName, safeArgs, undefined, _event.sender);
+     } catch (err: any) {
+-      console.log(`[PluginIPC] plugins:api-call failed (returning soft error to avoid log pollution):`, err.message || err);
++      console.error(`🚨 [PluginIPC:ERROR] api=${apiName} method=${methodName} failed:`, err.message || err);
+       return {
+         __isApiError: true,
+         message: err.message || String(err),
+@@ -859,7 +963,7 @@ export function registerIpcHandlers(pm: PluginManager): void {
+     baseUrl?: string;
+   }) => {
+     try {
+-      let baseUrl = options.baseUrl?.trim() || '';
++      const baseUrl = options.baseUrl?.trim() || '';
+       if (!baseUrl) {
+         return { success: false, error: 'API 地址 (Base URL) 不能为空' };
+       }

@@ -1,0 +1,167 @@
+diff --git a/src/views/plugins/workspace/components/BrowserImportHintButton.tsx b/src/views/plugins/workspace/components/BrowserImportHintButton.tsx
+new file mode 100644
+index 0000000..2bf54f3
+--- /dev/null
++++ b/src/views/plugins/workspace/components/BrowserImportHintButton.tsx
+@@ -0,0 +1,161 @@
++import React, { useState, useEffect } from 'react';
++import { Import, CheckCircle2, AlertCircle, Layers } from 'lucide-react';
++
++interface BrowserImportHintButtonProps {
++  onSuccessToast?: (msg: string) => void;
++  onErrorToast?: (msg: string) => void;
++}
++
++export function BrowserImportHintButton({ onSuccessToast, onErrorToast }: BrowserImportHintButtonProps) {
++  const [open, setOpen] = useState(false);
++  const [detectedBrowsers, setDetectedBrowsers] = useState<any[]>([]);
++  const [loading, setLoading] = useState(false);
++
++  const fetchBrowsers = async () => {
++    if (!window.electronAPI?.callApi) return;
++    try {
++      setLoading(true);
++      const res: any = await window.electronAPI.callApi('browser', 'detectBrowsers', []);
++      setDetectedBrowsers(res || []);
++    } catch (err) {
++      console.error('[BrowserImportHintButton] Error detecting browsers:', err);
++    } finally {
++      setLoading(false);
++    }
++  };
++
++  useEffect(() => {
++    if (open) {
++      fetchBrowsers();
++    }
++  }, [open]);
++
++  const handleImportAllBrowsers = async () => {
++    setOpen(false);
++    if (!window.electronAPI?.callApi) return;
++    try {
++      const res: any = await window.electronAPI.callApi('browser', 'importCookiesFromAllBrowsers', []);
++      if (res?.ok) {
++        const msg = `已一键成功导入 ${res.summary?.browsersCount || 0} 个浏览器的 ${res.summary?.importedCookies || 0} 条 Cookie！`;
++        if (onSuccessToast) onSuccessToast(msg);
++        else alert(msg);
++      } else {
++        const msg = `全量导入失败: ${res?.reason || '未知错误'}`;
++        if (onErrorToast) onErrorToast(msg);
++        else alert(msg);
++      }
++    } catch (err: any) {
++      alert(`全量导入异常: ${err.message}`);
++    }
++  };
++
++  const handleImportFromBrowser = async (family: string, profile?: string) => {
++    setOpen(false);
++    if (!window.electronAPI?.callApi) return;
++    try {
++      const res: any = await window.electronAPI.callApi('browser', 'importCookiesFromBrowser', [{ family, profile }]);
++      if (res?.ok) {
++        const msg = `已成功从 ${family} 导入 ${res.summary?.importedCookies || 0} 条 Cookie！`;
++        if (onSuccessToast) onSuccessToast(msg);
++        else alert(msg);
++      } else {
++        const msg = `导入失败: ${res?.reason || '未知错误'}`;
++        if (onErrorToast) onErrorToast(msg);
++        else alert(msg);
++      }
++    } catch (err: any) {
++      alert(`导入异常: ${err.message}`);
++    }
++  };
++
++  const handleImportFromFile = async () => {
++    setOpen(false);
++    if (!window.electronAPI?.callApi) return;
++    try {
++      const res: any = await window.electronAPI.callApi('browser', 'importCookiesFromFile', [{}]);
++      if (res?.ok) {
++        const msg = `已成功从文件导入 ${res.summary?.importedCookies || 0} 条 Cookie！`;
++        if (onSuccessToast) onSuccessToast(msg);
++        else alert(msg);
++      } else if (res?.reason !== 'canceled') {
++        const msg = `从文件导入失败: ${res?.reason || '未知错误'}`;
++        if (onErrorToast) onErrorToast(msg);
++        else alert(msg);
++      }
++    } catch (err: any) {
++      alert(`导入异常: ${err.message}`);
++    }
++  };
++
++  return (
++    <div className="relative inline-block text-left">
++      <button
++        type="button"
++        onClick={() => setOpen(!open)}
++        className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted border-none bg-transparent cursor-pointer flex items-center justify-center transition-colors"
++        title="导入浏览器 Cookie (支持单独或全量导入)"
++      >
++        <Import className="w-3.5 h-3.5" />
++      </button>
++
++      {open && (
++        <>
++          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
++          <div className="absolute right-0 mt-1.5 w-60 rounded-xl bg-card border border-border shadow-2xl z-40 overflow-hidden text-xs divide-y divide-border animate-in fade-in slide-in-from-top-2 duration-150">
++            <div className="p-2.5 bg-muted/40">
++              <span className="font-semibold text-foreground block">导入浏览器 Cookie</span>
++              <span className="text-[11px] text-muted-foreground block mt-0.5">
++                同步本地 Chrome/Edge/Firefox 等浏览器的 Cookie
++              </span>
++            </div>
++
++            {/* 一键全量导入按钮 */}
++            <div className="p-1 bg-blue-500/10">
++              <button
++                type="button"
++                onClick={handleImportAllBrowsers}
++                className="w-full text-left px-2.5 py-1.5 hover:bg-blue-500/20 rounded-lg text-blue-500 font-semibold flex items-center gap-2 transition-colors cursor-pointer"
++              >
++                <Layers className="w-3.5 h-3.5 shrink-0" />
++                <span>一键导入所有浏览器 Cookie</span>
++              </button>
++            </div>
++
++            <div className="py-1">
++              {loading ? (
++                <div className="px-3 py-2 text-muted-foreground text-[11px]">正在检测本地浏览器...</div>
++              ) : detectedBrowsers.length === 0 ? (
++                <div className="px-3 py-2 text-muted-foreground text-[11px] flex items-center gap-1.5">
++                  <AlertCircle className="w-3.5 h-3.5" />
++                  未自动探测到常用浏览器
++                </div>
++              ) : (
++                detectedBrowsers.map((b) => (
++                  <button
++                    key={b.family}
++                    type="button"
++                    onClick={() => handleImportFromBrowser(b.family, b.selectedProfile)}
++                    className="w-full text-left px-3 py-1.5 hover:bg-muted flex items-center justify-between text-foreground transition-colors cursor-pointer"
++                  >
++                    <span>从 {b.label} 导入</span>
++                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 opacity-80" />
++                  </button>
++                ))
++              )}
++            </div>
++
++            <div className="p-1">
++              <button
++                type="button"
++                onClick={handleImportFromFile}
++                className="w-full text-left px-3 py-1.5 hover:bg-muted rounded-lg text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
++              >
++                从 Cookie JSON 文件导入...
++              </button>
++            </div>
++          </div>
++        </>
++      )}
++    </div>
++  );
++}

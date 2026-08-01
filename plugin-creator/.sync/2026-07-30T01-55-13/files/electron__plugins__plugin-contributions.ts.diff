@@ -1,0 +1,168 @@
+diff --git a/electron/plugins/plugin-contributions.ts b/electron/plugins/plugin-contributions.ts
+new file mode 100644
+index 0000000..db11086
+--- /dev/null
++++ b/electron/plugins/plugin-contributions.ts
+@@ -0,0 +1,162 @@
++/**
++ * @architecture-boundary PluginContributions
++ * ─────────────────────────────────────────────────────────────────────────────
++ * 职责与业务流程：
++ * 负责插件在初始化与载入阶段的“静态贡献”注册，包含：
++ *  1. Selection Menu (划词选中右键菜单) ➔ 注册至 ElectronSelection
++ *  2. Shortcut Actions (快捷动作) ➔ 注册至 shortcut-action-registry
++ *  3. Commands (命令声明) ➔ 注册至 HookRegistry
++ *  4. Folder Context Menu (文件夹右键菜单) ➔ 声明校验
++ *  5. MCP Tools Spec (AI 工具规范) ➔ 注册至 McpHost 总线
++ *
++ * AI 修改约束：
++ *  - 本模块仅负责静态元信息与工具协议的注册映射，不要写复杂的物理逻辑。
++ *  - 命令执行 handler 必须继续采用 lazy-load 模式 (ensurePluginLoadedFn) 避免拖累启动耗时。
++ * ─────────────────────────────────────────────────────────────────────────────
++ */
++
++import { BrowserWindow } from 'electron';
++import { McpHost } from './mcp-host';
++import { ElectronSelection } from '../services/selection';
++import type { ScannedPlugin } from './plugin-scanner';
++import type { PluginManifest } from './plugin-verifier';
++import { PluginLauncher } from './plugin-launcher';
++import { HookRegistry } from './hook-registry';
++import type { SelectionMenuItem } from '../../src/plugins/SelectionMenuRegistry';
++import { getShortcutActionRegistry } from '../services/shortcut-action-registry';
++import { ApiDispatcher } from './api-dispatcher';
++import { KeybindingsManager, type KeybindingRule } from '../services/keybindings-manager';
++
++class ElectronMainWindow {
++  public static getInstance() {
++    return {
++      getWindow: () => {
++        const wins = BrowserWindow.getAllWindows();
++        return wins.find(w => {
++          const url = w.webContents.getURL();
++          return !url.includes('window=');
++        }) || wins[0] || null;
++      }
++    };
++  }
++}
++
++export function registerMcpForPlugin(
++  id: string,
++  mcpConfig: Record<string, unknown>,
++  plugin: ScannedPlugin | undefined,
++  ensurePluginLoadedFn: (pluginId: string) => Promise<PluginManifest | null>
++): void {
++  const isBackground = plugin?.manifest?.type === 'background' || plugin?.manifest?.type === 'hybrid';
++
++  McpHost.getInstance().registerPluginMcp(
++    id,
++    mcpConfig,
++    isBackground
++      ? async (channel: string, data: Record<string, unknown>) => {
++          // Lazy load the plugin before calling the tool in the utilityProcess
++          await ensurePluginLoadedFn(id);
++          const bgProc = PluginLauncher.getInstance().getBackgroundProcesses().get(id);
++          if (bgProc) {
++            bgProc.sendMessage({ type: channel, ...data });
++          } else {
++            throw new Error(`Background process not running for plugin "${id}", cannot route MCP call`);
++          }
++        }
++      : async (channel: string, data: Record<string, unknown>) => {
++          // Lazy load the plugin before calling the tool in the renderer
++          await ensurePluginLoadedFn(id);
++          const win = ElectronMainWindow.getInstance().getWindow();
++          if (win && !win.isDestroyed()) {
++            win.webContents.send('plugins:mcp-call-tool', {
++              pluginId: id,
++              ...data
++            });
++          } else {
++            throw new Error(`Main window not available to route MCP tool call for plugin "${id}"`);
++          }
++        },
++  );
++}
++
++export function registerStaticContributions(
++  plugin: ScannedPlugin,
++  ensurePluginLoadedFn: (pluginId: string) => Promise<PluginManifest | null>
++): void {
++  const t0 = performance.now();
++  const id = plugin.manifest.id;
++
++  // 1. Register selectionMenuItems
++  let selectionMenuItems = plugin.manifest.contributes?.selectionMenuItems as Array<Record<string, unknown>> | undefined;
++  if (!selectionMenuItems) {
++    selectionMenuItems = (plugin.manifest as unknown as Record<string, unknown>).selectionMenuItems as Array<Record<string, unknown>> | undefined;
++  }
++
++  if (selectionMenuItems && Array.isArray(selectionMenuItems)) {
++    for (const item of selectionMenuItems) {
++      ElectronSelection.getInstance().registerSelectionMenuItem({
++        ...item,
++        pluginId: id,
++      } as SelectionMenuItem);
++    }
++  }
++
++  // 2. Register shortcutActions statically
++  const shortcutActions = plugin.manifest.contributes?.shortcutActions as Array<{ id: string; label: string; icon?: string }> | undefined;
++  if (shortcutActions && Array.isArray(shortcutActions)) {
++    const registry = getShortcutActionRegistry();
++    for (const action of shortcutActions) {
++      registry.register({
++        id: action.id,
++        label: action.label,
++        icon: action.icon || '⚡',
++        pluginId: id,
++        handler: () => {
++          ensurePluginLoadedFn(id).then(() => {
++            ApiDispatcher.getInstance().dispatch(id, 'commands', 'execute', [action.id]).catch((err: unknown) => {
++              console.error('[ShortcutAction] Failed to execute command:', action.id, err);
++            });
++          }).catch(err => {
++            console.error('[ShortcutAction] Failed to load plugin for command execution:', id, err);
++          });
++        }
++      });
++    }
++  }
++
++  // 3. Register commands statically
++  const commands = plugin.manifest.contributes?.commands as Array<{ command: string; title: string; category?: string }> | undefined;
++  if (commands && Array.isArray(commands)) {
++    for (const cmd of commands) {
++      const commandId = cmd.command || (cmd as Record<string, unknown>).id;
++      if (!commandId) continue;
++
++      // Register command handler that lazy-loads plugin and executes
++      const handlerCode = `(...args) => { /* declared command */ }`;
++      HookRegistry.getInstance().register(id, `command:${commandId}`, 100, handlerCode);
++
++      console.log(`[PluginManager] Registered declared command "${commandId}" for plugin "${id}"`);
++    }
++  }
++
++  // 4. Register folderContextMenuItems statically
++  const folderContextMenuItems = plugin.manifest.contributes?.folderContextMenuItems as Array<{ id: string; label: string; command: string }> | undefined;
++  if (folderContextMenuItems && Array.isArray(folderContextMenuItems)) {
++    console.log(`[PluginManager] Plugin "${id}" declares ${folderContextMenuItems.length} folder context menu items`);
++  }
++
++  // 5. Register MCP Spec statically
++  const hasMcp = !!plugin.manifest.mcp;
++  if (hasMcp && plugin.manifest.type !== 'main') {
++    registerMcpForPlugin(id, plugin.manifest.mcp!, plugin, ensurePluginLoadedFn);
++  }
++
++  // 6. Register keybindings statically from plugin.json contributes.keybindings
++  const keybindings = plugin.manifest.contributes?.keybindings as Array<KeybindingRule> | undefined;
++  if (keybindings && Array.isArray(keybindings)) {
++    KeybindingsManager.getInstance().registerDefaultKeybindings(id, keybindings);
++    console.log(`[PluginManager] Registered ${keybindings.length} declarative keybindings for plugin "${id}"`);
++  }
++
++  console.log(`[Perf] [PluginManager] registerStaticContributions for "${id}" (type: ${plugin.manifest.type}) took ${(performance.now() - t0).toFixed(2)}ms`);
++}

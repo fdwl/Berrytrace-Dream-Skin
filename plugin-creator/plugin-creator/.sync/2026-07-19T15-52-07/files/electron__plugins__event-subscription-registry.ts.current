@@ -1,0 +1,86 @@
+/**
+ * EventSubscriptionRegistry
+ *
+ * 从 plugin.json 的 contributes.events.listens 声明中构建事件订阅索引。
+ * PluginLauncher 和 PluginManager 在广播事件时查询此表，只推送给真正声明的插件。
+ *
+ * 独立于 PluginManager/PluginLauncher，避免循环依赖。
+ */
+
+import type { PluginManifest } from './plugin-verifier';
+
+export class EventSubscriptionRegistry {
+  private static instance: EventSubscriptionRegistry;
+
+  /** Map<eventName, Set<pluginId>> */
+  private subscriptions = new Map<string, Set<string>>();
+
+  private constructor() {}
+
+  public static getInstance(): EventSubscriptionRegistry {
+    if (!EventSubscriptionRegistry.instance) {
+      EventSubscriptionRegistry.instance = new EventSubscriptionRegistry();
+    }
+    return EventSubscriptionRegistry.instance;
+  }
+
+  /**
+   * 从 PluginManifest 的 contributes.events.listens 批量注册
+   */
+  public registerFromManifest(pluginId: string, manifest: PluginManifest): void {
+    const listens = manifest.contributes?.events?.listens;
+    if (!listens || !Array.isArray(listens)) return;
+
+    for (const entry of listens) {
+      if (!entry.name) continue;
+      this.registerSubscription(pluginId, entry.name);
+    }
+  }
+
+  /**
+   * 注册单个事件订阅
+   */
+  public registerSubscription(pluginId: string, eventName: string): void {
+    if (!this.subscriptions.has(eventName)) {
+      this.subscriptions.set(eventName, new Set());
+    }
+    this.subscriptions.get(eventName)!.add(pluginId);
+  }
+
+  /**
+   * 获取订阅了指定事件的所有插件 ID
+   */
+  public getSubscribers(eventName: string): Set<string> {
+    return this.subscriptions.get(eventName) ?? new Set();
+  }
+
+  /**
+   * 取消插件的所有事件订阅（插件禁用/卸载时调用）
+   */
+  public unregisterPlugin(pluginId: string): void {
+    for (const subscribers of this.subscriptions.values()) {
+      subscribers.delete(pluginId);
+    }
+  }
+
+  /**
+   * 获取当前所有已被订阅的事件名称
+   */
+  public getAllSubscribedEvents(): string[] {
+    return Array.from(this.subscriptions.keys());
+  }
+
+  /**
+   * 调试用：打印当前订阅表
+   */
+  public debugPrint(): void {
+    if (process.env.DEBUG_EVENT_REGISTRY === 'true') {
+      console.log('[EventSubscriptionRegistry] Current subscriptions:');
+      for (const [eventName, pluginIds] of this.subscriptions.entries()) {
+        console.log(`  ${eventName}: [${Array.from(pluginIds).join(', ')}]`);
+      }
+    } else {
+      console.log(`[EventSubscriptionRegistry] Indexed ${this.subscriptions.size} event subscriptions across plugins.`);
+    }
+  }
+}

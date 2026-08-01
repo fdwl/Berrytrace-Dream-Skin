@@ -1,0 +1,99 @@
+diff --git a/electron/plugins/plugin-launcher.ts b/electron/plugins/plugin-launcher.ts
+index eeccbc1..8ba3b7d 100644
+--- a/electron/plugins/plugin-launcher.ts
++++ b/electron/plugins/plugin-launcher.ts
+@@ -175,6 +175,15 @@ export class PluginLauncher {
+     return this.activeAgentSessions.size > 0;
+   }
+ 
++  public isPluginBusy(pluginId: string): boolean {
++    for (const mappedPluginId of this.sessionToPluginMap.values()) {
++      if (mappedPluginId === pluginId) {
++        return true;
++      }
++    }
++    return false;
++  }
++
+   public emitToBackgroundPlugin(pluginId: string, eventName: string, payload: unknown): void {
+     const proc = this.backgroundProcesses.get(pluginId);
+     if (proc) {
+@@ -317,18 +326,13 @@ export class PluginLauncher {
+     const isolation = manifest.processIsolation ?? 'optional';
+     console.log(`[PluginLauncher] STARTING "${pluginId}" → ${mainJsPath} [isolation=${isolation}]`);
+ 
+-    // ── 策略决策：根据内存压力和稳定性决定独立进程还是共享池 ──────────────
++    // ── 策略决策：根据 processIsolation 声明决定独立进程还是共享池 ──────────
+     const { PluginManager } = require('./plugin-manager.js');
+     const scanned = PluginManager.getInstance().getPlugin(pluginId);
+     const isDev = scanned?.isDevFolder === true;
+ 
+-    let decision = 'isolated';
+-    if (!isDev) {
+-      const policy = PluginIsolationPolicy.getInstance();
+-      decision = policy.decide(pluginId, isolation);
+-    } else {
+-      console.log(`[PluginLauncher] Force isolating development plugin "${pluginId}" to prevent pool pollution`);
+-    }
++    // 开发模式插件强制独立进程，避免池化污染
++    const decision = isDev ? 'standalone' : PluginIsolationPolicy.getInstance().decide(pluginId, isolation);
+ 
+     // ── 进程池路径（决策为 pooled 的插件共享 Host 进程）────────────────────
+     if (decision === 'pooled') {
+@@ -597,16 +601,17 @@ export class PluginLauncher {
+         const subscribers = EventSubscriptionRegistry.getInstance().getSubscribers(eventName);
+         for (const subscriberId of subscribers) {
+           if (subscriberId === pluginId) continue;
++          // 仅在插件启用时才转发事件或唤醒
++          if (!PluginManager.getInstance().isPluginEnabled(subscriberId)) {
++            continue;
++          }
++
+           const bgProc = this.backgroundProcesses.get(subscriberId);
+           if (bgProc) {
+             console.log(`[PluginLauncher] Forwarding event "${eventName}" to background plugin "${subscriberId}"`);
+             bgProc.sendMessage({ type: 'sdk:events:on', eventName, payload });
+             PluginManager.getInstance().recordPluginActivity(subscriberId);
+           } else {
+-            // 仅在插件启用时才唤醒
+-            if (!PluginManager.getInstance().isPluginEnabled(subscriberId)) {
+-              continue;
+-            }
+             console.log(`[PluginLauncher] Waking up background plugin "${subscriberId}" due to event "${eventName}" from plugin "${pluginId}"`);
+             const ctx = {
+               action: 'normal' as const,
+@@ -637,9 +642,21 @@ export class PluginLauncher {
+         const status = stepPayload.status as string;
+         if (sessionId) {
+           if (status === 'completed' || status === 'error' || status === 'cancelled') {
++            const mappedPluginId = this.sessionToPluginMap.get(sessionId);
+             this.activeAgentSessions.delete(sessionId);
+             this.sessionToPluginMap.delete(sessionId);
+             console.log(`[PluginLauncher] AI Session finished: ${sessionId} (status: ${status})`);
++
++            if (mappedPluginId && !this.isPluginBusy(mappedPluginId)) {
++              try {
++                const { PluginManager } = require('./plugin-manager.js');
++                PluginManager.getInstance().processPendingReload(mappedPluginId).catch((err: any) => {
++                  console.error(`[PluginLauncher] Failed to process pending reload for "${mappedPluginId}":`, err);
++                });
++              } catch (err) {
++                console.error(`[PluginLauncher] Failed to require PluginManager:`, err);
++              }
++            }
+           } else {
+             this.activeAgentSessions.add(sessionId);
+             this.sessionToPluginMap.set(sessionId, pluginId);
+@@ -660,10 +677,10 @@ export class PluginLauncher {
+           methodName as string,
+           args as unknown[],
+         );
+-        proc.sendMessage({ type: 'sdk:callApi:response', token, success: true, result });
++        proc.sendMessage({ type: 'sdk:callApi:response', targetPluginId: pluginId, token, success: true, result });
+       } catch (err) {
+         const errMsg = err instanceof Error ? err.message : String(err);
+-        proc.sendMessage({ type: 'sdk:callApi:response', token, success: false, error: errMsg });
++        proc.sendMessage({ type: 'sdk:callApi:response', targetPluginId: pluginId, token, success: false, error: errMsg });
+       }
+     }
+   }

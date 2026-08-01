@@ -1,0 +1,144 @@
+diff --git a/electron/services/onboarding-download.ts b/electron/services/onboarding-download.ts
+index 20b79f1..04acd4f 100644
+--- a/electron/services/onboarding-download.ts
++++ b/electron/services/onboarding-download.ts
+@@ -6,12 +6,14 @@ import { PluginManager } from '../plugins/plugin-manager';
+ import { cache } from '../config/index';
+ import { getModelsRootDir, PLUGINS_DIR } from '../config/paths';
+ 
++export type DownloadTaskStatus = 'pending' | 'downloading' | 'completed' | 'failed';
++
+ export interface DownloadItem {
+   id: string;
+   name: string;
+   type: 'plugin' | 'model';
+   purpose: string;
+-  status: 'pending' | 'downloading' | 'completed' | 'failed';
++  status: DownloadTaskStatus;
+   progress: number;
+   downloadUrl: string;
+   destination: string;
+@@ -23,6 +25,7 @@ class OnboardingDownloadManager {
+   private static instance: OnboardingDownloadManager | null = null;
+   private items: DownloadItem[] = [];
+   private isDownloading = false;
++  private hasFetched = false;
+ 
+   private constructor() {
+     this.cleanStaleFiles();
+@@ -64,9 +67,9 @@ class OnboardingDownloadManager {
+     }
+   }
+ 
+-  private loadState(): Array<{ id: string; status: any; progress: number }> | null {
++  private loadState(): Array<{ id: string; status: DownloadTaskStatus; progress: number }> | null {
+     try {
+-      const state = cache.get<{ items: Array<{ id: string; status: any; progress: number }> }>('onboardingDownloadState');
++      const state = cache.get<{ items: Array<{ id: string; status: DownloadTaskStatus; progress: number }> }>('onboardingDownloadState');
+       if (state && Array.isArray(state.items)) {
+         return state.items;
+       }
+@@ -88,7 +91,9 @@ class OnboardingDownloadManager {
+           if (file.endsWith('.btp') || file.endsWith('.tmp') || file.endsWith('.part')) {
+             try {
+               fs.unlinkSync(path.join(tempDir, file));
+-            } catch (e) {}
++            } catch (_e) {
++              // ignore
++            }
+           }
+         }
+       }
+@@ -100,7 +105,9 @@ class OnboardingDownloadManager {
+           if (dir.endsWith('.new') || dir.endsWith('.old')) {
+             try {
+               fs.rmSync(path.join(PLUGINS_DIR, dir), { recursive: true, force: true });
+-            } catch (e) {}
++            } catch (_e) {
++              // ignore
++            }
+           }
+         }
+       }
+@@ -117,7 +124,9 @@ class OnboardingDownloadManager {
+           } else if (entry.name.endsWith('.tmp') || entry.name.endsWith('.part')) {
+             try {
+               fs.unlinkSync(fullPath);
+-            } catch (e) {}
++            } catch (_e) {
++              // ignore
++            }
+           }
+         }
+       };
+@@ -133,6 +142,11 @@ class OnboardingDownloadManager {
+   }
+ 
+   public isFinished(): boolean {
++    // 必须等 startSilentDownloads() 执行完（hasFetched=true）后才能做最终判断
++    // hasFetched=false 表示还没有向服务器请求必装插件列表，状态未知，不能视为完成
++    if (this.hasFetched && this.items.length === 0) {
++      return true; // fetch 完成且无待下载项 → 真正的"无需下载"
++    }
+     // 'failed' 也算终态：允许用户在失败的情况下继续进入主面板，而不是永久卡死
+     return this.items.length > 0 && this.items.every(item =>
+       item.status === 'completed' || item.status === 'failed'
+@@ -182,15 +196,15 @@ class OnboardingDownloadManager {
+     try {
+       const response = await net.fetch('https://berrytrace.getdear.cn/api/v1/plugins/install_required');
+       if (response.ok) {
+-        const json = await response.json() as any;
++        const json = await response.json() as { code?: number; data?: Array<{ id: string; name: string; description?: string; downloadUrl?: string }> | { list?: Array<{ id: string; name: string; description?: string; downloadUrl?: string }> } };
+         if (json && json.code === 200) {
+-          const rawList = Array.isArray(json.data) ? json.data : (json.data && Array.isArray(json.data.list) ? json.data.list : null);
++          const rawList = Array.isArray(json.data) ? json.data : (json.data && 'list' in json.data && Array.isArray(json.data.list) ? json.data.list : null);
+           if (rawList) {
+             console.log(`[OnboardingDownload:startSilentDownloads] Fetched ${rawList.length} required plugins from server.`);
+             
+             this.items = this.items.filter(item => item.type !== 'plugin');
+ 
+-            rawList.forEach((plugin: any) => {
++            rawList.forEach((plugin: { id: string; name: string; description?: string; downloadUrl?: string }) => {
+               const destName = plugin.id.replace('com.berrytrace.plugin.', '');
+               this.items.push({
+                 id: plugin.id,
+@@ -199,7 +213,7 @@ class OnboardingDownloadManager {
+                 purpose: plugin.description || '莓莓官方推荐的核心插件组件',
+                 status: 'pending',
+                 progress: 0,
+-                downloadUrl: plugin.downloadUrl,
++                downloadUrl: plugin.downloadUrl || '',
+                 destination: destName
+               });
+             });
+@@ -214,6 +228,8 @@ class OnboardingDownloadManager {
+       }
+     } catch (err) {
+       console.error('[OnboardingDownload:startSilentDownloads] Error fetching install_required API:', err);
++    } finally {
++      this.hasFetched = true;
+     }
+ 
+     // Restore state from cache
+@@ -349,7 +365,9 @@ class OnboardingDownloadManager {
+         packageInfo.manifest.id,
+         packageInfo.signature
+       );
+-      try { fs.unlinkSync(tempPkgPath); } catch {}
++      try { fs.unlinkSync(tempPkgPath); } catch {
++        // ignore
++      }
+       if (success) {
+         item.status = 'completed';
+         item.progress = 100;
+@@ -399,7 +417,9 @@ class OnboardingDownloadManager {
+             console.log(`[OnboardingDownload] Server returned 200. Downloading full file: ${contentLength}`);
+           } else if (response.statusCode === 416) {
+             console.warn(`[OnboardingDownload] Range 416 for ${item.id}. Clearing temp file and restarting.`);
+-            try { fs.unlinkSync(tempDest); } catch {}
++            try { fs.unlinkSync(tempDest); } catch {
++              // ignore
++            }
+             if (retriesLeft <= 0) {
+               reject(new Error('Server returned 416 Range Not Satisfiable repeatedly'));
+               return;

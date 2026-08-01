@@ -1,0 +1,37 @@
+diff --git a/electron/plugins/main-sdk-creator.ts b/electron/plugins/main-sdk-creator.ts
+index 80b82d3..a63dfad 100644
+--- a/electron/plugins/main-sdk-creator.ts
++++ b/electron/plugins/main-sdk-creator.ts
+@@ -117,6 +117,32 @@ export function createMainSDKInstance(pluginId: string, pm: PluginManager): Reco
+       getShareByPath: (filePath: string) => callApi('publish', 'getShareByPath', [filePath]),
+       addOrUpdateShare: (filePath: string, record: Record<string, unknown>) => callApi('publish', 'addOrUpdateShare', [filePath, record]),
+       removeShare: (filePath: string) => callApi('publish', 'removeShare', [filePath]),
++    },
++    workflow: {
++      register: (def: Record<string, unknown>) => callApi('workflow', 'register', [def]),
++      execute: (workflowId: string, input?: Record<string, unknown>, triggerType?: string) =>
++        callApi('workflow', 'execute', [workflowId, input, triggerType]),
++      list: () => callApi('workflow', 'list'),
++      get: (workflowId: string) => callApi('workflow', 'get', [workflowId]),
++      unregister: (workflowId: string) => callApi('workflow', 'unregister', [workflowId]),
++      cancel: (runId: string) => callApi('workflow', 'cancel', [runId]),
++      matchIntent: (userQuery: string) => callApi('workflow', 'matchIntent', [userQuery]),
++      getHistory: (workflowId: string) => callApi('workflow', 'getHistory', [workflowId]),
++      listRecentRuns: (workflowId?: string, limit?: number) => callApi('workflow', 'listRecentRuns', [workflowId, limit]),
++      deleteRun: (runId: string) => callApi('workflow', 'deleteRun', [runId]),
++      clearRuns: (workflowId: string) => callApi('workflow', 'clearRuns', [workflowId]),
++      deleteSnapshot: (workflowId: string, timestamp: number) => callApi('workflow', 'deleteSnapshot', [{ workflowId, timestamp }]),
++      clearSnapshots: (workflowId: string) => callApi('workflow', 'clearSnapshots', [workflowId]),
++    },
++    context: {
++      set: (key: string, value: unknown, options?: Record<string, unknown>) =>
++        callApi('context', 'set', [key, value, options]),
++      get: (key: string, options?: Record<string, unknown>) =>
++        callApi('context', 'get', [key, options]),
++      list: (options?: Record<string, unknown>) =>
++        callApi('context', 'list', [options]),
++      clear: (options?: Record<string, unknown>) =>
++        callApi('context', 'clear', [options]),
+     }
+   };
+ }

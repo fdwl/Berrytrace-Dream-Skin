@@ -1,0 +1,21 @@
+diff --git a/electron/plugins/controllers/system.ts b/electron/plugins/controllers/system.ts
+index 5c0e704..0e9c288 100644
+--- a/electron/plugins/controllers/system.ts
++++ b/electron/plugins/controllers/system.ts
+@@ -722,14 +722,15 @@ export class SystemController extends BaseApiController {
+   /**
+    * 获取宿主应用的 OEM 基础信息（如软件名称）
+    */
+-  async system_getAppInfo(): Promise<{ appName: string; oemId: string; apiGateway: string; logoPath?: string }> {
++  async system_getAppInfo(): Promise<{ appName: string; oemId: string; apiGateway: string; logoPath?: string; browserPolicy?: Record<string, unknown> }> {
+     const { oemManager } = await import('../../services/oem-manager');
+     const config = oemManager.getConfig();
+     return {
+       appName: config.appName,
+       oemId: config.oemId,
+       apiGateway: config.apiGateway,
+-      logoPath: config.logoPath
++      logoPath: config.logoPath,
++      browserPolicy: config.browserPolicy as Record<string, unknown> | undefined,
+     };
+   }

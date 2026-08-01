@@ -1,0 +1,126 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/05-sdk-setup.md b/plugins-dev/npx-tools/skills/plugin-creator/references/05-sdk-setup.md
+index ffe9c77..c4670e1 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/05-sdk-setup.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/05-sdk-setup.md
+@@ -1,88 +1,64 @@
+ # 05 — SDK 导入方案
+ 
+-SDK 通过裸包名导入：`import { createPluginSDK } from 'berrytrace-plugin-sdk'`
++SDK 通过 `createPluginSDK` 创建实例：
+ 
+-浏览器不能直接解析裸包名，有以下方案：
++```typescript
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++```
+ 
+ ---
+ 
+-## 方案 C：esbuild 直接打包（推荐，最适用于 Panel / Hybrid 视图）
+-
+-对于直接被宿主 `PluginRegistry` 用 `import()` 加载的 `.js` 视图文件（例如 Panel 视图或 Hybrid 的 View 视图），**直接在打包配置中把 SDK 编译进去**是最稳妥的做法。
+-
+-在 `scripts/bundle.mjs` 中，**不要**将 `berrytrace-plugin-sdk` 放入 `external`。由于主项目根目录中已安装 `berrytrace-plugin-sdk`，esbuild 在打包 `platform: 'browser'` 时会自动将其解析并打包进最终的 `view/index.js`。
+-
+-esbuild 配置示例：
+-```javascript
+-await esbuild.build({
+-  entryPoints: ['src/view/index.ts'],
+-  bundle: true,
+-  outfile: 'dist/view/index.js',
+-  platform: 'browser',
+-  format: 'esm',
+-  nodePaths: [resolve(root, '../../node_modules')], // 指向主项目 node_modules
+-});
+-```
++## 渲染进程（Panel / Hybrid 视图）— 全局 shim
+ 
+----
++**推荐方案**：BerryTrace 现在通过 esbuild 插件自动将 `berrytrace-plugin-sdk`、`react`、`react-dom`、`zustand` 替换为全局变量引用。
+ 
+-## 方案 B：Import Maps
++```typescript
++// src/renderer.tsx — 直接 import，构建时自动处理
++import React from 'react';
++import { createRoot } from 'react-dom/client';
++import { createPluginSDK } from 'berrytrace-plugin-sdk';
+ 
+-宿主在 HTML 中注入 Import Map，浏览器自动解析裸包名。**仅适用于运行在独立 iframe 中的插件（其 view 字段指向一个 html 文件时）。**
++const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
+ 
+-```html
+-<script type="importmap">
+-{
+-  "imports": {
+-    "berrytrace-plugin-sdk": "berrytrace-plugin://system/plugins-sdk/index.js"
+-  }
++function App() {
++  return <div>Hello</div>;
+ }
+-</script>
+-```
+ 
+----
+-
+-## 方案 A：esbuild sdkShimPlugin（兼容方案）
++const root = createRoot(document.getElementById('root')!);
++root.render(<App />);
++```
+ 
+-Import Maps 未启用且不想打包体积过大时，使用 esbuild 插件将 SDK 替换为运行时 Proxy，通过宿主注入的 `window.electronAPI.callApi` 传输。
++构建时使用 `berrytrace build` 命令（内置全局 shim 插件），或在自定义 bundle.mjs 中包含 `globalSdkPlugin` 和 `globalReactPlugin`（参考 [08-build.md](./08-build.md)）。
+ 
+-构建脚本 `scripts/bundle.mjs` 见 [08-build.md](./08-build.md)。
++**不再需要**：
++- ~~`external: ['berrytrace-plugin-sdk']`~~（view 构建）
++- ~~sdkShimPlugin~~
++- ~~Import Maps~~
+ 
+ ---
+ 
+-## 后台进程的 SDK 使用
++## 后台进程（Background / Hybrid main）— external
+ 
+-后台进程（`background`/`hybrid` 的 `main` 入口）在 Node.js 环境：
++后台进程在 Node.js 环境，SDK 通过 npm 依赖解析：
+ 
+ ```typescript
+-// src/background.ts — 直接 import
++// src/background.ts
+ import { createPluginSDK } from 'berrytrace-plugin-sdk';
+ 
+ const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
+ ```
+ 
+-esbuild 配置 `external: ['berrytrace-plugin-sdk']`，让 Node.js 运行时解析。**不需要 shim。**
+-
+----
+-
+-## 渲染进程的 SDK 使用
+-
+-```typescript
+-// src/renderer.tsx — 浏览器环境
+-import { createPluginSDK } from 'berrytrace-plugin-sdk';
+-
+-const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++esbuild 配置需要 external SDK：
++```javascript
++external: ['berrytrace-plugin-sdk', 'electron']
+ ```
+ 
+-根据插件类型选择方案 C（视图插件直接打包）或方案 B（iframe 插件）。
+-
+ ---
+ 
+ ## 方案对比
+ 
+-| 方案 | 适用场景 | 优点 | 缺点 |
+-|------|:---:|:---:|:---:|
+-| **esbuild 直接打包 (方案 C)** | **Direct View (Panel / Hybrid)** | 零配置，天然支持，代码绝对可用 | 产物体积稍大 |
+-| **Import Maps (方案 B)** | **Iframe HTML Plugin** | 无需任何配置，体积小 | 主窗口直接 import 时不支持 |
+-| **esbuild Shim (方案 A)** | **兼容性高** | 产物体积小 | 需要维护繁琐的 Shim 逻辑 |
+-
++| 方案 | 适用场景 | 说明 |
++|------|:---:|:---|
++| **全局 shim（推荐）** | Panel / Hybrid 视图 | `berrytrace build` 内置，SDK/React/zustand 从 window 全局变量读取 |
++| **external** | Background / Hybrid main | Node.js 环境，通过 npm 依赖解析 |

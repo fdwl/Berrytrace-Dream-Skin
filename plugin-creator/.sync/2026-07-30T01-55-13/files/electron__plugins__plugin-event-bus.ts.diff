@@ -1,0 +1,94 @@
+diff --git a/electron/plugins/plugin-event-bus.ts b/electron/plugins/plugin-event-bus.ts
+new file mode 100644
+index 0000000..5cae224
+--- /dev/null
++++ b/electron/plugins/plugin-event-bus.ts
+@@ -0,0 +1,88 @@
++/**
++ * @module PluginEventBus
++ * ─────────────────────────────────────────────────────────────────────────────
++ * 职责：插件系统向 Renderer 的"控制/状态"事件广播统一出口
++ *
++ * ── 设计边界 (IMPORTANT) ───────────────────────────────────────────────────
++ * 本模块仅处理"低频控制/状态事件"。以下场景有意排除在外：
++ *
++ *  1. agent:step_update thinking 帧（高频流式帧，每 150ms 一帧）
++ *     ➜ 仍由 plugin-launcher.ts 主路径处理（已含防洪优化与策略路由）
++ *
++ *  2. PluginWatchdog.notifyRenderer()（watchdog 特有防崩溃降级逻辑）
++ *     ➜ 无存活窗口时降级写入 addLog，不可用通用广播替代
++ *
++ * ── 统一到本模块的场景 ────────────────────────────────────────────────────
++ *  - agent:step_update 取消/错误/workflow 进度（低频，非 thinking 帧）
++ *  - 关闭时 cancelAllAgentSessions（仅启动退出时触发一次）
++ *  - 未来新增的低频控制事件
++ * ─────────────────────────────────────────────────────────────────────────────
++ */
++
++import { BrowserWindow } from 'electron';
++
++// ── 通用广播 ──────────────────────────────────────────────────────────────────
++
++/**
++ * 向所有存活的 BrowserWindow 发送一个 IPC 事件（fire-and-forget）。
++ * 自动过滤已销毁的窗口，并捕获 webContents 发送异常。
++ *
++ * @param channel  IPC 频道名称（完整频道，含 plugin:event: 前缀）
++ * @param payload  要发送的 payload
++ */
++export function broadcastToAllWindows(channel: string, payload: unknown): void {
++  for (const win of BrowserWindow.getAllWindows()) {
++    if (win.isDestroyed()) continue;
++    try {
++      win.webContents.send(channel, payload);
++    } catch (err) {
++      console.warn(`[PluginEventBus] Failed to send "${channel}" to window ${win.id}:`, err);
++    }
++  }
++}
++
++/**
++ * 向所有存活的 BrowserWindow 发送一个 plugin:event:xxx 事件（fire-and-forget）。
++ * 自动添加 plugin:event: 前缀（已含前缀时不重复添加）。
++ *
++ * @param eventName  事件名（如 "plugins:changed"，不含 plugin:event: 前缀）
++ * @param payload    要发送的 payload
++ */
++export function broadcastPluginEvent(eventName: string, payload: unknown): void {
++  const channel = eventName.startsWith('plugin:event:') ? eventName : `plugin:event:${eventName}`;
++  broadcastToAllWindows(channel, payload);
++}
++
++// ── Agent 步骤更新（低频控制帧）—— 统一出口 ─────────────────────────────────
++//
++// ⚠️ 注意：高频 thinking 帧由 plugin-launcher.ts 主路径处理，不经过本函数。
++// 本函数只处理：取消、错误兜底、工作流进度等低频控制帧。
++
++/** agent:step_update payload 类型（低频控制帧） */
++export interface AgentStepUpdate {
++  sessionId: string;
++  turnId?: string;
++  status: 'started' | 'running' | 'thinking' | 'calling_tool' | 'tool_result' | 'completed' | 'error' | 'cancelled';
++  currentStep?: number;
++  stepCount?: number;
++  totalSteps?: number;
++  message?: string;
++  toolName?: string;
++  toolDisplayName?: string;
++  subPhase?: 'thinking' | 'text' | 'tool' | 'system';
++  [key: string]: unknown;
++}
++
++/**
++ * 向所有 Renderer 窗口广播 agent:step_update（低频控制帧）。
++ *
++ * 调用场景：
++ * - 取消所有 session（退出时）
++ * - 工作流引擎进度通知
++ * - agent:dispatch-task 失败兜底
++ *
++ * 不适用场景：thinking 流式帧（高频，由 plugin-launcher 主路径处理）
++ */
++export function broadcastAgentStepUpdate(update: AgentStepUpdate): void {
++  broadcastToAllWindows('plugin:event:agent:step_update', update);
++}

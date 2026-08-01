@@ -1,0 +1,398 @@
+import type { DatabaseSync } from 'node:sqlite'
+
+export interface Migration {
+  version: number;
+  up(db: DatabaseSync): void;
+}
+
+export function createGlobalTables(db: DatabaseSync): void {
+  // 1. DbUser table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbUser (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      user_id INTEGER,
+      user_name TEXT,
+      avatar TEXT,
+      attribute TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 1
+    )
+  `)
+
+  // 2. DbAppsCalendar table (workspace 列表)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbAppsCalendar (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      user_id INTEGER,
+      name TEXT,
+      avatar TEXT,
+      attribute TEXT,
+      local_path TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 1,
+      isPermanentSync INTEGER DEFAULT 0
+    )
+  `)
+
+  // 3. InstalledAppsCache table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS InstalledAppsCache (
+      app_name TEXT NOT NULL,
+      app_path TEXT,
+      app_identifier TEXT,
+      app_version TEXT,
+      updated_at TEXT
+    )
+  `)
+
+  // 4. DbCache table (key-value cache)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbCache (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `)
+
+  // 5. DbCalendarUserIndex table (workspace-user relationships)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbCalendarUserIndex (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      calendar_uuid INTEGER,
+      user_id INTEGER,
+      role_name TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 1,
+      isPermanentSync INTEGER DEFAULT 0
+    )
+  `)
+
+  // 6. DbMenstruation table (notes / CalendarEventItem)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbMenstruation (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      calendar_id INTEGER,
+      calendar_uuid INTEGER,
+      user_id INTEGER,
+      content TEXT,
+      form_name TEXT,
+      event_date TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 0,
+      isPermanentSync INTEGER DEFAULT 0,
+      created_at TEXT,
+      updated_at TEXT,
+      keywords TEXT,
+      record_type TEXT,
+      record_function TEXT,
+      theme TEXT,
+      class_of TEXT,
+      word_count INTEGER,
+      location_name TEXT,
+      reserved_number_fields REAL,
+      attribute TEXT,
+      words TEXT
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_menstruation_calendar_uuid ON DbMenstruation(calendar_uuid)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_menstruation_event_date ON DbMenstruation(event_date)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_menstruation_is_sync ON DbMenstruation(is_sync)`)
+
+  // 7. DbCalendarEvent table (tasks / reminders)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbCalendarEvent (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      calendar_uuid INTEGER,
+      user_id INTEGER,
+      title TEXT,
+      parent_id INTEGER,
+      repeat_unit TEXT,
+      event_time TEXT,
+      dead_time TEXT,
+      start_time TEXT,
+      end_time TEXT,
+      form_name TEXT,
+      tags TEXT,
+      index_words TEXT,
+      event_type TEXT,
+      is_pin_to_top INTEGER,
+      children TEXT,
+      status INTEGER,
+      sort INTEGER,
+      is_major INTEGER,
+      remark TEXT,
+      my_to_day INTEGER,
+      theme_uuids TEXT,
+      assigned_string TEXT,
+      timer_max_time TEXT,
+      attribute TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 0,
+      isPermanentSync INTEGER DEFAULT 0,
+      words TEXT
+    )
+  `)
+
+  // 8. DbTags table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbTags (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      calendar_uuid INTEGER,
+      name TEXT,
+      tag_type TEXT,
+      attribute TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 1,
+      isPermanentSync INTEGER DEFAULT 0
+    )
+  `)
+
+  // 9. DbComments table
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS DbComments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      remote_id INTEGER UNIQUE,
+      uuid INTEGER UNIQUE,
+      calendar_uuid INTEGER,
+      user_id INTEGER,
+      event_uuid INTEGER,
+      content TEXT,
+      attribute TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      is_delete INTEGER DEFAULT 0,
+      is_sync INTEGER DEFAULT 0,
+      isPermanentSync INTEGER DEFAULT 0
+    )
+  `)
+  console.log('[DatabaseManager] Global tables created.')
+}
+
+export function createWorkspaceTables(db: DatabaseSync): void {
+  /**
+   * ⚠️【架构彻底纯文件化解耦声明】
+   * 本地桌面 Agent 会话管理已 100% 改造重构为纯文件存储 (Pure File Storage)。
+   * 对应工作区隐藏目录下的 `.berrytrace/sessions/*.json` 与 `.berrytrace/history/*.messages.json`。
+   * 宿主数据库完全不建会话表，杜绝数据库 Migration 与锁表风险！
+   */
+
+  // 2. FtsFileIndex table (for workspace files search)
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS FtsFileIndex 
+      USING fts5(
+        file_path,
+        file_name,
+        content,
+        file_type UNINDEXED,
+        workspace_path UNINDEXED,
+        modified_at UNINDEXED,
+        tokenize = 'unicode61'
+      )
+    `)
+    console.log('[DatabaseManager] FtsFileIndex virtual table initialized.')
+  } catch (err: any) {
+    console.warn('[DatabaseManager] Initializing FtsFileIndex with unicode61 fallback:', err?.message || err);
+    try {
+      db.exec(`DROP TABLE IF EXISTS FtsFileIndex`);
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS FtsFileIndex 
+        USING fts5(
+          file_path,
+          file_name,
+          content,
+          file_type UNINDEXED,
+          workspace_path UNINDEXED,
+          modified_at UNINDEXED,
+          tokenize = 'unicode61'
+        )
+      `);
+      console.log('[DatabaseManager] Recreated FtsFileIndex virtual table successfully.');
+    } catch (retryErr) {
+      console.error('[DatabaseManager] Failed to initialize FtsFileIndex:', retryErr);
+    }
+  }
+
+  // 3. FtsVectorIndex table for local AI vector search
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS FtsVectorIndex (
+      entity_id TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      dimension INTEGER NOT NULL,
+      model_id TEXT NOT NULL,
+      modified_at TEXT NOT NULL,
+      PRIMARY KEY (entity_id, entity_type)
+    )
+  `)
+  console.log('[DatabaseManager] FtsVectorIndex table initialized.')
+
+  // 4. FtsAgentIndex virtual table for skills and tools search
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS FtsAgentIndex USING fts5(
+        entity_id,
+        entity_type,
+        title,
+        content,
+        meta,
+        tokenize = 'unicode61'
+      )
+    `)
+    console.log('[DatabaseManager] FtsAgentIndex virtual table initialized.')
+  } catch (err: any) {
+    console.warn('[DatabaseManager] Initializing FtsAgentIndex with unicode61 fallback:', err?.message || err);
+    try {
+      db.exec(`DROP TABLE IF EXISTS FtsAgentIndex`);
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS FtsAgentIndex USING fts5(
+          entity_id,
+          entity_type,
+          title,
+          content,
+          meta,
+          tokenize = 'unicode61'
+        )
+      `);
+      console.log('[DatabaseManager] Recreated FtsAgentIndex virtual table successfully.');
+    } catch (retryErr) {
+      console.error('[DatabaseManager] Failed to initialize FtsAgentIndex:', retryErr);
+    }
+  }
+
+  // 5. doc_links, semantic_pairs, and graph_cache tables for 3D Knowledge Graph
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS doc_links (
+        source_path TEXT NOT NULL,
+        target_text TEXT NOT NULL,
+        display_text TEXT,
+        anchor TEXT,
+        target_type TEXT NOT NULL,
+        line_number INTEGER,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (source_path, target_text, line_number)
+      );
+      CREATE INDEX IF NOT EXISTS idx_doc_links_target ON doc_links(target_text);
+    `)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS semantic_pairs (
+        source_path TEXT NOT NULL,
+        target_path TEXT NOT NULL,
+        similarity REAL NOT NULL,
+        tier TEXT NOT NULL,
+        computed_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (source_path, target_path)
+      );
+      CREATE INDEX IF NOT EXISTS idx_semantic_pairs_source ON semantic_pairs(source_path);
+    `)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS graph_cache (
+        cache_key TEXT PRIMARY KEY,
+        cache_value TEXT NOT NULL,
+        doc_count INTEGER,
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+    `)
+    console.log('[DatabaseManager] doc_links, semantic_pairs, graph_cache tables initialized.')
+  } catch (err) {
+    console.error('[DatabaseManager] Failed to initialize knowledge graph tables:', err)
+  }
+
+  console.log('[DatabaseManager] Workspace tables created.')
+}
+
+export const GLOBAL_MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    up(db: DatabaseSync) {
+      createGlobalTables(db);
+    }
+  }
+];
+
+export const WORKSPACE_MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    up(db: DatabaseSync) {
+      createWorkspaceTables(db);
+    }
+  }
+];
+
+export function runMigrations(db: DatabaseSync, migrations: Migration[], baselineTable: string): void {
+  let currentVersion = 0;
+  try {
+    const result = db.prepare('PRAGMA user_version').all() as { user_version: number }[];
+    currentVersion = result[0]?.user_version ?? 0;
+  } catch (err) {
+    console.error('[DatabaseManager] Failed to get user_version:', err);
+  }
+
+  console.log(`[DatabaseManager] Current DB user_version is ${currentVersion}`);
+
+  if (currentVersion === 0) {
+    let hasBaseline = false;
+    try {
+      const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").all(baselineTable);
+      hasBaseline = rows.length > 0;
+    } catch (err) {
+      console.error(`[DatabaseManager] Failed to check baseline table ${baselineTable}:`, err);
+    }
+
+    if (hasBaseline) {
+      console.log(`[DatabaseManager] Legacy database detected (baseline table "${baselineTable}" exists). Setting version to 1.`);
+      try {
+        db.exec('PRAGMA user_version = 1');
+        currentVersion = 1;
+      } catch (err) {
+        console.error('[DatabaseManager] Failed to set user_version to 1 for legacy DB:', err);
+      }
+    } else {
+      console.log('[DatabaseManager] Fresh database detected. Will run migrations from version 1.');
+    }
+  }
+
+  for (const migration of migrations) {
+    if (migration.version > currentVersion) {
+      console.log(`[DatabaseManager] Migrating DB to version ${migration.version}...`);
+      db.exec('BEGIN TRANSACTION');
+      try {
+        migration.up(db);
+        db.exec(`PRAGMA user_version = ${migration.version}`);
+        db.exec('COMMIT');
+        console.log(`[DatabaseManager] Successfully migrated DB to version ${migration.version}`);
+        currentVersion = migration.version;
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch (rollbackErr) {
+          console.error('[DatabaseManager] Rollback failed:', rollbackErr);
+        }
+        console.error(`[DatabaseManager] Migration to version ${migration.version} failed. Transaction rolled back:`, err);
+        throw err;
+      }
+    }
+  }
+}

@@ -1,0 +1,314 @@
+diff --git a/src/views/plugins/workspace/utils/grab-guest-script.ts b/src/views/plugins/workspace/utils/grab-guest-script.ts
+new file mode 100644
+index 0000000..87b2f24
+--- /dev/null
++++ b/src/views/plugins/workspace/utils/grab-guest-script.ts
+@@ -0,0 +1,308 @@
++// DOM Grab & Annotate Guest Engine — 支持 Pin 避让穿透、连点批注与 Console 通信
++
++export type GuestScriptAction = 'arm' | 'awaitClick' | 'finalize' | 'extractHover' | 'teardown';
++
++export function buildGuestOverlayScript(action: GuestScriptAction): string {
++  switch (action) {
++    case 'arm': return ARM_SCRIPT;
++    case 'awaitClick': return AWAIT_CLICK_SCRIPT;
++    case 'finalize': return FINALIZE_SCRIPT;
++    case 'extractHover': return EXTRACT_HOVER_SCRIPT;
++    case 'teardown': return TEARDOWN_SCRIPT;
++  }
++}
++
++export function buildRenderPinsScript(annotations: Array<{ id: string; selector: string; comment: string; intent: string }>): string {
++  return `(function() {
++    'use strict';
++    var oldHost = document.getElementById('__berrytrace-pins-host');
++    if (oldHost && oldHost.parentNode) oldHost.parentNode.removeChild(oldHost);
++    if (!${JSON.stringify(annotations)} || ${annotations.length} === 0) return true;
++
++    var host = document.createElement('div');
++    host.id = '__berrytrace-pins-host';
++    host.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483646;';
++    document.body.appendChild(host);
++
++    var list = ${JSON.stringify(annotations)};
++    list.forEach(function(item, idx) {
++      try {
++        var el = document.querySelector(item.selector);
++        if (!el) return;
++        var rect = el.getBoundingClientRect();
++        var pin = document.createElement('div');
++        pin.style.cssText = 'position:fixed;left:' + Math.max(2, rect.x - 10) + 'px;top:' + Math.max(2, rect.y - 10) + 'px;width:24px;height:24px;border-radius:50%;background:#10b981;color:#ffffff;font:bold 12px/24px sans-serif;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.5);cursor:pointer;pointer-events:all;z-index:2147483647;border:2px solid #ffffff;transition:transform 0.15s ease;';
++        pin.textContent = String(idx + 1);
++        pin.title = '【标注 #' + (idx + 1) + '】' + item.comment + ' (点击编辑修改)';
++        pin.addEventListener('mouseenter', function() { pin.style.transform = 'scale(1.25)'; });
++        pin.addEventListener('mouseleave', function() { pin.style.transform = 'scale(1)'; });
++
++        var handlePinClick = function(e) {
++          e.preventDefault();
++          e.stopPropagation();
++          console.log('BERRYTRACE_PIN_CLICK:' + item.id);
++        };
++
++        pin.addEventListener('mousedown', handlePinClick, true);
++        pin.addEventListener('click', handlePinClick, true);
++        host.appendChild(pin);
++      } catch(e) {}
++    });
++    return true;
++  })();`;
++}
++
++const ARM_SCRIPT = `(function() {
++  'use strict';
++  if (window.__berrytraceGrab) {
++    try { window.__berrytraceGrab.cleanup(); } catch(e) {}
++    delete window.__berrytraceGrab;
++  }
++
++  var highlightBox = document.getElementById('__berrytrace-highlight-box');
++  if (!highlightBox) {
++    highlightBox = document.createElement('div');
++    highlightBox.id = '__berrytrace-highlight-box';
++    highlightBox.style.cssText = 'position:fixed;border:2px solid #3b82f6;background:rgba(59,130,246,0.18);border-radius:4px;pointer-events:none !important;z-index:2147483640;display:none;box-shadow:0 0 0 1px rgba(0,0,0,0.25);transition:all 0.02s ease-out;';
++    document.body.appendChild(highlightBox);
++  }
++
++  var hoverLabel = document.getElementById('__berrytrace-hover-label');
++  if (!hoverLabel) {
++    hoverLabel = document.createElement('div');
++    hoverLabel.id = '__berrytrace-hover-label';
++    hoverLabel.style.cssText = 'position:fixed;padding:3px 8px;background:rgba(15,23,42,0.92);color:#ffffff;font:bold 11px/1.4 system-ui,sans-serif;border-radius:4px;pointer-events:none !important;white-space:nowrap;z-index:2147483640;display:none;box-shadow:0 2px 10px rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.2);';
++    document.body.appendChild(hoverLabel);
++  }
++
++  var currentEl = null;
++  var clickResolver = null;
++
++  function clampStr(s, max) {
++    if (!s || typeof s !== 'string') return '';
++    return s.length <= max ? s : s.slice(0, max) + ' (truncated)';
++  }
++
++  function sanitizeUrl(url) {
++    try {
++      var u = new URL(url);
++      if (u.protocol !== 'http:' && u.protocol !== 'https:' && u.protocol !== 'file:') return '';
++      u.search = ''; u.hash = '';
++      return u.toString();
++    } catch (e) { return ''; }
++  }
++
++  function buildSelector(el) {
++    var parts = [];
++    var curr = el;
++    while (curr && curr.nodeType === Node.ELEMENT_NODE && curr !== document.body && parts.length < 8) {
++      var tag = curr.tagName.toLowerCase();
++      if (curr.id) {
++        parts.unshift(tag + '#' + curr.id);
++        break;
++      }
++      if (curr.classList.length > 0) tag += '.' + curr.classList[0];
++      parts.unshift(tag);
++      curr = curr.parentElement;
++    }
++    return clampStr(parts.join(' > ') || el.tagName.toLowerCase(), 700);
++  }
++
++  function extractPayload(el) {
++    var rect = el.getBoundingClientRect();
++    return {
++      page: {
++        sanitizedUrl: sanitizeUrl(window.location.href),
++        title: document.title || '',
++        viewportWidth: window.innerWidth,
++        viewportHeight: window.innerHeight,
++        scrollX: window.scrollX,
++        scrollY: window.scrollY
++      },
++      target: {
++        tagName: el.tagName.toLowerCase(),
++        selector: buildSelector(el),
++        elementPath: buildSelector(el),
++        textSnippet: clampStr((el.textContent || '').trim(), 200),
++        htmlSnippet: clampStr(el.outerHTML || '', 4096),
++        accessibility: {
++          role: el.getAttribute('role') || el.tagName.toLowerCase(),
++          accessibleName: el.getAttribute('aria-label') || clampStr((el.textContent || '').trim(), 60) || null
++        },
++        rectViewport: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
++      }
++    };
++  }
++
++  function updateHighlight(el) {
++    if (!el || el === document.documentElement || el === document.body || el === highlightBox || el === hoverLabel) {
++      highlightBox.style.display = 'none';
++      hoverLabel.style.display = 'none';
++      currentEl = null;
++      return;
++    }
++    currentEl = el;
++    var rect = el.getBoundingClientRect();
++    highlightBox.style.left = rect.x + 'px';
++    highlightBox.style.top = rect.y + 'px';
++    highlightBox.style.width = rect.width + 'px';
++    highlightBox.style.height = rect.height + 'px';
++    highlightBox.style.display = 'block';
++
++    var tag = el.tagName.toLowerCase();
++    hoverLabel.textContent = tag + ' (' + Math.round(rect.width) + 'x' + Math.round(rect.height) + ')';
++    var labelY = rect.bottom + 6;
++    if (labelY + 28 > window.innerHeight) labelY = rect.top - 28;
++    hoverLabel.style.left = Math.max(4, rect.x) + 'px';
++    hoverLabel.style.top = Math.max(4, labelY) + 'px';
++    hoverLabel.style.display = 'block';
++  }
++
++  function onPointerMove(e) {
++    if (e.target && e.target.closest && e.target.closest('#__berrytrace-pins-host')) {
++      highlightBox.style.display = 'none';
++      hoverLabel.style.display = 'none';
++      return;
++    }
++    var el = document.elementFromPoint(e.clientX, e.clientY);
++    updateHighlight(el);
++  }
++
++  function onPointerDown(e) {
++    if (e.target && e.target.closest && e.target.closest('#__berrytrace-pins-host')) {
++      return;
++    }
++    if (e.target === highlightBox || e.target === hoverLabel) return;
++    if (e.__berrytraceHandled) return;
++    e.__berrytraceHandled = true;
++
++    e.preventDefault();
++    e.stopPropagation();
++    highlightBox.style.display = 'none';
++    hoverLabel.style.display = 'none';
++    var el = document.elementFromPoint(e.clientX, e.clientY);
++    if (el) {
++      var payload = extractPayload(el);
++      console.log('🎯 [GuestARM:Selected]', payload.target.selector);
++      window.__lastGrabPayload = payload;
++      if (clickResolver) {
++        var res = clickResolver;
++        clickResolver = null;
++        res({ kind: 'selected', payload: payload });
++      }
++    }
++  }
++
++  function onKeyDown(e) {
++    if (e.key === 'Escape' || e.key === 'Esc') {
++      if (window.__berrytraceGrab) window.__berrytraceGrab.cleanup('escape');
++    }
++  }
++
++  window.addEventListener('pointermove', onPointerMove, true);
++  window.addEventListener('mousemove', onPointerMove, true);
++  window.addEventListener('pointerdown', onPointerDown, true);
++  window.addEventListener('mousedown', onPointerDown, true);
++  window.addEventListener('keydown', onKeyDown, true);
++  console.log('🚩 [GuestARM] Overlay Armed. Observer is active.');
++
++  window.__berrytraceGrab = {
++    extractPayload: function() { return window.__lastGrabPayload || (currentEl ? extractPayload(currentEl) : null); },
++    awaitClick: function() {
++      return new Promise(function(resolve) { clickResolver = resolve; });
++    },
++    cleanup: function(reason) {
++      if (clickResolver) {
++        var res = clickResolver;
++        clickResolver = null;
++        res({ kind: 'cancelled', reason: reason || 'teardown' });
++      }
++      window.removeEventListener('pointermove', onPointerMove, true);
++      window.removeEventListener('mousemove', onPointerMove, true);
++      window.removeEventListener('pointerdown', onPointerDown, true);
++      window.removeEventListener('mousedown', onPointerDown, true);
++      window.removeEventListener('keydown', onKeyDown, true);
++      if (highlightBox && highlightBox.parentNode) highlightBox.parentNode.removeChild(highlightBox);
++      if (hoverLabel && hoverLabel.parentNode) hoverLabel.parentNode.removeChild(hoverLabel);
++      console.log('🧹 [GuestARM] Overlay teardown completed.');
++    }
++  };
++  return true;
++})();`;
++
++const AWAIT_CLICK_SCRIPT = `(function() {
++  if (window.__berrytraceGrab && typeof window.__berrytraceGrab.awaitClick === 'function') {
++    return window.__berrytraceGrab.awaitClick();
++  }
++  return Promise.resolve({ kind: 'cancelled', reason: 'not-ready' });
++})();`;
++
++const FINALIZE_SCRIPT = `(function() {
++  if (window.__berrytraceGrab) {
++    var payload = window.__berrytraceGrab.extractPayload();
++    window.__berrytraceGrab.cleanup();
++    delete window.__berrytraceGrab;
++    return payload;
++  }
++  return null;
++})();`;
++
++const EXTRACT_HOVER_SCRIPT = `(function() {
++  if (window.__berrytraceGrab) {
++    return window.__berrytraceGrab.extractPayload();
++  }
++  return null;
++})();`;
++
++const TEARDOWN_SCRIPT = `(function() {
++  if (window.__berrytraceGrab) {
++    try { window.__berrytraceGrab.cleanup(); } catch(e) {}
++    delete window.__berrytraceGrab;
++  }
++  return true;
++})();`;
++
++export function formatGrabPayloadAsMarkdown(payload: any): string {
++  if (!payload || !payload.target) return '';
++  const lines: string[] = [];
++  lines.push(`Attached browser element from ${payload.page.sanitizedUrl}`);
++  lines.push('');
++  lines.push(`**Target:** \`<${payload.target.tagName}>\``);
++  if (payload.target.accessibility?.accessibleName) {
++    lines.push(`**Accessible Name:** "${payload.target.accessibility.accessibleName}"`);
++  }
++  lines.push(`**Selector:** \`${payload.target.selector}\``);
++  lines.push(`**Bounds:** ${Math.round(payload.target.rectViewport.width)}x${Math.round(payload.target.rectViewport.height)}`);
++
++  if (payload.target.textSnippet) {
++    lines.push('');
++    lines.push('**Text:**');
++    lines.push(payload.target.textSnippet);
++  }
++
++  if (payload.target.htmlSnippet) {
++    lines.push('');
++    lines.push('**HTML:**');
++    lines.push('```html');
++    lines.push(payload.target.htmlSnippet);
++    lines.push('```');
++  }
++
++  return lines.join('\n');
++}
++
++export function formatAnnotationAsMarkdown(payload: any, comment: string, intent = 'fix'): string {
++  if (!payload || !payload.target) return '';
++  const lines: string[] = [];
++  lines.push(`## Design Feedback: ${payload.page.title || payload.page.sanitizedUrl}`);
++  lines.push(`**URL:** ${payload.page.sanitizedUrl}`);
++  lines.push(`**Target:** \`<${payload.target.tagName}>\``);
++  lines.push(`**Selector:** \`${payload.target.selector}\``);
++  lines.push(`**Intent:** ${intent}`);
++  if (payload.target.textSnippet) {
++    lines.push(`**Text:** "${payload.target.textSnippet}"`);
++  }
++  lines.push('');
++  lines.push(`**Feedback Comment:** ${comment}`);
++  return lines.join('\n');
++}

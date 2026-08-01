@@ -1,0 +1,475 @@
+import { app, BrowserWindow, ipcMain } from 'electron'
+import { join, resolve } from 'path'
+import { promises as fs } from 'fs'
+import { cache } from '../config/index'
+import { CacheAttribute } from '../../src/config/CacheAttribute'
+import { ElectronLogsWindow } from '../windows/logs-window'
+import util from 'util'
+
+export interface LogEntry {
+  timestamp: number
+  level: 'debug' | 'info' | 'warn' | 'error'
+  source: string
+  message: string
+  // Phase 4: workspace context for multi-workspace log filtering
+  workspacePath?: string
+  workspaceName?: string
+}
+
+// Log level hierarchy: debug < info < warn < error
+const LOG_LEVEL_ORDER: Record<LogEntry['level'], number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+}
+
+let currentLogLevel: LogEntry['level'] = 'info'
+
+export function setLogLevel(level: LogEntry['level']) {
+  currentLogLevel = level
+}
+
+export function getLogLevel(): LogEntry['level'] {
+  return currentLogLevel
+}
+
+function shouldLog(level: LogEntry['level']): boolean {
+  return LOG_LEVEL_ORDER[level] >= LOG_LEVEL_ORDER[currentLogLevel]
+}
+
+const MAX_IN_MEMORY_LOGS = 1000
+const inMemoryLogsBySource: Record<string, LogEntry[]> = {
+  all: []
+}
+let isLoggingInitialized = false
+
+export function getInMemoryLogs(source?: string, limit: number = 50): LogEntry[] {
+  let logs: LogEntry[] = []
+  if (source && inMemoryLogsBySource[source]) {
+    logs = inMemoryLogsBySource[source]
+  } else {
+    logs = inMemoryLogsBySource.all || []
+    if (source) {
+      logs = logs.filter(l => l.source.includes(source) || l.message.includes(source))
+    }
+  }
+  return logs.slice(-limit)
+}
+
+// Store original console functions
+export const originalConsole = {
+  log: console.log,
+  info: console.info,
+  warn: console.warn,
+  error: console.error,
+  debug: console.debug || console.log,
+}
+
+// Queue for writing to file asynchronously
+let isWriting = false
+const writeQueue: string[] = []
+
+const appStartTime = Date.now()
+
+const ANSI_COLORS = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  error: '\x1b[31;1m', // Bold Red
+  warn: '\x1b[33;1m',  // Bold Yellow
+  info: '\x1b[36m',    // Cyan
+  debug: '\x1b[90m',   // Gray
+}
+
+function formatConsoleMessage(level: LogEntry['level'], text: string): string {
+  const color = ANSI_COLORS[level] || ANSI_COLORS.reset
+  return `${color}${text}${ANSI_COLORS.reset}`
+}
+
+function formatLogLine(entry: LogEntry): string {
+  const dateStr = new Date(entry.timestamp).toISOString()
+  const elapsedMs = (entry.timestamp - appStartTime).toString().padStart(6, ' ')
+  
+  let levelPrefix = ''
+  if (entry.level === 'error') levelPrefix = '❌ '
+  else if (entry.level === 'warn') levelPrefix = '⚠️ '
+
+  const levelStr = (levelPrefix + entry.level.toUpperCase()).padEnd(8)
+  const sourceStr = entry.source
+  const wsStr = entry.workspaceName ? ` [${entry.workspaceName}]` : ''
+  return `[${dateStr}] [+${elapsedMs}ms] [${levelStr}] [${sourceStr}]${wsStr} ${entry.message}\n`
+}
+
+// Get project root logs directory
+function getProjectLogDir(): string {
+  // In dev: app.getAppPath() returns project root
+  // In prod: try to resolve from the executable path
+  const appPath = app.getAppPath()
+  const projectRoot = app.isPackaged
+    ? resolve(appPath, '..', '..', '..')  // go up from asar
+    : appPath
+  return join(projectRoot, 'logs')
+}
+
+// Write to multiple log destinations
+async function writeToAllLogs(formattedLine: string): Promise<void> {
+  const destinations: string[] = []
+
+  // 1. User data directory (always)
+  try {
+    const userDataDir = join(app.getPath('userData'), 'logs')
+    await fs.mkdir(userDataDir, { recursive: true })
+    destinations.push(join(userDataDir, 'app.log'))
+  } catch (err) {
+    originalConsole.error('[Logger] Failed to create userData log dir:', err)
+  }
+
+  // 2. Project root logs/ (for development convenience)
+  try {
+    const projectLogDir = getProjectLogDir()
+    await fs.mkdir(projectLogDir, { recursive: true })
+    destinations.push(join(projectLogDir, 'app.log'))
+    // Also write a date-rotated log for easier debugging
+    const dateStr = new Date().toISOString().split('T')[0] // YYYY-MM-DD
+    destinations.push(join(projectLogDir, `app-${dateStr}.log`))
+  } catch (err) {
+    // Project root might not be writable in production, ignore
+  }
+
+  // Write to all destinations
+  const writePromises = destinations.map(async (logPath) => {
+    try {
+      await fs.appendFile(logPath, formattedLine, 'utf-8')
+    } catch (err) {
+      originalConsole.error(`[Logger] Failed to write to ${logPath}:`, err)
+    }
+  })
+
+  await Promise.all(writePromises)
+}
+
+async function flushWriteQueue() {
+  if (isWriting || writeQueue.length === 0) return
+  isWriting = true
+  const toWrite = [...writeQueue]
+  writeQueue.length = 0
+  try {
+    // Write each line to all log destinations
+    for (const line of toWrite) {
+      await writeToAllLogs(line)
+    }
+  } catch (err) {
+    originalConsole.error('[Logger] Failed to write log to file:', err)
+  } finally {
+    isWriting = false
+    // Schedule next flush if more items were queued
+    if (writeQueue.length > 0) {
+      setImmediate(flushWriteQueue)
+    }
+  }
+}
+
+let isInsideAddLog = false
+
+export function getHistory(): LogEntry[] {
+  return inMemoryLogsBySource.all || []
+}
+
+export function getHistoryMap(): Record<string, LogEntry[]> {
+  return inMemoryLogsBySource
+}
+
+export function addLog(level: LogEntry['level'], source: string, message: string, workspacePath?: string, workspaceName?: string) {
+  if (!shouldLog(level)) return
+  if (isInsideAddLog) {
+    // Prevent infinite logging recursion by calling original console
+    originalConsole.error(`[Logger Recursion Prevention] [${level}] [${source}] ${message}`)
+    return
+  }
+  isInsideAddLog = true
+  try {
+    const isDev = !app.isPackaged || !!process.env.VITE_DEV_SERVER_URL
+    const isSaveEnabled = cache.get(CacheAttribute.prefLogSaveEnabled) === true || isDev
+    let isWindowOpen = false
+    try {
+      isWindowOpen = ElectronLogsWindow.getInstance().isOpen()
+    } catch (err) {
+      // Ignore if ElectronLogsWindow is not initialized yet
+    }
+
+    // Performance Optimization: If log viewer is closed and saving to file is disabled,
+    // exit immediately without allocating objects or broadcasting.
+    if (!isSaveEnabled && !isWindowOpen) {
+      return
+    }
+
+    const entry: LogEntry = {
+      timestamp: Date.now(),
+      level,
+      source: source || 'main',
+      message,
+      workspacePath,
+      workspaceName,
+    }
+
+    // Append to 'all'
+    if (!inMemoryLogsBySource.all) {
+      inMemoryLogsBySource.all = []
+    }
+    inMemoryLogsBySource.all.push(entry)
+    if (inMemoryLogsBySource.all.length > MAX_IN_MEMORY_LOGS) {
+      inMemoryLogsBySource.all.shift()
+    }
+
+    // Append to specific source channel to avoid source logs cluttering/flushing each other
+    const src = entry.source
+    if (src && src !== 'all') {
+      if (!inMemoryLogsBySource[src]) {
+        inMemoryLogsBySource[src] = []
+      }
+      inMemoryLogsBySource[src].push(entry)
+      if (inMemoryLogsBySource[src].length > MAX_IN_MEMORY_LOGS) {
+        inMemoryLogsBySource[src].shift()
+      }
+    }
+
+    // Broadcast to all windows (only if window is open)
+    if (isWindowOpen) {
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) {
+          try {
+            win.webContents.send('logs:message', entry)
+          } catch (err) {
+            originalConsole.error('[Logger] Failed to send log message to window webContents:', err)
+          }
+        }
+      })
+    }
+
+    // Only write to file if preference is enabled
+    if (isSaveEnabled) {
+      writeQueue.push(formatLogLine(entry))
+      flushWriteQueue()
+    }
+  } finally {
+    isInsideAddLog = false
+  }
+}
+
+export async function clearLogs() {
+  for (const key of Object.keys(inMemoryLogsBySource)) {
+    inMemoryLogsBySource[key] = []
+  }
+  const logDir = join(app.getPath('userData'), 'logs')
+  const logPath = join(logDir, 'app.log')
+  try {
+    await fs.writeFile(logPath, '', 'utf-8')
+  } catch (_err) {
+    // Ignore if file doesn't exist
+  }
+  // Broadcast cleared state
+  BrowserWindow.getAllWindows().forEach((win) => {
+    if (!win.isDestroyed()) {
+      try {
+        win.webContents.send('logs:cleared')
+      } catch (err) {
+        originalConsole.error('[Logger] Failed to send clear logs command to window webContents:', err)
+      }
+    }
+  })
+}
+
+function argsToString(...args: unknown[]): string {
+  return util.format(...args)
+}
+
+export function setupWebContentsLogger(contents: Electron.WebContents) {
+  const contentsId = contents.id
+
+  contents.on('did-start-loading', () => {
+    const url = contents.getURL?.() || ''
+    addLog('info', `renderer:${contentsId}`, `[WebContents:${contentsId}] did-start-loading (URL: ${url})`)
+  })
+
+  contents.on('did-finish-load', () => {
+    const url = contents.getURL?.() || ''
+    addLog('info', `renderer:${contentsId}`, `[WebContents:${contentsId}] did-finish-load (URL: ${url})`)
+  })
+
+  contents.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL) => {
+    addLog('error', `renderer:${contentsId}`, `[WebContents:${contentsId}] ❌ did-fail-load: code=${errorCode}, desc=${errorDescription}, url=${validatedURL}`)
+  })
+
+  contents.on('render-process-gone', (_e, details) => {
+    addLog('error', `renderer:${contentsId}`, `[WebContents:${contentsId}] 💥 render-process-gone: reason=${details.reason}, exitCode=${details.exitCode}`)
+  })
+
+  contents.on('console-message', (_e, level, message, line, sourceId) => {
+    // 0 = verbose/debug, 1 = info, 2 = warning, 3 = error
+    const levelMap: Record<number, LogEntry['level']> = {
+      0: 'debug',
+      1: 'info',
+      2: 'warn',
+      3: 'error',
+    }
+    const fnLevel = levelMap[level] || 'info'
+
+    // Parse the window type or plugin name from the URL
+    const url = contents.getURL?.() || ''
+    let source = `renderer:${contentsId}`
+    
+    // Check if it's a plugin
+    if (url.startsWith('berrytrace-plugin://')) {
+      const match = url.match(/berrytrace-plugin:\/\/([^/]+)/)
+      if (match && match[1]) {
+        source = `plugin:${match[1]}`
+      }
+    } else {
+      // Find the window query parameter
+      try {
+        const urlObj = new URL(url)
+        const windowName = urlObj.searchParams.get('window') || 'main'
+        source = `renderer:${windowName}`
+      } catch {
+        source = `renderer:${contentsId}`
+      }
+    }
+
+    const locationInfo = sourceId ? ` (${sourceId}:${line})` : ''
+    const fullMsg = `${message}${locationInfo}`
+
+    // Print to main process console in dev mode
+    if (process.env.VITE_DEV_SERVER_URL) {
+      const label = `[renderer:${source}]`
+      originalConsole[fnLevel](formatConsoleMessage(fnLevel, `${label} ${fullMsg}`))
+    }
+
+    // Phase 4: Resolve workspace context for this webContents
+    let workspacePath: string | undefined
+    let workspaceName: string | undefined
+    try {
+      const win = BrowserWindow.fromWebContents(contents)
+      if (win && !win.isDestroyed()) {
+        const { WorkspaceContextManager } = require('./workspace-context-manager')
+        const wcm = WorkspaceContextManager.getInstance()
+        const wsPath = wcm.getPathForWindow(win)
+        if (wsPath) {
+          workspacePath = wsPath
+          const path = require('path')
+          workspaceName = path.basename(wsPath)
+        }
+      }
+    } catch {
+      // WorkspaceContextManager may not be initialized yet
+    }
+
+    addLog(fnLevel, source, fullMsg, workspacePath, workspaceName)
+  })
+}
+
+/**
+ * Clear app.log files at startup so each session starts fresh.
+ * app-{date}.log files are NOT cleared — they accumulate all records per day.
+ */
+async function clearAppLogOnStartup() {
+  const clearTargets: string[] = []
+
+  // 1. User data directory app.log
+  try {
+    const userDataDir = join(app.getPath('userData'), 'logs')
+    await fs.mkdir(userDataDir, { recursive: true })
+    clearTargets.push(join(userDataDir, 'app.log'))
+  } catch (_err) {
+    // Ignore
+  }
+
+  // 2. Project root app.log (dev convenience)
+  try {
+    const projectLogDir = getProjectLogDir()
+    await fs.mkdir(projectLogDir, { recursive: true })
+    clearTargets.push(join(projectLogDir, 'app.log'))
+  } catch (_err) {
+    // Ignore
+  }
+
+  await Promise.all(clearTargets.map(async (p) => {
+    try {
+      await fs.writeFile(p, '', 'utf-8')
+    } catch (_err) {
+      // File may not exist yet, ignore
+    }
+  }))
+}
+
+export function initializeLogger() {
+  if (isLoggingInitialized) return
+  isLoggingInitialized = true
+
+  // Support BERRYTRACE_LOG_LEVEL env var (debug|info|warn|error)
+  const envLevel = (process.env.BERRYTRACE_LOG_LEVEL || '').toLowerCase()
+  if (envLevel in LOG_LEVEL_ORDER) {
+    currentLogLevel = envLevel as LogEntry['level']
+  }
+
+  // Clear app.log on startup so it only contains the current session
+  clearAppLogOnStartup()
+
+  // Override console methods to capture main process output and colorize terminal logs
+  console.log = (...args: unknown[]) => {
+    const formatted = argsToString(...args)
+    originalConsole.log(formatted)
+    addLog('info', 'main', formatted)
+  }
+  console.info = (...args: unknown[]) => {
+    const formatted = argsToString(...args)
+    originalConsole.info(formatConsoleMessage('info', formatted))
+    addLog('info', 'main', formatted)
+  }
+  console.warn = (...args: unknown[]) => {
+    const formatted = argsToString(...args)
+    originalConsole.warn(formatConsoleMessage('warn', formatted))
+    addLog('warn', 'main', formatted)
+  }
+  console.error = (...args: unknown[]) => {
+    const formatted = argsToString(...args)
+    originalConsole.error(formatConsoleMessage('error', formatted))
+    addLog('error', 'main', formatted)
+  }
+  if (console.debug) {
+    console.debug = (...args: unknown[]) => {
+      const formatted = argsToString(...args)
+      originalConsole.debug(formatConsoleMessage('debug', formatted))
+      addLog('debug', 'main', formatted)
+    }
+  }
+
+  // Hook all webContents console messages
+  app.on('web-contents-created', (_event, contents) => {
+    setupWebContentsLogger(contents)
+  })
+
+  // Register IPC handlers
+  ipcMain.handle('logs:get-history', () => {
+    return getHistoryMap()
+  })
+
+  ipcMain.handle('logs:set-save-enabled', (_event, enabled: boolean) => {
+    cache.set(CacheAttribute.prefLogSaveEnabled, enabled)
+    // Broadcast preferences change
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed() && win.webContents.id !== _event.sender.id) {
+        win.webContents.send('pref:changed')
+      }
+    })
+    return true
+  })
+
+  ipcMain.handle('logs:get-save-enabled', () => {
+    return cache.get(CacheAttribute.prefLogSaveEnabled) === true
+  })
+
+  ipcMain.handle('logs:clear', async () => {
+    await clearLogs()
+    return true
+  })
+}

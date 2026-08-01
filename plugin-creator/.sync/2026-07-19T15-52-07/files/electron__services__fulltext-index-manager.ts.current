@@ -1,0 +1,2171 @@
+import { BrowserWindow, powerMonitor, ipcMain, app } from 'electron'
+import { join, extname, relative, basename } from 'path'
+import * as fs from 'fs'
+import os from 'os'
+import { DatabaseManager } from './db-manager.js'
+import eventBus from '../../src/services/event_bus';
+import { WORKSPACE_DIR_NAME } from '../../src/config/constants.js'
+import { LocalAIService } from './local-ai-service.js'
+import { VectorSearchEngine } from './vector-search-engine.js'
+import { FtsHybridSearcher } from './fts-hybrid-searcher.js'
+import { DocumentLinkService } from './document-link-service.js'
+
+// 模块化导入（符合 800 行限制规范）
+import { QueryParser } from './fulltext-query-parser.js'
+import { QueryCache } from './fulltext-cache.js'
+import {
+  extractFileContent,
+  getSupportedExts,
+} from './fulltext-file-parsers.js'
+import { SKILLS_DIR, PLUGINS_DIR, FULLTEXT_CONFIG } from '../config/paths'
+
+export interface IndexProgress {
+  status: 'idle' | 'pending' | 'building' | 'paused' | 'error' | 'done'
+  percent: number
+  indexedCount: number
+  totalCount: number
+  estimatedRemainingMs: number
+  noteIndexCount?: number
+  fileIndexCount?: number
+  dbSize?: number
+}
+
+interface NoteSearchResult {
+  note_id: number
+  title: string
+  snip: string
+  rank: number
+}
+
+interface FileSearchResult {
+  file_path: string
+  file_name: string
+  snip: string
+  rank: number
+  line_number?: number
+}
+
+/** 全文索引中存储的工具条目 */
+interface IndexedTool {
+  name: string
+  description?: string
+  displayName?: string
+  category?: string
+  package?: string
+  pluginId?: string
+  cliName?: string
+  type?: string
+  downloadUrls?: Record<string, string>
+  inputSchema?: { properties?: Record<string, { description?: string }> }
+  isDynamic?: boolean
+  userQueries?: string[]
+}
+
+/** 全文索引中存储的 Skill 元信息 */
+interface IndexedSkillMeta {
+  dir: string
+  name: string
+  mdPath: string
+  mtimeMs: number
+  modifiedAt?: number
+}
+
+// 缓存实例（模块级，单例共享）
+const noteSearchCache = new QueryCache()
+const fileSearchCache = new QueryCache()
+
+/**
+ * 全文索引管理器（主类）
+ * 已模块化拆分：QueryParser / QueryCache / Notification / FileParsers 均在独立文件
+ *
+ * 性能优化：使用 Worker 线程处理 CPU 密集任务
+ */
+export class FullTextIndexManager {
+  private static instance: FullTextIndexManager
+
+  // 索引任务状态
+  private status: IndexProgress['status'] = 'idle'
+  private totalNotes = 0
+  private indexedNotes = 0
+  private startTime = 0
+  private isRebuilding = false
+  private startupIndexCheckDone = false
+
+  // Counts & DB size cache for buildProgress (5-second TTL)
+  private cachedNoteIndexCount = 0
+  private cachedFileIndexCount = 0
+  private cachedDbSize = 0
+  private lastCountsQueryTime = 0
+
+  // Known workspace paths for buildProgress() queries (populated during indexing)
+  private knownWorkspacePaths: Set<string> = new Set()
+
+  // 暂停/恢复控制
+  private pauseRequested = false
+  private resumeResolve: (() => void) | null = null
+
+  // 资源监控
+  private monitorInterval: NodeJS.Timeout | null = null
+  private schedulingInterval: NodeJS.Timeout | null = null
+  private lastCpuPercent = 0
+  private isUserActive = false
+
+  // Worker 线程（懒加载）
+  private worker: import('worker_threads').Worker | null = null
+
+  public clearCountsCache(): void {
+    this.lastCountsQueryTime = 0
+  }
+
+  private constructor() {
+    this.startResourceMonitor()
+    this.startScheduler()
+
+    // 延迟扫描 / 闲时扫描：避免启动时抢占资源，等待系统空闲再触发索引检查
+    this.scheduleIdleStartupIndexCheck()
+
+    // 监听文件变化事件（用于增量索引）
+    this.setupFileChangeWatcher()
+
+    // 监听插件安装/卸载事件 → 防抖重建全文索引
+    eventBus.on('plugin:changed', () => {
+      if (this.pluginReindexTimer) clearTimeout(this.pluginReindexTimer);
+      this.pluginReindexTimer = setTimeout(() => {
+        this.pluginReindexTimer = null;
+        console.log('[FullTextIndex] Plugin changed, rebuilding tools and skills index...');
+        this.indexToolsLibrary([]).catch(err => console.warn('[FullTextIndex] plugin:changed reindex tools failed:', err));
+        this.indexAllSkills().catch(err => console.warn('[FullTextIndex] plugin:changed reindex skills failed:', err));
+      }, 2000);
+    });
+
+    // 监听本地 AI 服务就绪事件，就绪后对没有向量的项（如 skills / tools / 笔记 / 文件）重新进行向量化
+    const localAI = LocalAIService.getInstance()
+    const onLocalAiReady = () => {
+      if (!this.startupIndexCheckDone) {
+        console.log('[FullTextIndex] Local AI service is ready, but startup index check has not run yet. Postponing reindex to idle startup task.')
+        return
+      }
+      console.log('[FullTextIndex] Local AI service became ready after startup. Triggering background vector reindex...')
+      this.triggerVectorReindex()
+      this.indexAllSkills().catch(err => {
+        console.error('[FullTextIndex] Failed to rebuild skills index on Local AI ready:', err)
+      })
+      this.indexToolsLibrary([]).catch(err => {
+        console.error('[FullTextIndex] Failed to rebuild tools index on Local AI ready:', err)
+      })
+    }
+
+    if (localAI.isWorkerRunning()) {
+      console.log('[FullTextIndex] Local AI service is already running. Rebuilding index...')
+      onLocalAiReady()
+    } else {
+      localAI.on('ready', onLocalAiReady)
+    }
+  }
+
+  /**
+   * 安排闲时启动索引检查
+   * 避免启动时抢占资源，等待系统闲置 5 秒后在后台执行。
+   */
+  private scheduleIdleStartupIndexCheck(): void {
+    let checkCount = 0
+    const checkInterval = setInterval(() => {
+      checkCount++
+      try {
+        const idleTime = powerMonitor.getSystemIdleTime()
+        // 至少等待应用启动 10 秒（5 次检查），且系统闲置超过 5 秒
+        if (checkCount >= 5 && idleTime >= 5) {
+          clearInterval(checkInterval)
+          console.log(`[FullTextIndex] System is idle (${idleTime}s), starting background index check...`)
+          this.checkAndBuildIndexOnStartup().catch(err => {
+            console.error('[FullTextIndex] Idle startup index check failed:', err)
+          })
+        }
+      } catch (_e) {
+        // Fallback: 如果系统不支持 powerMonitor，30 秒后自动执行
+        clearInterval(checkInterval)
+        setTimeout(() => {
+          this.checkAndBuildIndexOnStartup()
+        }, 30000)
+      }
+    }, 2000)
+  }
+
+  // ==================== 增量索引防抖机制 ====================
+  private incrementalUpdateTimer: NodeJS.Timeout | null = null
+  private pendingUpdates: Map<string, string[]> = new Map() // workspacePath -> changedFiles
+  private pluginReindexTimer: NodeJS.Timeout | null = null
+  private readonly DEBOUNCE_DELAY_MS = 60000 // 1 分钟防抖
+
+  /**
+   * 设置文件变化监听器
+   * 监听 workspace:content-changed 事件，实现增量索引更新
+   */
+  private setupFileChangeWatcher(): void {
+    // 监听来自 workspace-manager 的文件变化通知
+    ipcMain.on('workspace:content-changed', (_event, payload) => {
+      const { workspacePath, changedFiles } = payload as { workspacePath: string; changedFiles: string[] }
+
+      if (!changedFiles || changedFiles.length === 0) return
+
+      console.log(`[FullTextIndex] Received file changes: ${changedFiles.length} files in ${workspacePath}`)
+
+      // 收集待更新的文件
+      if (!this.pendingUpdates.has(workspacePath)) {
+        this.pendingUpdates.set(workspacePath, [])
+      }
+      const pending = this.pendingUpdates.get(workspacePath)!
+      pending.push(...changedFiles)
+
+      // 重置防抖计时器
+      this.resetIncrementalUpdateTimer()
+    })
+
+    console.log('[FullTextIndex] File change watcher set up')
+  }
+
+  /**
+   * 重置增量更新计时器（防抖）
+   */
+  private resetIncrementalUpdateTimer(): void {
+    if (this.incrementalUpdateTimer) {
+      clearTimeout(this.incrementalUpdateTimer)
+    }
+
+    this.incrementalUpdateTimer = setTimeout(() => {
+      // 检查系统资源
+      if (this.isUserActive || this.lastCpuPercent > 80) {
+        console.log(`[FullTextIndex] Skipping incremental update due to resource constraints (CPU: ${this.lastCpuPercent}%, UserActive: ${this.isUserActive})`)
+        // 资源不足，延长防抖时间（再等 1 分钟）
+        this.resetIncrementalUpdateTimer()
+        return
+      }
+
+      // 执行增量更新
+      this.processPendingUpdates().catch((err) => {
+        console.error('[FullTextIndex] Incremental index update failed:', err)
+      })
+    }, this.DEBOUNCE_DELAY_MS)
+  }
+
+  /**
+   * 处理待更新的文件（防抖到期后执行）
+   */
+  private async processPendingUpdates(): Promise<void> {
+    if (this.pendingUpdates.size === 0) return
+
+    console.log(`[FullTextIndex] Processing incremental updates for ${this.pendingUpdates.size} workspace(s)`)
+
+    for (const [workspacePath, changedFiles] of this.pendingUpdates) {
+      // 去重
+      const uniqueFiles = [...new Set(changedFiles)]
+
+      // 分离删除和更新的文件
+      const deletedFiles: string[] = []
+      const updatedFiles: string[] = []
+
+      for (const filePath of uniqueFiles) {
+        if (!fs.existsSync(filePath)) {
+          deletedFiles.push(filePath)
+        } else {
+          updatedFiles.push(filePath)
+        }
+      }
+
+      // 立即处理删除（不需要防抖）
+      if (deletedFiles.length > 0) {
+        await this.updateFileIndexIncremental(workspacePath, deletedFiles, true)
+      }
+
+      // 延迟处理更新（防抖已在此方法外处理）
+      if (updatedFiles.length > 0) {
+        await this.updateFileIndexIncremental(workspacePath, updatedFiles, false)
+      }
+    }
+
+    // 清空待更新列表
+    this.pendingUpdates.clear()
+  }
+
+  /**
+   * 增量更新文件索引
+   * @param workspacePath 工作区路径
+   * @param changedFiles 变化的文件列表
+   * @param isDeletion 是否为删除操作（删除立即执行，不受防抖影响）
+   * @param force 是否强制执行（忽略资源检查，用于启动时）
+   */
+  // 文件数量阈值（超过此值禁止索引）
+  private static readonly MAX_FILES_FOR_INDEXING = 50000;
+
+  /**
+   * 检查文件是否应该被索引（过滤 . 开头的文件/目录）
+   */
+  private shouldIndexFile(filePath: string, workspacePath: string): boolean {
+    const relativePath = relative(workspacePath, filePath);
+    const parts = relativePath.split('/');
+
+    // 检查路径的任何部分是否以 . 开头
+    for (const part of parts) {
+      if (part.startsWith('.') && part !== '.qoder') {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  private async updateFileIndexIncremental(workspacePath: string, changedFiles: string[], isDeletion: boolean = false, force: boolean = false): Promise<void> {
+    // 检查系统资源（删除操作除外，force 模式除外）
+    if (!isDeletion && !force && (this.isUserActive || this.lastCpuPercent > 80)) {
+      console.log(`[FullTextIndex] Skipping incremental update due to resource constraints (CPU: ${this.lastCpuPercent}%, UserActive: ${this.isUserActive}), will retry later`)
+      return
+    }
+
+    // 检查工作区文件总数（防止意外索引大目录）
+    try {
+      const allFiles = await fs.promises.readdir(workspacePath, { recursive: true, withFileTypes: true });
+      let fileCount = 0;
+      for (const entry of allFiles) {
+        if (entry.isFile() && !entry.name.startsWith('.')) {
+          fileCount++;
+        }
+      }
+
+      if (fileCount > FullTextIndexManager.MAX_FILES_FOR_INDEXING) {
+        console.warn(`[FullTextIndex] Workspace has ${fileCount} files, exceeding threshold (${FullTextIndexManager.MAX_FILES_FOR_INDEXING}). Skipping incremental update.`);
+        return;
+      }
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to check workspace size:', err);
+    }
+
+    console.log(`[FullTextIndex] Starting incremental update: ${changedFiles.length} files, force=${force}`)
+
+    const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+    let updatedCount = 0
+    let deletedCount = 0
+    let errorCount = 0
+
+    // FTS5 虚拟表不能可靠地通过 file_path = ? 删除（因为被分词了），必须通过 rowid 删除
+    const existingIndex = wsDb.prepare('SELECT rowid, file_path FROM FtsFileIndex WHERE workspace_path = ?').all(workspacePath) as {rowid: number, file_path: string}[]
+    const fileToRowids = new Map<string, number[]>()
+    for (const r of existingIndex) {
+      if (!fileToRowids.has(r.file_path)) {
+        fileToRowids.set(r.file_path, [])
+      }
+      fileToRowids.get(r.file_path)!.push(r.rowid)
+    }
+
+    for (const filePath of changedFiles) {
+      try {
+        // 过滤 . 开头的文件/目录
+        if (!this.shouldIndexFile(filePath, workspacePath)) {
+          console.log(`[FullTextIndex] Skipping dotfile: ${filePath}`)
+          continue
+        }
+
+        const ext = extname(filePath).toLowerCase()
+
+        // 只处理支持的文件类型
+        if (!getSupportedExts().includes(ext)) {
+          console.log(`[FullTextIndex] Skipping unsupported file type: ${filePath} (${ext})`)
+          continue
+        }
+
+        const relativePath = relative(workspacePath, filePath)
+        const oldRowids = fileToRowids.get(relativePath) || fileToRowids.get(filePath) || []
+
+        // 检查文件是否存在
+        if (!fs.existsSync(filePath)) {
+          // 文件被删除，从索引中移除
+          if (oldRowids.length > 0) {
+            const stmt = wsDb.prepare('DELETE FROM FtsFileIndex WHERE rowid = ?')
+            for (const oldRowid of oldRowids) {
+              stmt.run(oldRowid)
+            }
+            console.log(`[FullTextIndex] Removed from index (file deleted): ${relativePath}`)
+            deletedCount++
+          }
+          continue
+        }
+
+        // 先删除旧索引，防止由于提取内容失败或后续步骤导致的重复/老数据残留
+        if (oldRowids.length > 0) {
+          const stmt = wsDb.prepare('DELETE FROM FtsFileIndex WHERE rowid = ?')
+          for (const oldRowid of oldRowids) {
+            stmt.run(oldRowid)
+          }
+        }
+
+        // 文件被修改或新增，更新索引
+        console.log(`[FullTextIndex] Extracting content from: ${filePath}`)
+        
+        let mtime = new Date().toISOString()
+        try {
+          const stats = fs.statSync(filePath)
+          mtime = stats.mtime.toISOString()
+        } catch (e) {
+          console.warn(`[FullTextIndex] Failed to get stats for ${filePath}:`, e)
+        }
+
+        let content = ''
+        try {
+          content = await extractFileContent(filePath, ext)
+        } catch (err) {
+          console.error(`[FullTextIndex] Failed to extract content for ${filePath}:`, err)
+        }
+
+        if (!content) {
+          console.warn(`[FullTextIndex] Empty content extracted or failed to extract content: ${filePath}`)
+        }
+
+        // 截断存入 FTS5 数据库的文本上限，防止巨型文档膨胀内存与数据库
+        const maxChars = FULLTEXT_CONFIG.FTS_MAX_CHARS
+        const indexContent = (content && content.length > maxChars) ? content.slice(0, maxChars) : (content || '')
+        const fileName = basename(filePath)
+
+        // 插入新索引 (存储 relativePath 并且 file_type 去除点前缀)
+        wsDb.prepare(`
+          INSERT INTO FtsFileIndex (file_path, file_name, content, file_type, workspace_path, modified_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(relativePath, fileName, indexContent, ext.slice(1), workspacePath, mtime)
+
+        console.log(`[FullTextIndex] Updated index (incremental): ${relativePath} (${content?.length || 0} chars)`)
+        updatedCount++
+
+        // 礼让 Electron 主线程事件循环，防止连续大文件处理导致 UI 卡顿
+        await new Promise(resolve => setTimeout(resolve, FULLTEXT_CONFIG.YIELD_INTERVAL_MS))
+      } catch (err) {
+        console.error(`[FullTextIndex] Failed to update index for ${filePath}:`, err)
+        errorCount++
+      }
+    }
+
+    console.log(`[FullTextIndex] Incremental update complete: ${updatedCount} updated, ${deletedCount} deleted, ${errorCount} errors`)
+
+    if (updatedCount > 0 || deletedCount > 0) {
+      console.log(`[FullTextIndex] Incremental update complete: ${updatedCount} files updated, ${deletedCount} deleted`)
+      // 清除缓存
+      this.clearCountsCache()
+      fileSearchCache.clear()
+    }
+  }
+
+  public static getInstance(): FullTextIndexManager {
+    if (!FullTextIndexManager.instance) {
+      FullTextIndexManager.instance = new FullTextIndexManager()
+    }
+    return FullTextIndexManager.instance
+  }
+
+  // ==================== 文件解析（异步） ====================
+  // 注意：Worker 线程已移除，改用异步处理
+  // 原因：Worker 文件路径在编译后难以解析（code splitting 导致文件名哈希化）
+  // 文件解析本身是 I/O 密集型任务，异步处理已足够
+
+  /**
+   * 异步解析文件内容（大文件分级索引策略）
+   * - 普通文件 (<= FULLTEXT_CONFIG.LARGE_FILE_THRESHOLD): 提取全量文本内容
+   * - 大型文档 (> 10MB 且 <= 300MB): 不提取数百兆全量原始文本，而是提炼【目录大纲+结构摘要】存入 FTS5 索引
+   * - 超大二进制 (> 300MB): 跳过文本索引
+   */
+  private async extractFileContentAsync(filePath: string, ext: string): Promise<string> {
+    try {
+      let fileSize = 0
+      try {
+        const stats = await fs.promises.stat(filePath)
+        fileSize = stats.size
+      } catch (err) {
+        console.warn(`[FullTextIndex] Stat failed for ${filePath}, skipping:`, err)
+        return ''
+      }
+
+      // 超大文件 (> MAX_FILE_SIZE)，跳过索引
+      if (fileSize > FULLTEXT_CONFIG.MAX_FILE_SIZE) {
+        console.warn(`[FullTextIndex] Skipping huge file (>${(FULLTEXT_CONFIG.MAX_FILE_SIZE / 1024 / 1024).toFixed(0)}MB): ${filePath}`)
+        return ''
+      }
+
+      // 大型文档 (> LARGE_FILE_THRESHOLD 且 <= MAX_FILE_SIZE)：提炼大纲作为索引文本
+      if (fileSize > FULLTEXT_CONFIG.LARGE_FILE_THRESHOLD) {
+        console.log(`[FullTextIndex] Large document detected (${(fileSize / 1024 / 1024).toFixed(2)}MB), extracting outline index for: ${filePath}`)
+        const { extractDocumentOutline } = await import('./fulltext-file-parsers.js')
+        const outlineRes = await extractDocumentOutline(filePath)
+        const outlineTitles = outlineRes.outline.map(o => `${o.title} (Page ${o.page || 1})`).join('\n')
+        return `[Large Document Outline / 大文档结构大纲 - Total Pages: ${outlineRes.totalPages || 0}]\n${outlineTitles}`
+      }
+
+      return await extractFileContent(filePath, ext)
+    } catch (err) {
+      console.error(`[FullTextIndex] extractFileContentAsync error for ${filePath}:`, err)
+      return ''
+    }
+  }
+
+  // ==================== 启动与自动构建 ====================
+
+  private async checkAndBuildIndexOnStartup(): Promise<void> {
+    const startTime = performance.now()
+    console.log(`[FullTextIndex] [STARTUP] Starting checkAndBuildIndexOnStartup...`)
+    try {
+      // Check and migrate vector dimensions/models if needed
+      await this.checkAndMigrateVectorDimensions()
+
+      // 1. 检查文件索引（仅限当前活动/打开的工作区）
+      await this.checkAndBuildFileIndexOnStartup()
+
+      // 2. 扫描并索引所有 Agent Skills
+      await this.indexAllSkills()
+
+      // 3. 索引所有可用 MCP 工具
+      await this.indexToolsLibrary([])
+
+      // 4. 闲置时拉取已安装应用（仅在缓存为空或超过 24 小时时刷新）
+      await this.refreshInstalledAppsIfNeeded()
+    } catch (err) {
+      console.error('[FullTextIndex] Startup check failed:', err)
+    } finally {
+      this.startupIndexCheckDone = true
+      console.log(`[FullTextIndex] [STARTUP] checkAndBuildIndexOnStartup finished in ${(performance.now() - startTime).toFixed(1)}ms`)
+    }
+  }
+
+  private async checkAndMigrateVectorDimensions(): Promise<void> {
+    try {
+      const localAI = LocalAIService.getInstance()
+      const activeModel = localAI.getActiveEmbeddingModel()
+
+      // Fetch active workspaces from WorkspaceManager
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+
+      const activeWorkspaces = new Set<string>()
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          activeWorkspaces.add(wsPath)
+        }
+      }
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        activeWorkspaces.add(initialPath)
+      }
+      const history = workspaceManager.getHistory()
+      for (const entry of history) {
+        if (entry.path && entry.exists && fs.existsSync(entry.path)) {
+          activeWorkspaces.add(entry.path)
+        }
+      }
+
+      for (const wsPath of activeWorkspaces) {
+        try {
+          const wsDb = DatabaseManager.getInstance().getWorkspaceDB(wsPath)
+          const sample = wsDb.prepare('SELECT model_id, dimension FROM FtsVectorIndex LIMIT 1').all() as Array<{
+            model_id: string
+            dimension: number
+          }>
+
+          if (sample.length > 0) {
+            const dbModelId = sample[0].model_id
+            const dbDim = sample[0].dimension
+
+            if (dbModelId !== activeModel.modelId || dbDim !== activeModel.dimension) {
+              console.warn(`[FullTextIndex] Vector dimension/model mismatch in ${wsPath}! DB has ${dbModelId} (${dbDim}d) but active is ${activeModel.modelId} (${activeModel.dimension}d). Migrating...`)
+
+              // Clear vectors in this workspace DB and memory cache
+              wsDb.prepare('DELETE FROM FtsVectorIndex').run()
+              VectorSearchEngine.getEngine(wsDb, wsPath).clear()
+
+              // Rebuild files index
+              this.rebuildFilesIndex(wsPath).catch(err => {
+                console.error(`[FullTextIndex] Failed to rebuild files index for ${wsPath} during migration:`, err)
+              })
+            }
+          }
+        } catch (err) {
+          console.error(`[FullTextIndex] Failed to check vector dimensions for workspace ${wsPath}:`, err)
+        }
+      }
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to check and migrate vector dimensions:', err)
+    }
+  }
+
+  public triggerVectorReindex(): void {
+    console.log('[FullTextIndex] Triggering full vector indexing after model download...')
+
+    // Trigger tools vector indexing
+    this.indexToolsLibrary([]).catch(err => {
+      console.error('[FullTextIndex] Failed to rebuild tools index in triggerVectorReindex:', err)
+    })
+
+    // Trigger files vector indexing for active workspaces
+    import('./workspace-manager.js').then(({ WorkspaceManager }) => {
+      const workspaceManager = WorkspaceManager.getInstance()
+      const activeWorkspaces = new Set<string>()
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          activeWorkspaces.add(wsPath)
+        }
+      }
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        activeWorkspaces.add(initialPath)
+      }
+      for (const wsPath of activeWorkspaces) {
+        this.rebuildFilesIndex(wsPath).catch(err => {
+          console.error(`[FullTextIndex] Failed to rebuild files index for ${wsPath} after model download:`, err)
+        })
+      }
+    }).catch(e => {
+      console.warn('[FullTextIndex] Failed to resolve WorkspaceManager for vector reindex:', e)
+    })
+  }
+
+  /**
+   * 全量重建所有索引（Tools + Skills +   }
+
+  /**
+   * 检查是否需要刷新已安装应用缓存
+   * 仅在 InstalledAppsCache 为空或上次更新超过 24 小时时才重新拉取
+   */
+  private async refreshInstalledAppsIfNeeded(): Promise<void> {
+    try {
+      const db = DatabaseManager.getInstance()
+      const rows = db.query(
+        "SELECT updated_at FROM InstalledAppsCache ORDER BY updated_at DESC LIMIT 1"
+      ) as { updated_at: string }[]
+
+      const lastUpdated = rows[0]?.updated_at ? new Date(rows[0].updated_at).getTime() : 0
+      const hoursSinceUpdate = (Date.now() - lastUpdated) / (1000 * 60 * 60)
+
+      if (lastUpdated > 0 && hoursSinceUpdate < 24) {
+        console.log(`[FullTextIndex] InstalledAppsCache is fresh (${hoursSinceUpdate.toFixed(1)}h ago), skipping refresh`)
+        return
+      }
+
+      console.log('[FullTextIndex] InstalledAppsCache is stale or empty, refreshing in idle time...')
+      await this.rebuildInstalledAppsCache()
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to check InstalledAppsCache freshness:', err)
+    }
+  }
+
+  /**
+   * 在主进程中拉取系统已安装应用，写入 InstalledAppsCache 表
+   * 仅在系统闲置时调用，不影响启动速度
+   */
+  public async rebuildInstalledAppsCache(): Promise<void> {
+    try {
+      console.log('[FullTextIndex] Fetching installed apps via get-installed-apps...')
+      const { getInstalledApps } = await import('get-installed-apps')
+      const rawApps = await getInstalledApps()
+
+      const apps = (rawApps as Record<string, unknown>[])
+        .filter((a) => !!a.appName)
+        .map((a) => ({
+          appName: (a.appName as string) || '',
+          appPath: (a.appPath as string) || (a.kMDItemPath as string) || '',
+          appIdentifier: (a.appIdentifier as string) || (a.kMDItemCFBundleIdentifier as string) || '',
+          appVersion: (a.appVersion as string) || (a.kMDItemVersion as string) || '',
+          updatedAt: new Date().toISOString(),
+        }))
+
+      const dbPath = DatabaseManager.getInstance().getGlobalDBPath()
+      const { DatabaseWriter } = await import('./db-writer.js')
+
+      const statements: Array<{ sql: string; params: any[] }> = [
+        { sql: 'DELETE FROM InstalledAppsCache', params: [] }
+      ]
+      for (const app of apps) {
+        statements.push({
+          sql: 'INSERT INTO InstalledAppsCache (app_name, app_path, app_identifier, app_version, updated_at) VALUES (?, ?, ?, ?, ?)',
+          params: [app.appName, app.appPath, app.appIdentifier, app.appVersion, app.updatedAt]
+        })
+      }
+
+      await DatabaseWriter.getInstance().executeBatch(dbPath, statements)
+      console.log(`[FullTextIndex] InstalledAppsCache rebuilt: ${apps.length} apps written to DB`)
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to rebuild InstalledAppsCache:', err)
+    }
+  }
+
+  /**
+   * 启动时检查并构建当前活动工作区的文件索引（限制为当前活动工作区）
+   */
+  private async checkAndBuildFileIndexOnStartup(): Promise<void> {
+    try {
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+
+      // 获取所有当前活跃的工作区
+      const activeWorkspaces = new Set<string>()
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          activeWorkspaces.add(wsPath)
+        }
+      }
+
+      // 获取默认/初始工作区
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        activeWorkspaces.add(initialPath)
+      }
+
+      console.log(`[FullTextIndex] [STARTUP] Found ${activeWorkspaces.size} active workspaces for startup scanning:`, Array.from(activeWorkspaces))
+
+      // 1. 扫描并更新活动工作区的索引
+      for (const workspacePath of activeWorkspaces) {
+        await this.checkAndBuildFileIndexForWorkspace(workspacePath)
+      }
+    } catch (err) {
+      console.error('[FullTextIndex] Startup active file index check failed:', err)
+    }
+  }
+
+  /**
+   * 检查并增量更新指定工作区的文件索引
+   */
+  public async checkAndBuildFileIndexForWorkspace(workspacePath: string): Promise<void> {
+    const startTime = performance.now()
+    console.log(`[FullTextIndex] [SCAN] Checking file index for workspace: ${workspacePath}`)
+    // Register workspace so buildProgress() can query index counts
+    this.knownWorkspacePaths.add(workspacePath)
+    try {
+      const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+
+      // 获取当前工作区中所有已索引文件的修改时间，并收集重复行
+      const indexedFilesMap = new Map<string, { modified_at: string; rowid: number; allRowids: number[] }>()
+      const duplicateRowidsToDelete: number[] = []
+      try {
+        const indexedRows = wsDb.prepare(
+          'SELECT rowid, file_path, modified_at FROM FtsFileIndex WHERE workspace_path = ?'
+        ).all(workspacePath) as { rowid: number; file_path: string; modified_at: string }[]
+        for (const row of indexedRows) {
+          const existing = indexedFilesMap.get(row.file_path)
+          if (!existing) {
+            indexedFilesMap.set(row.file_path, {
+              modified_at: row.modified_at,
+              rowid: row.rowid,
+              allRowids: [row.rowid]
+            })
+          } else {
+            existing.allRowids.push(row.rowid)
+            // 保留最新修改时间以及最新行ID，重复行标记删除
+            if (row.modified_at > existing.modified_at) {
+              duplicateRowidsToDelete.push(existing.rowid)
+              existing.rowid = row.rowid
+              existing.modified_at = row.modified_at
+            } else {
+              duplicateRowidsToDelete.push(row.rowid)
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[FullTextIndex] [SCAN] Failed to query indexed files map:`, e)
+      }
+
+      // 1. 批量清理已在磁盘上删除的文件的索引以及重复行（使用事务）
+      const rowidsToDelete = [...duplicateRowidsToDelete]
+      for (const [filePath, fileData] of indexedFilesMap.entries()) {
+        const absolutePath = filePath.startsWith('/') || filePath.includes(':')
+          ? filePath
+          : join(workspacePath, filePath)
+
+        if (!fs.existsSync(absolutePath)) {
+          console.log(`[FullTextIndex] [SCAN] File deleted on disk, marking for deletion: ${filePath}`)
+          rowidsToDelete.push(...fileData.allRowids)
+          indexedFilesMap.delete(filePath)
+        }
+      }
+
+      if (rowidsToDelete.length > 0) {
+        const chunkSize = 100
+        let deletedCount = 0
+        for (let i = 0; i < rowidsToDelete.length; i += chunkSize) {
+          const batch = rowidsToDelete.slice(i, i + chunkSize)
+          wsDb.prepare('BEGIN TRANSACTION').run()
+          try {
+            const stmt = wsDb.prepare('DELETE FROM FtsFileIndex WHERE rowid = ?')
+            for (const rowid of batch) {
+              stmt.run(rowid)
+            }
+            wsDb.prepare('COMMIT').run()
+            deletedCount += batch.length
+          } catch (err) {
+            wsDb.prepare('ROLLBACK').run()
+            console.error('[FullTextIndex] [SCAN] Failed to delete batch of stale/duplicate indices in transaction:', err)
+          }
+          // Yield control back to the event loop
+          await new Promise<void>(resolve => setImmediate(resolve))
+        }
+        console.log(`[FullTextIndex] [SCAN] Batch deleted ${deletedCount} stale/duplicate files from FTS index`)
+        fileSearchCache.clear()
+        this.clearCountsCache()
+      }
+
+      // 2. 遍历工作区目录中的实际文件，检查是否需要更新
+      const filesToUpdate: string[] = []
+      let scannedCount = 0
+      let skippedCount = 0
+      let alreadyIndexedCount = 0
+
+      const walkDir = async (dir: string): Promise<void> => {
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true })
+        for (const entry of entries) {
+          const fullPath = join(dir, entry.name)
+
+          // 核心过滤：跳过隐藏文件/特定构建目录（关键优化：避免扫描 node_modules 等造成卡死）
+          if (
+            (entry.name.startsWith('.') && entry.name !== '.qoder') ||
+            entry.name === 'node_modules' ||
+            entry.name === 'dist' ||
+            entry.name === 'build' ||
+            entry.name === WORKSPACE_DIR_NAME
+          ) {
+            skippedCount++
+            continue
+          }
+
+          if (entry.isDirectory()) {
+            await walkDir(fullPath)
+          } else if (entry.isFile()) {
+            const ext = extname(fullPath).toLowerCase()
+
+            // 只处理支持的文档/笔记类型
+            if (!getSupportedExts().includes(ext)) {
+              skippedCount++
+              continue
+            }
+
+            scannedCount++
+
+            const stats = await fs.promises.stat(fullPath)
+            const fileModifiedAt = stats.mtime.toISOString()
+
+            // 比较修改时间，支持相对路径和绝对路径的精确匹配
+            const relativePath = relative(workspacePath, fullPath)
+            const indexedData = indexedFilesMap.get(relativePath) || indexedFilesMap.get(fullPath)
+            const indexedAt = indexedData?.modified_at
+
+            if (!indexedAt) {
+              console.log(`[FullTextIndex] [SCAN] File not indexed yet: ${relativePath}`)
+              filesToUpdate.push(fullPath)
+            } else if (fileModifiedAt > indexedAt) {
+              console.log(`[FullTextIndex] [SCAN] File modified, needs re-indexing: ${relativePath}`)
+              filesToUpdate.push(fullPath)
+            } else {
+              alreadyIndexedCount++
+            }
+          }
+        }
+      }
+
+      await walkDir(workspacePath)
+      console.log(`[FullTextIndex] [SCAN] Scan result: ${scannedCount} files matched, ${filesToUpdate.length} to update, ${alreadyIndexedCount} up-to-date, ${skippedCount} skipped`)
+
+      // 3. 增量更新变化的文件的索引
+      if (filesToUpdate.length > 0) {
+        console.log(`[FullTextIndex] [SCAN] Incrementally indexing ${filesToUpdate.length} files...`)
+        await this.updateFileIndexIncremental(workspacePath, filesToUpdate, false, true) // force = true
+      }
+    } catch (err) {
+      console.error('[FullTextIndex] [SCAN] Incremental workspace check failed:', err)
+    } finally {
+      console.log(`[FullTextIndex] [SCAN] Workspace indexing verification finished in ${(performance.now() - startTime).toFixed(1)}ms`)
+    }
+  }
+
+
+  // ==================== 资源监控 ====================
+
+  private startResourceMonitor(): void {
+    this.monitorInterval = setInterval(async () => {
+      this.lastCpuPercent = await this.measureCpuUsage()
+
+      try {
+        const idleTime = powerMonitor.getSystemIdleTime()
+        this.isUserActive = idleTime < 5
+      } catch {
+        this.isUserActive = false
+      }
+    }, 2000)
+  }
+
+  private startScheduler(): void {
+    this.schedulingInterval = setInterval(() => {
+      if (this.status !== 'building' && this.status !== 'paused') return
+
+      const shouldPause = this.isUserActive || this.lastCpuPercent > 80
+      const shouldResume = !this.isUserActive && this.lastCpuPercent < 64
+
+      if (this.status === 'building' && shouldPause) {
+        console.log(`[FullTextIndex] Pausing indexer. Reason: CPU=${this.lastCpuPercent}%, UserActive=${this.isUserActive}`)
+        this.pauseIndexing()
+      } else if (this.status === 'paused' && shouldResume) {
+        console.log(`[FullTextIndex] Resuming indexer. CPU=${this.lastCpuPercent}%`)
+        this.resumeIndexing()
+      }
+    }, 2000)
+  }
+
+  private measureCpuUsage(): Promise<number> {
+    return new Promise((resolve) => {
+      const startMeasure = os.cpus().map((cpu) => {
+        const times = cpu.times as Record<string, number>
+        const total = Object.values(times).reduce((sum, val) => sum + val, 0)
+        return { idle: times.idle, total }
+      })
+
+      setTimeout(() => {
+        const endMeasure = os.cpus().map((cpu) => {
+          const times = cpu.times as Record<string, number>
+          const total = Object.values(times).reduce((sum, val) => sum + val, 0)
+          return { idle: times.idle, total }
+        })
+
+        let totalDiff = 0
+        let idleDiff = 0
+        for (let i = 0; i < startMeasure.length; i++) {
+          totalDiff += endMeasure[i]!.total - startMeasure[i]!.total
+          idleDiff += endMeasure[i]!.idle - startMeasure[i]!.idle
+        }
+
+        resolve(totalDiff === 0 ? 0 : 100 - Math.round((100 * idleDiff) / totalDiff))
+      }, 200)
+    })
+  }
+
+  // ==================== 暂停/恢复 ====================
+
+  public pauseIndexing(): void {
+    if (this.status !== 'building') return
+    this.pauseRequested = true
+    console.log('[FullTextIndex] Pause requested')
+  }
+
+  public resumeIndexing(): void {
+    if (this.status !== 'paused') return
+    this.pauseRequested = false
+    if (this.resumeResolve) {
+      console.log('[FullTextIndex] Resuming indexing...')
+      this.resumeResolve()
+      this.resumeResolve = null
+    }
+  }
+
+  private async checkPausePoint(): Promise<void> {
+    if (!this.pauseRequested) return Promise.resolve()
+
+    this.status = 'paused'
+    this.broadcastProgress()
+    console.log('[FullTextIndex] Paused. Waiting for resume signal...')
+
+    return new Promise<void>((resolve) => {
+      this.resumeResolve = () => {
+        this.status = 'building'
+        this.broadcastProgress()
+        console.log('[FullTextIndex] Resumed from checkpoint.')
+        resolve()
+      }
+
+      if (!this.pauseRequested && this.resumeResolve) {
+        this.resumeResolve()
+        this.resumeResolve = null
+      }
+    })
+  }
+
+  // ==================== 进度广播 ====================
+
+  private broadcastProgress(): void {
+    const progress = this.buildProgress()
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('fulltext-index:progress', progress)
+      }
+    })
+  }
+
+  private buildProgress(): IndexProgress {
+    const now = Date.now()
+    // Refresh counts every 5s; clearCountsCache() forces immediate refresh by resetting lastCountsQueryTime to 0
+    if (now - this.lastCountsQueryTime > 5000) {
+      this.lastCountsQueryTime = now
+      try {
+        let totalNotesCount = 0
+        let totalFilesCount = 0
+        let totalDbSize = 0
+
+        // Get global DB file size
+        try {
+          const dbFolder = app.getPath('userData')
+          const dbName = !app.isPackaged ? 'berrytrace-dev.db' : 'berrytrace.db'
+          const globalDbPath = join(dbFolder, dbName)
+          if (fs.existsSync(globalDbPath)) {
+            totalDbSize += fs.statSync(globalDbPath).size
+          }
+        } catch { /* empty */ }
+
+        // Use knownWorkspacePaths populated during indexing (synchronous, always correct)
+        for (const wsPath of this.knownWorkspacePaths) {
+          try {
+            const wsDb = DatabaseManager.getInstance().getWorkspaceDB(wsPath)
+            const noteCountRow = wsDb.prepare('SELECT COUNT(*) as count FROM FtsNoteIndex').all() as { count: number }[]
+            totalNotesCount += noteCountRow[0]?.count || 0
+
+            const fileCountRow = wsDb.prepare('SELECT COUNT(*) as count FROM FtsFileIndex').all() as { count: number }[]
+            totalFilesCount += fileCountRow[0]?.count || 0
+
+            const dbPath = join(wsPath, WORKSPACE_DIR_NAME, 'workspace.db')
+            if (fs.existsSync(dbPath)) {
+              totalDbSize += fs.statSync(dbPath).size
+            }
+          } catch (_err) {
+            // Ignore workspace DB errors
+          }
+        }
+
+        this.cachedNoteIndexCount = totalNotesCount
+        this.cachedFileIndexCount = totalFilesCount
+        this.cachedDbSize = totalDbSize
+      } catch (_err) {
+        // Avoid printing errors constantly during active indexing loop
+      }
+    }
+
+    return {
+      status: this.status,
+      percent: this.totalNotes > 0 ? Math.round((this.indexedNotes / this.totalNotes) * 100) : 0,
+      indexedCount: this.indexedNotes,
+      totalCount: this.totalNotes,
+      estimatedRemainingMs: this.estimateRemainingMs(),
+      noteIndexCount: this.cachedNoteIndexCount,
+      fileIndexCount: this.cachedFileIndexCount,
+      dbSize: this.cachedDbSize,
+    };
+  }
+
+  private estimateRemainingMs(): number {
+    if (this.indexedNotes === 0 || this.status !== 'building') return 0
+    const elapsed = Date.now() - this.startTime
+    const rate = this.indexedNotes / elapsed
+    const remaining = this.totalNotes - this.indexedNotes
+    return Math.round(remaining / rate)
+  }
+
+  // ==================== 索引构建核心逻辑 ====================
+
+  /**
+   * 全量重建所有索引（Tools + Skills + Files 的 FTS5 + 向量）
+   * 由用户从设置页面手动触发，或在模型切换后自动调用。
+   * 此方法在后台异步执行，不阻塞调用方。
+   */
+  public async rebuildAllIndices(): Promise<void> {
+    if (this.isRebuilding) {
+      console.log('[FullTextIndex] Full rebuild already in progress, skipping duplicate call');
+      return;
+    }
+    this.isRebuilding = true;
+    this.rebuildAllIndicesAsync().catch((err) => {
+      console.error('[FullTextIndex] Failed to rebuild all indices:', err)
+      this.status = 'error'
+      this.broadcastProgress()
+    }).finally(() => {
+      this.isRebuilding = false;
+    })
+  }
+
+  private async rebuildAllIndicesAsync(): Promise<void> {
+    try {
+      this.status = 'building'
+      this.broadcastProgress()
+
+      // Step 1: 索引所有工作区文件
+      console.log(`[FullTextIndex] Starting workspace files indexing...`)
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+
+      const workspacePaths = new Set<string>()
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          workspacePaths.add(wsPath)
+        }
+      }
+
+      const history = workspaceManager.getHistory()
+      for (const entry of history) {
+        if (entry.path && entry.exists && fs.existsSync(entry.path)) {
+          workspacePaths.add(entry.path)
+        }
+      }
+
+      console.log(`[FullTextIndex] Found ${workspacePaths.size} workspaces to index`)
+
+      for (const wsPath of workspacePaths) {
+        console.log(`[FullTextIndex] Indexing workspace: ${wsPath}`)
+        await this.rebuildFilesIndex(wsPath)
+      }
+
+      // Step 2: 刷新已安装应用缓存
+      console.log('[FullTextIndex] Refreshing installed apps cache...')
+      await this.rebuildInstalledAppsCache()
+
+      this.status = 'done'
+      this.broadcastProgress()
+
+      setTimeout(() => {
+        if (this.status === 'done') {
+          this.status = 'idle'
+          this.broadcastProgress()
+        }
+      }, 3000)
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to rebuild all indices:', err)
+      this.status = 'error'
+      this.broadcastProgress()
+    }
+  }
+
+  public async onNoteCreated(_noteId: number): Promise<void> {
+    // disabled
+  }
+
+  public async onNoteUpdated(_noteId: number): Promise<void> {
+    // disabled
+  }
+
+  public async onNoteDeleted(_noteId: number): Promise<void> {
+    // disabled
+  }
+
+  private async buildFullIndex(_calendarUuid: number): Promise<void> {
+    // disabled
+  }
+
+  // ==================== 工作区文件索引 ====================
+
+  public async onFilesChanged(filePaths: string[], workspacePath: string): Promise<void> {
+    const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+    const vectorEngine = VectorSearchEngine.getEngine(wsDb, workspacePath)
+    const supportedExts = getSupportedExts()
+
+    // 预先查询工作区中所有的索引，以便通过 rowid 准确且高效地去重
+    const existingIndex = wsDb.prepare(
+      'SELECT rowid, file_path FROM FtsFileIndex WHERE workspace_path = ?'
+    ).all(workspacePath) as { rowid: number; file_path: string }[]
+
+    const fileToRowids = new Map<string, number[]>()
+    for (const r of existingIndex) {
+      if (!fileToRowids.has(r.file_path)) {
+        fileToRowids.set(r.file_path, [])
+      }
+      fileToRowids.get(r.file_path)!.push(r.rowid)
+    }
+
+    for (const filePath of filePaths) {
+      try {
+        // 全文索引：过滤 . 开头的隐藏文件/文件夹
+        if (!this.shouldIndexFile(filePath, workspacePath)) continue
+
+        const ext = extname(filePath).toLowerCase()
+        const relativePath = relative(workspacePath, filePath)
+        const oldRowids = fileToRowids.get(relativePath) || fileToRowids.get(filePath) || []
+
+        if (!fs.existsSync(filePath)) {
+          if (oldRowids.length > 0) {
+            const stmt = wsDb.prepare('DELETE FROM FtsFileIndex WHERE rowid = ?')
+            for (const oldRowid of oldRowids) {
+              stmt.run(oldRowid)
+            }
+          }
+          // Delete Vector and links
+          try {
+            vectorEngine.delete(relativePath, 'file')
+            vectorEngine.delete(relativePath, 'note_outline')
+            wsDb.prepare("DELETE FROM FtsVectorIndex WHERE entity_type = 'note_chunk' AND entity_id LIKE ?").run(relativePath + '#chunk_%')
+            wsDb.prepare('DELETE FROM doc_links WHERE source_path = ?').run(relativePath)
+            wsDb.prepare('DELETE FROM semantic_pairs WHERE source_path = ? OR target_path = ?').run(relativePath, relativePath)
+          } catch (e) {
+            console.error('[FullTextIndex] Failed to delete indexes on file removal:', e)
+          }
+          console.log(`[FullTextIndex] Deleted file index for: ${relativePath}`)
+          continue
+        }
+
+        if (!supportedExts.includes(ext)) continue
+
+        const stats = fs.statSync(filePath)
+        if (stats.isDirectory()) continue
+
+        // 删除已有索引行（含重复项）
+        if (oldRowids.length > 0) {
+          const stmt = wsDb.prepare('DELETE FROM FtsFileIndex WHERE rowid = ?')
+          for (const oldRowid of oldRowids) {
+            stmt.run(oldRowid)
+          }
+        }
+
+        const content = await this.extractFileContentAsync(filePath, ext)
+        const fileName = basename(filePath)
+
+        wsDb.prepare(
+          `INSERT OR REPLACE INTO FtsFileIndex (file_path, file_name, content, file_type, workspace_path, modified_at) VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(relativePath, fileName, content, ext.slice(1), workspacePath, stats.mtime.toISOString())
+
+        // Index links for markdown files
+        if (ext === '.md') {
+          try {
+            const parsedLinks = await DocumentLinkService.getInstance().parseLinks(filePath, workspacePath)
+            wsDb.prepare('DELETE FROM doc_links WHERE source_path = ?').run(relativePath)
+            const insertLink = wsDb.prepare(
+              'INSERT OR IGNORE INTO doc_links (source_path, target_text, display_text, anchor, target_type, line_number) VALUES (?, ?, ?, ?, ?, ?)'
+            )
+            for (const link of parsedLinks) {
+              insertLink.run(relativePath, link.targetText, link.displayText || null, link.anchor || null, link.targetType, link.lineNumber)
+            }
+          } catch (err) {
+            console.warn(`[FullTextIndex] Failed to index links for ${relativePath}:`, err)
+          }
+        }
+
+        // Index Vector
+        try {
+          const textToEmbed = (fileName + '\n' + content).trim()
+          const localAI = LocalAIService.getInstance()
+          if (textToEmbed && localAI.isWorkerRunning()) {
+            const activeModel = localAI.getActiveEmbeddingModel()
+            const vector = await localAI.getEmbedding(textToEmbed)
+            vectorEngine.addOrUpdate(relativePath, 'file', vector, activeModel.dimension, activeModel.modelId)
+          }
+
+          // Prioritize Outline Vector for Markdown files
+          if (ext === '.md' && localAI.isWorkerRunning()) {
+            const activeModel = localAI.getActiveEmbeddingModel()
+            const outlineText = await DocumentLinkService.getInstance().extractOutlineText(filePath)
+            if (outlineText) {
+              const outlineVector = await localAI.getEmbedding(outlineText)
+              vectorEngine.addOrUpdate(relativePath, 'note_outline', outlineVector, activeModel.dimension, activeModel.modelId)
+            }
+          }
+        } catch (err) {
+          console.warn(`[FullTextIndex] Failed to generate vector for file ${relativePath}:`, err)
+        }
+
+        console.log(`[FullTextIndex] Updated file index for: ${relativePath}`)
+      } catch (err) {
+        console.error('[FullTextIndex] Failed to index file:', filePath, err)
+      }
+    }
+    this.clearCountsCache()
+  }
+
+  public async rebuildFilesIndex(workspacePath: string): Promise<void> {
+    console.log(`[FullTextIndex] Rebuilding files index for workspace: ${workspacePath}`)
+    this.status = 'building'
+    // Register this workspace so buildProgress() can query its counts
+    this.knownWorkspacePaths.add(workspacePath)
+    this.broadcastProgress()
+
+    const wsDb = DatabaseManager.getInstance().getWorkspaceDB(workspacePath)
+
+    // 不再预先清空索引！使用 INSERT OR REPLACE 进行 upsert，保留现有数据可用性
+    // 索引完成后，再删除磁盘上已不存在的文件条目（增量清理）
+
+    // 收集所有需要索引的文件
+    const filesToIndex: Array<{ fullPath: string; ext: string }> = []
+
+    const walkDir = async (dir: string): Promise<void> => {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name)
+
+        // 跳过隐藏文件和特定目录
+        if ((entry.name.startsWith('.') && entry.name !== '.qoder') || entry.name === 'node_modules' || entry.name === WORKSPACE_DIR_NAME) continue
+
+        if (entry.isDirectory()) {
+          await walkDir(fullPath)
+        } else {
+          const ext = extname(fullPath).toLowerCase()
+          const supportedExts = getSupportedExts()
+          if (supportedExts.includes(ext)) {
+            filesToIndex.push({ fullPath, ext })
+          }
+        }
+      }
+    }
+
+    try {
+      // 先遍历收集文件列表
+      await walkDir(workspacePath)
+
+      console.log(`[FullTextIndex] Found ${filesToIndex.length} files to index in ${workspacePath}`)
+
+      // Update total count for progress reporting
+      this.totalNotes = filesToIndex.length
+      this.indexedNotes = 0
+      this.startTime = Date.now()
+      this.broadcastProgress()
+
+      // 分批索引文件
+      const batchSize = 50  // 每批处理 50 个文件
+      let indexedCount = 0
+
+      for (let i = 0; i < filesToIndex.length; i += batchSize) {
+        // 检查是否需要暂停
+        await this.checkPausePoint()
+
+        const batch = filesToIndex.slice(i, i + batchSize)
+
+        // 1. Generate embeddings for the batch outside transaction
+        const batchEmbeddings: Array<{
+          relativePath: string;
+          fileVector: number[] | null;
+          outlineVector: number[] | null;
+          dimension: number;
+          modelId: string;
+        } | null> = []
+        for (const { fullPath, ext } of batch) {
+          try {
+            const stats = await fs.promises.stat(fullPath)
+            if (stats.isDirectory() || stats.size > 10 * 1024 * 1024) {
+              batchEmbeddings.push(null)
+              continue
+            }
+
+            const content = await this.extractFileContentAsync(fullPath, ext)
+            const fileName = basename(fullPath)
+            const relativePath = relative(workspacePath, fullPath)
+            const textToEmbed = (fileName + '\n' + content).trim()
+            const localAI = LocalAIService.getInstance()
+
+            if (localAI.isWorkerRunning()) {
+              const activeModel = localAI.getActiveEmbeddingModel()
+              let fileVector: number[] | null = null
+              let outlineVector: number[] | null = null
+
+              if (textToEmbed) {
+                fileVector = await localAI.getEmbedding(textToEmbed)
+              }
+
+              if (ext === '.md') {
+                const outlineText = await DocumentLinkService.getInstance().extractOutlineText(fullPath)
+                if (outlineText) {
+                  outlineVector = await localAI.getEmbedding(outlineText)
+                }
+              }
+
+              batchEmbeddings.push({
+                relativePath,
+                fileVector,
+                outlineVector,
+                dimension: activeModel.dimension,
+                modelId: activeModel.modelId
+              })
+            } else {
+              batchEmbeddings.push(null)
+            }
+          } catch (_e) {
+            batchEmbeddings.push(null)
+          }
+        }
+
+        // 2. Perform DB operations inside transaction
+        wsDb.prepare('BEGIN TRANSACTION').run()
+        try {
+          const stmt = wsDb.prepare(
+            `INSERT OR REPLACE INTO FtsFileIndex (file_path, file_name, content, file_type, workspace_path, modified_at) VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          for (let idx = 0; idx < batch.length; idx++) {
+            const { fullPath, ext } = batch[idx]
+            try {
+              const stats = await fs.promises.stat(fullPath)
+              if (stats.isDirectory()) continue
+              if (stats.size > 10 * 1024 * 1024) continue
+
+              const content = await this.extractFileContentAsync(fullPath, ext)
+              const fileName = basename(fullPath)
+              const relativePath = relative(workspacePath, fullPath)
+
+              stmt.run(relativePath, fileName, content, ext.slice(1), workspacePath, stats.mtime.toISOString())
+
+              // Index links for markdown files
+              if (ext === '.md') {
+                try {
+                  const parsedLinks = await DocumentLinkService.getInstance().parseLinks(fullPath, workspacePath)
+                  wsDb.prepare('DELETE FROM doc_links WHERE source_path = ?').run(relativePath)
+                  const insertLink = wsDb.prepare(
+                    'INSERT OR IGNORE INTO doc_links (source_path, target_text, display_text, anchor, target_type, line_number) VALUES (?, ?, ?, ?, ?, ?)'
+                  )
+                  for (const link of parsedLinks) {
+                    insertLink.run(relativePath, link.targetText, link.displayText || null, link.anchor || null, link.targetType, link.lineNumber)
+                  }
+                } catch (linkErr) {
+                  console.error('[FullTextIndex] Failed to parse links in rebuild:', linkErr)
+                }
+              }
+
+              // Insert vectors
+              const embeddingInfo = batchEmbeddings[idx]
+              if (embeddingInfo) {
+                const vectorEngine = VectorSearchEngine.getEngine(wsDb, workspacePath)
+                if (embeddingInfo.fileVector) {
+                  vectorEngine.addOrUpdate(
+                    embeddingInfo.relativePath,
+                    'file',
+                    embeddingInfo.fileVector,
+                    embeddingInfo.dimension,
+                    embeddingInfo.modelId
+                  )
+                }
+                if (embeddingInfo.outlineVector) {
+                  vectorEngine.addOrUpdate(
+                    embeddingInfo.relativePath,
+                    'note_outline',
+                    embeddingInfo.outlineVector,
+                    embeddingInfo.dimension,
+                    embeddingInfo.modelId
+                  )
+                }
+              }
+
+              indexedCount++
+            } catch (err) {
+              console.error('[FullTextIndex] Failed to index file:', fullPath, err)
+            }
+          }
+          wsDb.prepare('COMMIT').run()
+        } catch (err) {
+          wsDb.prepare('ROLLBACK').run()
+          console.error(`[FullTextIndex] Failed to index batch at ${i}:`, err)
+          throw err
+        }
+
+        // 每处理完一批，报告进度
+        this.indexedNotes = indexedCount
+        this.broadcastProgress()
+        console.log(`[FullTextIndex] Indexed ${indexedCount}/${filesToIndex.length} files`)
+      }
+
+      // Mark all as complete for progress reporting
+      this.indexedNotes = this.totalNotes
+      console.log(`[FullTextIndex] File index rebuild complete for: ${workspacePath} (${indexedCount} files)`)
+      this.broadcastProgress()
+      this.clearCountsCache()
+
+      // 清理磁盘上已不存在的文件的索引条目（增量清理，不影响现有数据可用性）
+      try {
+        const indexedPaths = new Set(filesToIndex.map(f => relative(workspacePath, f.fullPath)))
+        const dbFiles = wsDb.prepare('SELECT file_path FROM FtsFileIndex WHERE workspace_path = ?').all(workspacePath) as { file_path: string }[]
+        const staleFiles = dbFiles.filter(f => !indexedPaths.has(f.file_path))
+        if (staleFiles.length > 0) {
+          console.log(`[FullTextIndex] Cleaning up ${staleFiles.length} stale file entries`)
+          const vectorEngine = VectorSearchEngine.getEngine(wsDb, workspacePath)
+          const deleteStmt = wsDb.prepare('DELETE FROM FtsFileIndex WHERE file_path = ? AND workspace_path = ?')
+          for (const f of staleFiles) {
+            deleteStmt.run(f.file_path, workspacePath)
+            vectorEngine.delete(f.file_path, 'file')
+            vectorEngine.delete(f.file_path, 'note_outline')
+          }
+        }
+      } catch (e) {
+        console.warn('[FullTextIndex] Failed to clean up stale file entries:', e)
+      }
+
+      await this.indexAllSkills(workspacePath)
+
+      this.status = 'done'
+      this.broadcastProgress()
+
+      setTimeout(() => {
+        if (this.status === 'done') {
+          this.status = 'idle'
+          this.broadcastProgress()
+        }
+      }, 3000)
+
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to rebuild file index:', err)
+      this.status = 'error'
+      this.broadcastProgress()
+    }
+  }
+
+  // ==================== 查询引擎（IPC 入口） ====================
+
+  public async searchNotes(_query: string, _calendarUuid: number, _workspacePath?: string | null): Promise<NoteSearchResult[]> {
+    return [];
+  }
+
+  public async searchFiles(query: string, workspacePath?: string): Promise<FileSearchResult[]> {
+    const { WorkspaceManager } = await import('./workspace-manager.js')
+    const activePath = workspacePath || WorkspaceManager.getInstance().getInitialWorkspacePath()
+    if (!activePath) {
+      console.warn('[FullTextIndex] No active workspace path found for searchFiles')
+      return []
+    }
+
+    const scopeKey = activePath
+    const cacheKey = `files:${scopeKey}:${query}`;
+
+    // 1. 检查缓存
+    const cached = fileSearchCache.get(cacheKey) as FileSearchResult[] | null
+    if (cached) {
+      console.log(`[FullTextIndex] Cache hit for files: ${cacheKey}`)
+      return cached
+    }
+
+    // 2. 第一阶段：SQLite FTS5 + 向量检索 (仅涉及文档) — 极其迅速
+    try {
+      const wsFilter = 'AND workspace_path = ?'
+      const hasAdvancedSyntax = /( AND | OR | NOT |"-|"[^"]+")/.test(query)
+
+      let sql: string
+      let params: (string | number)[]
+
+      if (hasAdvancedSyntax) {
+        const parser = new QueryParser()
+        const parsed = parser.parse(query)
+        const ftsQuery = parser.toFtsQuery(parsed)
+
+        sql = `
+          SELECT file_path, file_name, content, snippet(FtsFileIndex, 2, '[', ']', '...', 30) as snip, rank
+          FROM FtsFileIndex
+          WHERE FtsFileIndex MATCH ?
+            ${wsFilter}
+          ORDER BY rank
+          LIMIT 100
+        `
+        params = [ftsQuery, activePath]
+      } else {
+        sql = `
+          SELECT file_path, file_name, content, snippet(FtsFileIndex, 2, '[', ']', '...', 30) as snip, rank
+          FROM FtsFileIndex
+          WHERE FtsFileIndex MATCH simple_query(?)
+            ${wsFilter}
+          ORDER BY rank
+          LIMIT 100
+        `
+        params = [query, activePath]
+      }
+
+      const wsDb = DatabaseManager.getInstance().getWorkspaceDB(activePath)
+      const rawResults = wsDb.prepare(sql).all(...params) as unknown as (FileSearchResult & { content: string })[]
+
+      const searchTerms = query.replace(/["'+-]/g, ' ').split(/\s+/).filter(Boolean)
+      const firstTerm = searchTerms.length > 0 ? searchTerms[0].toLowerCase() : ''
+
+      const ftsResults: FileSearchResult[] = rawResults.map(r => {
+        let lineNumber = 1
+        if (firstTerm && r.content) {
+          const idx = r.content.toLowerCase().indexOf(firstTerm)
+          if (idx !== -1) {
+            const upToIdx = r.content.substring(0, idx)
+            lineNumber = (upToIdx.match(/\n/g) || []).length + 1
+          }
+        }
+
+        const { content: _content, ...rest } = r
+        return {
+          ...rest,
+          line_number: lineNumber
+        }
+      })
+
+      // RRF 混合搜索 (只针对 SQLite 中的文档)
+      const hybridDbResults = await FtsHybridSearcher.searchFiles(query, activePath, ftsResults)
+
+      const initialResults = hybridDbResults.map((item, idx) => ({
+        ...item,
+        rank: idx
+      }))
+
+      // 3. 异步启动第二阶段：后台通过 Ripgrep 检索代码，完成后 IPC 广播更新
+      this.runRipgrepAndNotify(query, activePath, hybridDbResults).catch(err => {
+        console.error('[FullTextIndex] Async Ripgrep search failed:', err)
+      })
+
+      // 立即返回第一阶段结果，保证 UI 界面立即响应，不留 Loading 空白
+      return initialResults
+
+    } catch (err) {
+      console.error('[FullTextIndex] SQLite search failed:', err)
+      return []
+    }
+  }
+
+  /**
+   * 后台异步执行 Ripgrep 搜索并向渲染进程发送更新事件
+   */
+  private async runRipgrepAndNotify(query: string, activePath: string, hybridDbResults: FileSearchResult[]) {
+    const { RipgrepService } = await import('./ripgrep-service.js')
+    const rgService = RipgrepService.getInstance()
+    const codeExts = ['.js', '.ts', '.tsx', '.jsx', '.json', '.py', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.html', '.css', '.sh', '.yaml', '.yml', '.toml', '.sql']
+    
+    console.log(`[FullTextIndex:runRipgrepAndNotify] Launching background Ripgrep search for query "${query}"`)
+    const rgMatches = await rgService.searchContent(query, activePath, codeExts)
+    
+    const rgResults: FileSearchResult[] = rgMatches.map((m, idx) => ({
+      file_path: m.filePath,
+      file_name: m.fileName,
+      snip: m.snippet,
+      rank: 1.0,
+      line_number: m.lineNumber,
+      score: 1 / (60 + idx + 1)
+    }))
+
+    // 对 Ripgrep 结果赋予标题加权得分
+    const rgResultsBoosted = rgResults.map(item => ({
+      ...item,
+      score: FtsHybridSearcher.applyTitleBoost(query, item.file_name, item.score ?? 0)
+    }))
+
+    // 合并第一阶段与第二阶段结果
+    const combined = [...hybridDbResults, ...rgResultsBoosted]
+    combined.sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+
+    const truncated = combined.slice(0, 150)
+    const finalResults = truncated.map((item, idx) => ({
+      ...item,
+      rank: idx
+    }))
+
+    // 存入缓存
+    const cacheKey = `files:${activePath}:${query}`;
+    fileSearchCache.set(cacheKey, finalResults)
+
+    // 获取全部主窗口并发送更新广播
+    const { BrowserWindow } = await import('electron')
+    const wins = BrowserWindow.getAllWindows()
+    console.log(`[FullTextIndex:runRipgrepAndNotify] Ripgrep search complete. Broadcasting update to ${wins.length} windows. Found ${finalResults.length} matches in total.`)
+    for (const win of wins) {
+      if (!win.isDestroyed() && win.webContents) {
+        win.webContents.send('fts:search-update', {
+          query,
+          workspacePath: activePath,
+          results: finalResults
+        })
+      }
+    }
+  }
+
+  public async getStatus(): Promise<IndexProgress> {
+    return this.buildProgress()
+  }
+
+  public async clearAllIndices(): Promise<void> {
+    try {
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+      const workspacePaths = new Set<string>()
+
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          workspacePaths.add(wsPath)
+        }
+      }
+
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        workspacePaths.add(initialPath)
+      }
+
+      const history = workspaceManager.getHistory()
+      for (const entry of history) {
+        if (entry.path && entry.exists && fs.existsSync(entry.path)) {
+          workspacePaths.add(entry.path)
+        }
+      }
+
+      for (const wsPath of workspacePaths) {
+        try {
+          const wsDb = DatabaseManager.getInstance().getWorkspaceDB(wsPath)
+          wsDb.prepare('DELETE FROM FtsFileIndex').run()
+          wsDb.prepare('DELETE FROM FtsAgentIndex').run()
+          wsDb.prepare('DELETE FROM FtsVectorIndex').run()
+
+          VectorSearchEngine.getEngine(wsDb, wsPath).clear()
+        } catch { /* empty */ }
+      }
+
+      this.status = 'idle'
+      this.totalNotes = 0
+      this.indexedNotes = 0
+      noteSearchCache.clear()
+      fileSearchCache.clear()
+      console.log('[FullTextIndex] All indices cleared.')
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to clear indices:', err)
+    }
+  }
+
+  public async clearNoteIndices(): Promise<void> {
+    noteSearchCache.clear()
+    console.log('[FullTextIndex] Note indices cleared.')
+  }
+
+  public async clearFileIndices(): Promise<void> {
+    try {
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+      const workspacePaths = new Set<string>()
+
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          workspacePaths.add(wsPath)
+        }
+      }
+
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        workspacePaths.add(initialPath)
+      }
+
+      const history = workspaceManager.getHistory()
+      for (const entry of history) {
+        if (entry.path && entry.exists && fs.existsSync(entry.path)) {
+          workspacePaths.add(entry.path)
+        }
+      }
+
+      for (const wsPath of workspacePaths) {
+        try {
+          const wsDb = DatabaseManager.getInstance().getWorkspaceDB(wsPath)
+          wsDb.prepare('DELETE FROM FtsFileIndex').run()
+          wsDb.prepare("DELETE FROM FtsVectorIndex WHERE entity_type = 'file'").run()
+          VectorSearchEngine.getEngine(wsDb, wsPath).clear()
+        } catch { /* empty */ }
+      }
+
+      fileSearchCache.clear()
+      console.log('[FullTextIndex] File indices cleared.')
+    } catch (err) {
+      console.error('[FullTextIndex] Failed to clear file indices:', err)
+    }
+  }
+
+  public shutdown(): void {
+    if (this.monitorInterval) {
+      clearInterval(this.monitorInterval)
+      this.monitorInterval = null
+    }
+    if (this.schedulingInterval) {
+      clearInterval(this.schedulingInterval)
+      this.schedulingInterval = null
+    }
+    if (this.worker) {
+      this.worker.terminate()
+      this.worker = null
+    }
+  }
+
+  // ==================== Agent Skills and Tools Indexing ====================
+
+  /**
+   * Index NPX Tools Whitelist
+   */
+  private isIndexingTools = false;
+
+  public async indexToolsLibrary(tools: IndexedTool[], workspacePath?: string | null): Promise<void> {
+    if (this.isIndexingTools) {
+      console.log('[FullTextIndex] Tools indexing already in progress, skipping duplicate call');
+      return;
+    }
+    this.isIndexingTools = true;
+    try {
+    console.log(`[FullTextIndex] Indexing tools library (passed: ${tools.length})...`)
+
+    const activeWorkspaces = new Set<string>()
+    if (workspacePath) {
+      activeWorkspaces.add(workspacePath)
+    } else {
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          activeWorkspaces.add(wsPath)
+        }
+      }
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        activeWorkspaces.add(initialPath)
+      }
+    }
+
+    // Get active MCP tools from McpHost
+    let mcpTools: IndexedTool[] = [];
+    try {
+      const { McpHost } = await import('../plugins/mcp-host.js');
+      mcpTools = McpHost.getInstance().listTools();
+    } catch (err) {
+      console.warn('[FullTextIndex] Failed to get MCP tools for indexing:', err);
+    }
+
+    for (const wsPath of activeWorkspaces) {
+      try {
+        const db = DatabaseManager.getInstance().getWorkspaceDB(wsPath)
+        const dbKey = wsPath
+
+        // 1. Read existing non-MCP tools to preserve them
+        const preservedTools: IndexedTool[] = [];
+        try {
+          const rows = db.prepare("SELECT meta FROM FtsAgentIndex WHERE entity_type = 'tool'").all() as { meta: string }[];
+          for (const row of rows) {
+            try {
+              const t = JSON.parse(row.meta);
+              if (t.category !== 'mcp') {
+                preservedTools.push(t);
+              }
+            } catch (_e) { /* empty */ }
+          }
+        } catch (_e) { /* empty */ }
+
+        // 2. Merge all tools (passed tools + preserved tools + active MCP tools)
+        const allToolsMap = new Map<string, IndexedTool>();
+
+        // Add preserved non-MCP tools first
+        for (const t of preservedTools) {
+          allToolsMap.set(t.name, t);
+        }
+        // Add newly passed tools (overwrite if duplicate)
+        for (const t of tools) {
+          allToolsMap.set(t.name, t);
+        }
+        // Add active MCP tools (overwrite if duplicate)
+        for (const t of mcpTools) {
+          allToolsMap.set(t.name, {
+            name: t.name,
+            description: t.description,
+            category: 'mcp',
+            package: t.pluginId,
+            inputSchema: t.inputSchema,
+            displayName: t.displayName,
+            isDynamic: t.isDynamic,
+            userQueries: t.userQueries
+          });
+        }
+
+        const mergedTools = Array.from(allToolsMap.values());
+
+        // 3. Clear existing tools in FTS and Vector index
+        db.prepare("DELETE FROM FtsAgentIndex WHERE entity_type = 'tool'").run()
+        try {
+          const existing = db.prepare("SELECT entity_id FROM FtsVectorIndex WHERE entity_type = 'tool'").all() as { entity_id: string }[]
+          const vectorEngine = VectorSearchEngine.getEngine(db, dbKey)
+          for (const item of existing) {
+            vectorEngine.delete(item.entity_id, 'tool')
+          }
+        } catch (_e) { /* empty */ }
+
+        // 4. Insert and generate vectors
+        const localAI = LocalAIService.getInstance()
+        const activeModel = localAI.getActiveEmbeddingModel()
+
+        const stmt = db.prepare(
+          `INSERT OR REPLACE INTO FtsAgentIndex (entity_id, entity_type, title, content, meta) VALUES (?, ?, ?, ?, ?)`
+        )
+
+        for (const tool of mergedTools) {
+          try {
+            const title = tool.name
+            const displayName = tool.displayName || ''
+            const description = tool.description || ''
+
+            // Extract parameter descriptions from inputSchema
+            const paramInfo: string[] = []
+            if (tool.inputSchema && tool.inputSchema.properties) {
+              for (const [propName, prop] of Object.entries(tool.inputSchema.properties)) {
+                const p = prop as { description?: string }
+                if (p.description) {
+                  paramInfo.push(`${propName}: ${p.description}`)
+                } else {
+                  paramInfo.push(propName)
+                }
+              }
+            }
+            const paramsText = paramInfo.join('\n')
+
+            // Custom synonyms/keywords to boost retrieval
+            const customKeywords: string[] = []
+            const nameLower = title.toLowerCase()
+
+            if (nameLower.includes('editor_lines') || nameLower.includes('editor_selection') || nameLower.includes('editor_chunk') || nameLower.includes('editor_content')) {
+              customKeywords.push('修改', '编辑', '替换', '优化', '重构', '这段', '那段', '这一行', '那一行', '这行', '那行', '当前行', '选区', '选中', '行数', '内容')
+            }
+            if (nameLower.includes('read_note') || nameLower.includes('list_notes') || nameLower.includes('read_file')) {
+              customKeywords.push('读取', '查看', '获取', '打开', '笔记', '内容')
+            }
+            if (nameLower.includes('search')) {
+              customKeywords.push('查找', '搜索', '定位', '匹配')
+            }
+            const customKeywordsText = customKeywords.join(' ')
+
+            // 1. Build FTS5 content
+            const userQueriesText = Array.isArray(tool.userQueries) ? tool.userQueries.join('\n') : ''
+            const content = [
+              title,
+              displayName,
+              description,
+              paramsText,
+              customKeywordsText,
+              userQueriesText,
+              tool.category || '',
+              tool.package || ''
+            ].filter(Boolean).join('\n')
+
+            const meta = JSON.stringify(tool)
+
+            stmt.run(tool.name, 'tool', title, content, meta)
+          } catch (err) {
+            console.warn(`[FullTextIndex] Failed to index tool ${tool.name} in ${wsPath}:`, err)
+          }
+        }
+      } catch (err) {
+        console.error(`[FullTextIndex] Failed to index tools library for workspace ${wsPath}:`, err)
+      }
+    }
+    console.log('[FullTextIndex] Tools indexing complete.')
+    } finally {
+      this.isIndexingTools = false;
+    }
+  }
+
+  /**
+   * Scan global and workspace paths for SKILL.md/SKILLS.md and index them
+   */
+  public async indexAllSkills(workspacePath?: string | null): Promise<void> {
+    console.log('[FullTextIndex] Scanning and indexing all Agent Skills...')
+
+    const activeWorkspaces = new Set<string>()
+    if (workspacePath) {
+      activeWorkspaces.add(workspacePath)
+    } else {
+      const { WorkspaceManager } = await import('./workspace-manager.js')
+      const workspaceManager = WorkspaceManager.getInstance()
+      for (const win of BrowserWindow.getAllWindows()) {
+        const wsPath = workspaceManager.getPathForWindow(win)
+        if (wsPath && fs.existsSync(wsPath)) {
+          activeWorkspaces.add(wsPath)
+        }
+      }
+      const initialPath = workspaceManager.getInitialWorkspacePath()
+      if (initialPath && fs.existsSync(initialPath)) {
+        activeWorkspaces.add(initialPath)
+      }
+    }
+
+    const skillDirs = new Set<string>()
+
+    // 1. Scan global skills
+    await this.collectSkillDirs(SKILLS_DIR, skillDirs)
+
+    // 2. Scan workspace skills
+    for (const wsPath of activeWorkspaces) {
+      await this.collectSkillDirs(join(wsPath, '.skills'), skillDirs)
+      await this.collectSkillDirs(join(wsPath, 'skills'), skillDirs)
+    }
+
+    // 3. Scan plugin skills
+    try {
+      if (fs.existsSync(PLUGINS_DIR)) {
+        const pluginEntries = await fs.promises.readdir(PLUGINS_DIR, { withFileTypes: true })
+        for (const entry of pluginEntries) {
+          if (entry.isDirectory()) {
+            const pluginSkillsDir = join(PLUGINS_DIR, entry.name, 'skills')
+            await this.collectSkillDirs(pluginSkillsDir, skillDirs)
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[FullTextIndex] Failed to scan plugin skills:', err)
+    }
+
+    console.log(`[FullTextIndex] Found ${skillDirs.size} skill directories to index.`)
+
+    const localAI = LocalAIService.getInstance()
+    const activeModel = localAI.getActiveEmbeddingModel()
+
+    for (const wsPath of activeWorkspaces) {
+      try {
+        const db = DatabaseManager.getInstance().getWorkspaceDB(wsPath)
+        const dbKey = wsPath
+
+        // 1. Gather info for all scanned skills
+        const scannedSkillsInfo: Array<{
+          dir: string;
+          name: string;
+          mdPath: string;
+          mtimeMs: number;
+        }> = [];
+
+        for (const skillDir of skillDirs) {
+          const folderName = basename(skillDir)
+          let skillMdPath = join(skillDir, 'SKILL.md')
+          if (!fs.existsSync(skillMdPath)) {
+            skillMdPath = join(skillDir, 'SKILLS.md')
+          }
+          if (!fs.existsSync(skillMdPath)) continue
+
+          try {
+            const stats = fs.statSync(skillMdPath);
+            scannedSkillsInfo.push({
+              dir: skillDir,
+              name: folderName,
+              mdPath: skillMdPath,
+              mtimeMs: stats.mtimeMs,
+            });
+          } catch { /* empty */ }
+        }
+
+        // 2. Compare with existing skills to avoid unnecessary re-indexing
+        let isIdentical = false;
+        try {
+          const rows = db.prepare("SELECT entity_id, meta FROM FtsAgentIndex WHERE entity_type = 'skill'").all() as { entity_id: string; meta: string }[];
+          if (rows.length === scannedSkillsInfo.length) {
+            const dbSkillsMap = new Map<string, IndexedSkillMeta>();
+            for (const r of rows) {
+              try {
+                dbSkillsMap.set(r.entity_id, JSON.parse(r.meta));
+              } catch { /* empty */ }
+            }
+
+            isIdentical = true;
+            for (const skill of scannedSkillsInfo) {
+              const dbSkill = dbSkillsMap.get(skill.name);
+              if (!dbSkill || dbSkill.modifiedAt !== skill.mtimeMs) {
+                isIdentical = false;
+                break;
+              }
+            }
+
+            if (isIdentical && localAI.isWorkerRunning()) {
+              const vectorRows = db.prepare("SELECT entity_id FROM FtsVectorIndex WHERE entity_type = 'skill'").all() as { entity_id: string }[];
+              const vectorIds = new Set(vectorRows.map(r => r.entity_id));
+              for (const skill of scannedSkillsInfo) {
+                if (!vectorIds.has(skill.name)) {
+                  isIdentical = false;
+                  console.log(`[FullTextIndex] Skill "${skill.name}" is missing vector representation. Re-indexing to generate vector.`);
+                  break;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('[FullTextIndex] Failed to compare skills with database:', e);
+        }
+
+        if (isIdentical) {
+          console.log(`[FullTextIndex] Skills in workspace ${wsPath} have not changed. Skipping indexing.`);
+          continue;
+        }
+
+        // Clear existing skills in FTS and Vector index since there are changes
+        db.prepare("DELETE FROM FtsAgentIndex WHERE entity_type = 'skill'").run()
+        try {
+          const existing = db.prepare("SELECT entity_id FROM FtsVectorIndex WHERE entity_type = 'skill'").all() as { entity_id: string }[]
+          const vectorEngine = VectorSearchEngine.getEngine(db, dbKey)
+          for (const item of existing) {
+            vectorEngine.delete(item.entity_id, 'skill')
+          }
+        } catch (_e) { /* empty */ }
+
+        const stmt = db.prepare(
+          `INSERT OR REPLACE INTO FtsAgentIndex (entity_id, entity_type, title, content, meta) VALUES (?, ?, ?, ?, ?)`
+        )
+
+        for (const skill of scannedSkillsInfo) {
+          try {
+            const folderName = skill.name
+            const skillMdPath = skill.mdPath
+            const rawContent = fs.readFileSync(skillMdPath, 'utf-8')
+
+            // Parse frontmatter
+            const fm = this.parseYamlFrontmatter(rawContent)
+            const title = fm.name || folderName
+            const description = fm.description || ''
+
+            // FTS 索引只存搜索元数据（和工具保持一致），完整指令通过 use_skill 加载
+            const ftsContent = [
+              title,
+              description,
+              fm.capabilities ? Object.keys(fm.capabilities).join(' ') : '',
+              folderName,
+            ].filter(Boolean).join('\n').slice(0, 2000)
+            const meta = JSON.stringify({
+              path: skill.dir,
+              name: folderName,
+              displayName: title,
+              description,
+              modifiedAt: skill.mtimeMs,
+              ...fm
+            })
+
+            stmt.run(folderName, 'skill', title, ftsContent, meta)
+          } catch (err) {
+            console.warn(`[FullTextIndex] Failed to index skill from ${skill.dir} in ${wsPath}:`, err)
+          }
+        }
+      } catch (err) {
+        console.error(`[FullTextIndex] Failed to index skills for workspace ${wsPath}:`, err)
+      }
+    }
+    console.log('[FullTextIndex] Skills indexing complete.')
+  }
+
+  private async collectSkillDirs(parentDir: string, skillDirs: Set<string>): Promise<void> {
+    if (!fs.existsSync(parentDir)) return
+    try {
+      const entries = await fs.promises.readdir(parentDir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          FullTextIndexManager.collectSkillPath(join(parentDir, entry.name), skillDirs)
+        }
+      }
+    } catch (e) {
+      console.warn(`[FullTextIndex] Failed to read parentDir: ${parentDir}`, e)
+    }
+  }
+
+  private static collectSkillPath(dir: string, skillDirs: Set<string>): void {
+    if (fs.existsSync(join(dir, 'SKILL.md')) || fs.existsSync(join(dir, 'SKILLS.md'))) {
+      skillDirs.add(dir)
+      return
+    }
+    // Deep scanning (max depth 2)
+    try {
+      const subs = fs.readdirSync(dir, { withFileTypes: true })
+      for (const sub of subs) {
+        if (sub.isDirectory()) {
+          const subPath = join(dir, sub.name)
+          if (fs.existsSync(join(subPath, 'SKILL.md')) || fs.existsSync(join(subPath, 'SKILLS.md'))) {
+            skillDirs.add(subPath)
+          }
+        }
+      }
+    } catch { /* empty */ }
+  }
+
+  private parseYamlFrontmatter(content: string): Record<string, string> {
+    const match = content.match(/^---\s*\n([\s\S]*?)\n---/)
+    if (!match) return {}
+    const yaml = match[1]
+    const result: Record<string, string> = {}
+    for (const line of yaml.split('\n')) {
+      const colonIdx = line.indexOf(':')
+      if (colonIdx === -1) continue
+      const key = line.substring(0, colonIdx).trim().toLowerCase()
+      const val = line.substring(colonIdx + 1).trim().replace(/^["']|["']$/g, '')
+      if (key === 'name') result.name = val
+      else if (key === 'description') result.description = val
+      else result[key] = val
+    }
+    return result
+  }
+}

@@ -1,0 +1,33 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md b/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md
+index f241a83..b2f3441 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md
+@@ -190,6 +190,28 @@ uuid: scripts/generate-uuid.js 生成的纯数字
+ }
+ ```
+ 
++### keybindings — 快捷键与硬件手势绑定 ✅
++
++声明插件的默认快捷键与 C++ 硬件手势（用户可在偏好设置中自定义覆盖）：
++
++```json
++{
++  "contributes": {
++    "keybindings": [
++      {
++        "command": "com.berrytrace.plugin.voice-agents:start-listening",
++        "title": "Voice Agent 对话唤醒",
++        "key": "Option+Space",
++        "mac": "Option+Space",
++        "win": "Alt+Space",
++        "gesture": "combo:fn+space",
++        "when": "global"
++      }
++    ]
++  }
++}
++```
++
+ ---
+ 
+ ## `contributes` — 计划中的声明项

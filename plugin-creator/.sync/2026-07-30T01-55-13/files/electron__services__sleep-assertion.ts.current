@@ -1,0 +1,68 @@
+/**
+ * sleep-assertion.ts — System Power & Sleep Assertion Manager
+ *
+ * Prevents OS sleep (macOS / Windows / Linux) while long-running Agent tasks
+ * are active, and automatically releases sleep assertions when idle.
+ */
+
+import { powerSaveBlocker } from 'electron';
+
+export class SystemSleepAssertionManager {
+  private static blockerId: number | null = null;
+  private static activeTaskCount = 0;
+
+  /**
+   * Acquire a power save blocker assertion when an agent task starts.
+   */
+  public static acquire(reason = 'BerryTrace AI Agent is running a background task') {
+    this.activeTaskCount++;
+    if (this.blockerId === null) {
+      try {
+        // 'prevent-app-suspension' prevents system sleep while keeping screen behavior normal
+        this.blockerId = powerSaveBlocker.start('prevent-app-suspension');
+        console.log(`⚡ [SleepAssertion] Acquired powerSaveBlocker (id=${this.blockerId}) for reason: "${reason}". Active tasks: ${this.activeTaskCount}`);
+      } catch (err) {
+        console.error('[SleepAssertion] Failed to acquire powerSaveBlocker:', err);
+      }
+    }
+  }
+
+  /**
+   * Release power save blocker assertion when an agent task completes or cancels.
+   */
+  public static release() {
+    if (this.activeTaskCount > 0) {
+      this.activeTaskCount--;
+    }
+
+    if (this.activeTaskCount === 0 && this.blockerId !== null) {
+      try {
+        if (powerSaveBlocker.isStarted(this.blockerId)) {
+          powerSaveBlocker.stop(this.blockerId);
+          console.log(`🌙 [SleepAssertion] Released powerSaveBlocker (id=${this.blockerId}). System sleep restored.`);
+        }
+      } catch (err) {
+        console.error('[SleepAssertion] Failed to release powerSaveBlocker:', err);
+      } finally {
+        this.blockerId = null;
+      }
+    }
+  }
+
+  /**
+   * Reset all assertions (e.g. on app shutdown)
+   */
+  public static reset() {
+    this.activeTaskCount = 0;
+    if (this.blockerId !== null) {
+      try {
+        if (powerSaveBlocker.isStarted(this.blockerId)) {
+          powerSaveBlocker.stop(this.blockerId);
+        }
+      } catch (e) {
+        // ignore
+      }
+      this.blockerId = null;
+    }
+  }
+}

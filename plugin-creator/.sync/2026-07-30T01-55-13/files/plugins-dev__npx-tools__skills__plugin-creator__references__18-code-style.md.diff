@@ -1,0 +1,16 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/18-code-style.md b/plugins-dev/npx-tools/skills/plugin-creator/references/18-code-style.md
+index 300bba8..4a776aa 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/18-code-style.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/18-code-style.md
+@@ -43,4 +43,8 @@ To help AI agents locate API implementations instantly and troubleshoot errors w
+ 3. Native platform feature?   → use it
+ 4. Installed dependency?      → use it
+ 5. One line?                  → one line
+-6. Only then: the minimum that works
+\ No newline at end of file
++6. Only then: the minimum that works
++
++## 9. React View 容器隔离与 `createRoot` SSOT 防线
++- **严禁对宿主 `this.container` 直接 `createRoot`**：在 `View` 视图扩展子类中，严禁在 `onOpen` 中直接使用 `createRoot(this.container)`。
++- **强制使用内部子 DOM (`subContainer`)**：必须通过 `this.subContainer = document.createElement('div')` 追加到 `this.container` 中作为隔离层再进行 `createRoot`，并在 `onClose` 中显式清空并拔除子元素。避免宿主多次 `onOpen` 或 `onClose` 异步微任务卸载时引发 React 18 重复挂载异常。
+\ No newline at end of file

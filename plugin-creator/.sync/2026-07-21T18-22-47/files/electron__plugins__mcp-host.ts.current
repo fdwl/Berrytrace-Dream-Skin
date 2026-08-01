@@ -1,0 +1,383 @@
+
+import { ElectronMainWindow } from '../windows/main-window';
+
+export interface McpToolDeclaration {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  pluginId: string;
+  displayName?: string;
+  /** 由插件运行时动态注册（非 plugin.json 声明），relevance-filter 直接放行 */
+  isDynamic?: boolean;
+  userQueries?: string[];
+}
+
+export interface McpResourceDeclaration {
+  uri: string;
+  name: string;
+  mimeType?: string;
+  description?: string;
+  pluginId: string;
+}
+
+export class McpHost {
+  private static instance: McpHost;
+  private tools = new Map<string, McpToolDeclaration>();
+  private resources = new Map<string, McpResourceDeclaration>();
+  private systemPrompts = new Map<string, { pluginId: string; promptText: string }>();
+  
+  // Callback to execute tool inside sandboxed utilityProcess
+  private toolHandlers = new Map<string, (args: Record<string, unknown>) => Promise<unknown>>();
+
+  private activeState = {
+    fileExtension: ''
+  };
+
+  public setActiveState(state: { fileExtension: string }) {
+    console.log(`[McpHost] Updating active state:`, state);
+    this.activeState = { ...this.activeState, ...state };
+  }
+
+  private constructor() {}
+
+  public static getInstance(): McpHost {
+    if (!McpHost.instance) {
+      McpHost.instance = new McpHost();
+    }
+    return McpHost.instance;
+  }
+
+  public registerPluginMcp(pluginId: string, mcpConfig: Record<string, unknown>, sendToSandbox: (channel: string, data: Record<string, unknown>) => void) {
+    if (!mcpConfig) return;
+
+    // Register Tools
+    if (Array.isArray(mcpConfig.tools)) {
+      mcpConfig.tools.forEach((tool: { name: string; description: string; inputSchema: Record<string, unknown>; displayName?: string; userQueries?: string[] }) => {
+        console.log(`[McpHost] Registering tool "${tool.name}" from plugin "${pluginId}"`);
+        this.tools.set(tool.name, {
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          pluginId,
+          displayName: tool.displayName,
+          userQueries: tool.userQueries
+        });
+
+        // Set up the router execution callback
+        this.toolHandlers.set(tool.name, async (args) => {
+          return new Promise((resolve, reject) => {
+            const token = Math.floor(Math.random() * 1000000);
+
+            // Register this pending call
+            (global as unknown as Record<string, unknown>).pendingMcpCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls || new Map();
+            ((global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>).set(token, { resolve, reject });
+
+            // Send message to the sandbox process
+            console.log(`[McpHost] sendToSandbox mcp:call-tool: tool=${tool.name}, token=${token}, args=${JSON.stringify(args)}`);
+            sendToSandbox('mcp:call-tool', {
+              toolName: tool.name,
+              args,
+              token
+            });
+
+            // Set timeout for safety (30 minutes max to allow interactive CLI logins)
+            setTimeout(() => {
+              const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+              const pending = pendingCalls?.get(token);
+              if (pending) {
+                pending.reject(new Error(`MCP Tool call timeout: ${tool.name}`));
+                pendingCalls?.delete(token);
+              }
+            }, 30 * 60 * 1000);
+          });
+        });
+      });
+    }
+
+    // Register Resources
+    if (Array.isArray(mcpConfig.resources)) {
+      mcpConfig.resources.forEach((res: { name: string; uri: string; mimeType?: string; description?: string }) => {
+        console.log(`[McpHost] Registering resource "${res.name}" (${res.uri}) from plugin "${pluginId}"`);
+        this.resources.set(res.uri, {
+          uri: res.uri,
+          name: res.name,
+          mimeType: res.mimeType,
+          description: res.description,
+          pluginId
+        });
+      });
+    }
+  }
+
+  public unregisterPluginMcp(pluginId: string) {
+    for (const [name, tool] of this.tools.entries()) {
+      if (tool.pluginId === pluginId) {
+        this.tools.delete(name);
+        this.toolHandlers.delete(name);
+      }
+    }
+    for (const [uri, res] of this.resources.entries()) {
+      if (res.pluginId === pluginId) {
+        this.resources.delete(uri);
+      }
+    }
+    for (const [promptId, item] of this.systemPrompts.entries()) {
+      if (item.pluginId === pluginId) {
+        this.systemPrompts.delete(promptId);
+      }
+    }
+  }
+
+  public listTools(): McpToolDeclaration[] {
+    const { PluginManager } = require('./plugin-manager');
+    const allTools = Array.from(this.tools.values());
+    const currentExt = (this.activeState.fileExtension || '').toLowerCase().replace(/^\./, '');
+
+    // 注入已注册的本地工作流作为虚拟 MCP 工具
+    try {
+      const { WorkflowEngine } = require('./workflow-engine');
+      const workflows = WorkflowEngine.getInstance().list();
+      workflows.forEach((wf: any) => {
+        const properties: Record<string, any> = {};
+        const required: string[] = [];
+        if (wf.inputs) {
+          for (const [key, inputDef] of Object.entries(wf.inputs) as any) {
+            properties[key] = {
+              type: inputDef.type || 'string',
+              description: inputDef.description || '',
+            };
+            if (inputDef.required) {
+              required.push(key);
+            }
+          }
+        }
+
+        allTools.push({
+          name: wf.id,
+          displayName: wf.name || wf.id,
+          description: `【本地 SOP 工作流】${wf.description || ''}。执行此工具将按顺序运行工作流的各个步骤。`,
+          inputSchema: {
+            type: 'object',
+            properties,
+            required,
+          },
+          pluginId: 'workflow-engine',
+        });
+      });
+    } catch (err) {
+      console.warn('[McpHost] Failed to list workflows as mcp tools:', err);
+    }
+
+    return allTools.filter(tool => {
+      // Host tools have pluginId 'berrytrace.host' or 'system' or 'berrytrace' -> always allow
+      if (tool.pluginId === 'berrytrace.host' || tool.pluginId === 'system' || tool.pluginId === 'berrytrace' || tool.pluginId === 'workflow-engine') {
+        return true;
+      }
+
+      const pm = PluginManager.getInstance();
+
+      // Check if the plugin is currently enabled
+      if (!pm.isPluginEnabled(tool.pluginId)) {
+        return false;
+      }
+
+      // If active, always expose all registered tools
+      if (pm.isPluginActive(tool.pluginId)) {
+        return true;
+      }
+      
+      const plugin = pm.getPlugin(tool.pluginId);
+      if (!plugin) return true;
+      
+      const events = plugin.manifest.activationEvents || (plugin.manifest.mcp as Record<string, any> | undefined)?.activationEvents;
+      if (!events || !Array.isArray(events) || events.length === 0) {
+        return true; // No scoping declared, expose by default
+      }
+      
+      // Match rules: e.g. "onFileExtension:md" or "onMcpCall:toolName"
+      return events.some((event: string) => {
+        if (event === '*') return true;
+        const [type, val] = event.split(':');
+        if (type === 'onFileExtension' && val) {
+          return val.toLowerCase() === currentExt;
+        }
+        if (type === 'onMcpCall' && val) {
+          return val === tool.name;
+        }
+        return false;
+      });
+    });
+  }
+
+  public listResources(): McpResourceDeclaration[] {
+    return Array.from(this.resources.values());
+  }
+
+  public hasToolHandler(toolName: string): boolean {
+    if (!toolName) return false;
+    let resolvedName = toolName;
+    if (toolName.includes(':')) {
+      resolvedName = toolName.split(':').pop() || toolName;
+    }
+    return this.toolHandlers.has(resolvedName);
+  }
+
+  public async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+    if (!toolName) throw new Error('Tool name is undefined or empty');
+    let resolvedName = toolName;
+    if (toolName.includes(':')) {
+      resolvedName = toolName.split(':').pop() || toolName;
+    }
+
+    // 优先拦截工作流调用
+    try {
+      const { WorkflowEngine } = require('./workflow-engine');
+      const wf = WorkflowEngine.getInstance().get(resolvedName);
+      if (wf) {
+        console.log(`[McpHost] Intercepting MCP call to execute workflow "${resolvedName}"...`);
+        const result = await WorkflowEngine.getInstance().execute(resolvedName, args, 'direct');
+        if (!result.success) {
+          throw new Error(result.error || '工作流执行失败');
+        }
+        return result.finalOutput || '工作流执行成功完成！';
+      }
+    } catch (err: any) {
+      console.error(`[McpHost] Failed to execute workflow tool "${resolvedName}":`, err);
+      throw err;
+    }
+
+    let handler = this.toolHandlers.get(resolvedName);
+    console.log(`[McpHost] callTool: toolName=${toolName}, resolvedName=${resolvedName}, hasHandler=${!!handler}`);
+    
+    // Lazy-loaded plugin: tool not registered yet → load plugin on-demand, then retry
+    if (!handler) {
+      const toolDecl = this.tools.get(resolvedName);
+      if (toolDecl && toolDecl.pluginId && toolDecl.pluginId !== 'berrytrace.host' && toolDecl.pluginId !== 'system') {
+        const { PluginManager } = require('./plugin-manager');
+        const pm = PluginManager.getInstance();
+        if (pm.isPluginEnabled(toolDecl.pluginId)) {
+          console.log(`[McpHost] Tool "${resolvedName}" not loaded, triggering lazy load for plugin "${toolDecl.pluginId}"...`);
+          await pm.ensurePluginLoaded(toolDecl.pluginId);
+          handler = this.toolHandlers.get(resolvedName);
+        }
+      }
+    }
+    
+    if (!handler) {
+      throw new Error(`MCP Tool "${toolName}" not found or has no active handler.`);
+    }
+    return handler(args);
+  }
+
+  /**
+   * Register a tool that runs directly in the main process (no sandbox IPC needed).
+   * Used by NoteTools and other built-in host tools.
+   */
+  public registerHostTool(
+    declaration: Omit<McpToolDeclaration, 'pluginId'>,
+    handler: (args: Record<string, unknown>) => Promise<unknown>,
+    pluginId = 'berrytrace.host',
+  ): void {
+    console.log(`[McpHost] Registering host tool: ${declaration.name}`);
+    this.tools.set(declaration.name, { ...declaration, pluginId });
+    this.toolHandlers.set(declaration.name, handler);
+  }
+
+  public registerDynamicRendererTool(
+    pluginId: string,
+    tool: { name: string; description: string; inputSchema: Record<string, unknown>; displayName?: string; userQueries?: string[] }
+  ): void {
+    console.log(`[McpHost] Registering dynamic renderer tool "${tool.name}" from plugin "${pluginId}"`);
+    this.tools.set(tool.name, {
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      pluginId,
+      displayName: tool.displayName,
+      isDynamic: true,  // 标记为运行时动态注册，relevance-filter 直接放行
+      userQueries: tool.userQueries
+    });
+
+    this.toolHandlers.set(tool.name, async (args) => {
+      return new Promise((resolve, reject) => {
+        const token = Math.floor(Math.random() * 1000000);
+
+        // Register this pending call
+        (global as unknown as Record<string, unknown>).pendingMcpCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls || new Map();
+        ((global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>).set(token, { resolve, reject });
+
+        // Route call to the active main window renderer
+        const win = ElectronMainWindow.getInstance().getWindow();
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('plugins:mcp-call-tool', {
+            pluginId,
+            toolName: tool.name,
+            args,
+            token
+          });
+        } else {
+          reject(new Error(`Main window not available to route dynamic MCP tool call for plugin "${pluginId}"`));
+          const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+          pendingCalls?.delete(token);
+          return;
+        }
+
+        // Set timeout for safety (30 minutes max to allow interactive CLI logins)
+        setTimeout(() => {
+          const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+          const pending = pendingCalls?.get(token);
+          if (pending) {
+            pending.reject(new Error(`MCP Dynamic Tool call timeout: ${tool.name}`));
+            pendingCalls?.delete(token);
+          }
+        }, 30 * 60 * 1000);
+      });
+    });
+  }
+
+  public unregisterDynamicRendererTool(pluginId: string, toolName: string): void {
+    console.log(`[McpHost] Unregistering dynamic renderer tool "${toolName}" from plugin "${pluginId}"`);
+    const tool = this.tools.get(toolName);
+    if (tool && tool.pluginId === pluginId) {
+      this.tools.delete(toolName);
+      this.toolHandlers.delete(toolName);
+    }
+  }
+
+  public registerSystemPrompt(pluginId: string, promptId: string, promptText: string): void {
+    console.log(`[McpHost] Registering system prompt "${promptId}" from plugin "${pluginId}"`);
+    this.systemPrompts.set(promptId, { pluginId, promptText });
+  }
+
+  public unregisterSystemPrompt(pluginId: string, promptId: string): void {
+    console.log(`[McpHost] Unregistering system prompt "${promptId}" from plugin "${pluginId}"`);
+    this.systemPrompts.delete(promptId);
+  }
+
+  public listSystemPrompts(): string[] {
+    const { PluginManager } = require('./plugin-manager');
+    const prompts: string[] = [];
+    for (const [_, item] of this.systemPrompts.entries()) {
+      if (PluginManager.getInstance().isPluginActive(item.pluginId)) {
+        prompts.push(item.promptText);
+      }
+    }
+    return prompts;
+  }
+
+  // Handle replies returning from sandbox process
+  public handleSandboxResponse(token: number, success: boolean, result: unknown, errorMsg?: string) {
+    const pendingCalls = (global as unknown as Record<string, unknown>).pendingMcpCalls as Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }> | undefined;
+    if (!pendingCalls) return;
+
+    const call = pendingCalls.get(token);
+    if (call) {
+      if (success) {
+        call.resolve(result);
+      } else {
+        call.reject(new Error(errorMsg || 'Tool execution failed inside sandbox'));
+      }
+      pendingCalls.delete(token);
+    }
+  }
+}

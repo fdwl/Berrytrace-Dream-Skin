@@ -1,0 +1,98 @@
+diff --git a/electron/services/local-ai-service.ts b/electron/services/local-ai-service.ts
+index b8efdf8..187fb5c 100644
+--- a/electron/services/local-ai-service.ts
++++ b/electron/services/local-ai-service.ts
+@@ -1,10 +1,11 @@
+-import { app, utilityProcess, UtilityProcess, ipcMain } from 'electron';
++import type { UtilityProcess} from 'electron';
++import { app, utilityProcess, ipcMain } from 'electron';
+ import * as path from 'path';
+ import * as fs from 'fs';
+ import * as crypto from 'crypto';
+ import * as child_process from 'child_process';
+ import { net } from 'electron';
+-import { AITaskRequest, AITaskResponse, AITaskType } from '../workers/local-ai.worker';
++import type { AITaskRequest, AITaskResponse, AITaskType } from '../workers/local-ai.worker';
+ import { fileURLToPath } from 'url';
+ import { EventEmitter } from 'events';
+ import { getModelsRootDir } from '../config/paths';
+@@ -37,6 +38,15 @@ export class LocalAIService extends EventEmitter {
+     super();
+     this.ensureModelDir();
+     this.registerGenericIpcHandlers();
++    this.registerIpcHandlers();
++
++    // Register StorageMigrationService handlers early
++    import('./storage-migration-service.js').then(({ StorageMigrationService }) => {
++      StorageMigrationService.getInstance().registerIpcHandlers();
++      console.log('[LocalAIService] StorageMigrationService handlers registered early.');
++    }).catch((err) => {
++      console.error('[LocalAIService] Failed to load StorageMigrationService early:', err);
++    });
+ 
+     app.on('before-quit', () => {
+       this.isQuitting = true;
+@@ -45,14 +55,18 @@ export class LocalAIService extends EventEmitter {
+         try {
+           this.child.kill();
+           console.log('[LocalAIService] Killed LocalAIWorker child process.');
+-        } catch (e) {}
++        } catch (e) {
++          // ignore
++        }
+         this.child = null;
+       }
+       for (const [key, proc] of this.spawnedProcesses.entries()) {
+         try {
+           proc.kill();
+           console.log(`[LocalAIService] Killed spawned process: ${key}`);
+-        } catch (e) {}
++        } catch (e) {
++          // ignore
++        }
+       }
+       this.spawnedProcesses.clear();
+     });
+@@ -238,14 +252,18 @@ export class LocalAIService extends EventEmitter {
+     if (this.child) {
+       try {
+         this.child.kill();
+-      } catch (e) {}
++      } catch (e) {
++        // ignore
++      }
+       this.child = null;
+     }
+     for (const [key, proc] of this.spawnedProcesses.entries()) {
+       try {
+         proc.kill();
+         console.log(`[LocalAIService] Suspended spawned process: ${key}`);
+-      } catch (e) {}
++      } catch (e) {
++        // ignore
++      }
+     }
+     this.spawnedProcesses.clear();
+   }
+@@ -261,7 +279,9 @@ export class LocalAIService extends EventEmitter {
+     if (this.child) {
+       try {
+         this.child.kill();
+-      } catch (e) {}
++      } catch (e) {
++        // ignore
++      }
+       this.child = null;
+     }
+ 
+@@ -454,7 +474,9 @@ export class LocalAIService extends EventEmitter {
+       try {
+         if (fs.existsSync(modelFile)) await fs.promises.unlink(modelFile);
+         if (fs.existsSync(vocabFile)) await fs.promises.unlink(vocabFile);
+-      } catch (e) {}
++      } catch (e) {
++        // ignore
++      }
+     } finally {
+       this.isDownloading = false;
+     }

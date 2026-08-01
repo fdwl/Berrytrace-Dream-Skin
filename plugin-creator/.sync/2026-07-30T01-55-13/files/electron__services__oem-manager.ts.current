@@ -1,0 +1,161 @@
+import fs from 'fs';
+import path from 'path';
+import { app, ipcMain } from 'electron';
+
+export interface OEMBrowserPolicy {
+  forceWorkspaceBrowser?: boolean;
+  disableExternalBrowser?: boolean;
+  preLoginUrl?: string;
+  workspaceBrowserAutoOpen?: boolean;
+  defaultWorkspaceUrl?: string;
+}
+
+export interface OEMConfig {
+  oemId: string;
+  appName: string;
+  appId: string;
+  apiGateway: string;
+  logoPath?: string;
+  splashPath?: string;
+  iconsDir?: string;
+  builtinPlugins: string[];
+  browserPolicy?: OEMBrowserPolicy;
+}
+
+const DEFAULT_CONFIG: OEMConfig = {
+  oemId: 'default',
+  appName: '莓莓印记',
+  appId: 'com.getdear.berrytracemac',
+  apiGateway: 'https://api.getdear.cn',
+  builtinPlugins: []
+};
+
+class OEMManager {
+  private static instance: OEMManager;
+  private config: OEMConfig | null = null;
+
+  private constructor() {
+    this.loadConfig();
+  }
+
+  public static getInstance(): OEMManager {
+    if (!OEMManager.instance) {
+      OEMManager.instance = new OEMManager();
+    }
+    return OEMManager.instance;
+  }
+
+  /**
+   * 加载 OEM 配置文件
+   * 生产环境下：优先读取应用包内的 oem.config.json
+   * 开发环境下：读取项目根目录下的 oem.config.json
+   */
+  private loadConfig(): void {
+    const configName = 'oem.config.json';
+    
+    // 尝试多个可能存在配置文件的路径
+    const pathsToSearch = [
+      // 1. 开发环境项目根目录 / 生产环境打包后的 Resources 目录
+      path.join(process.cwd(), configName),
+      path.join(app.getAppPath(), configName),
+      path.join(path.dirname(app.getPath('exe')), configName),
+    ];
+
+    for (const p of pathsToSearch) {
+      if (fs.existsSync(p)) {
+        try {
+          const content = fs.readFileSync(p, 'utf-8');
+          this.config = JSON.parse(content);
+          console.log(`[OEMManager] Successfully loaded OEM config from: ${p}`);
+          break;
+        } catch (e) {
+          console.error(`[OEMManager] Failed to parse OEM config at ${p}:`, e);
+        }
+      }
+    }
+
+    if (!this.config) {
+      console.log('[OEMManager] No custom oem.config.json found, using default configuration.');
+      this.config = { ...DEFAULT_CONFIG };
+    }
+  }
+
+  public getConfig(): OEMConfig {
+    if (!this.config) {
+      this.loadConfig();
+    }
+    return this.config || { ...DEFAULT_CONFIG };
+  }
+
+  public getOEMLogoPath(): string | null {
+    const config = this.getConfig();
+    if (!config.logoPath) return null;
+
+    const filename = path.basename(config.logoPath);
+    return app.isPackaged
+      ? path.join(app.getAppPath(), 'dist', filename)
+      : path.join(app.getAppPath(), 'public', filename);
+  }
+
+  /**
+   * 注册 IPC 监听
+   */
+  public registerIpcHandlers(): void {
+    ipcMain.handle('oem:get-config', () => {
+      return this.getConfig();
+    });
+  }
+
+  /**
+   * 获取系统中所有已知 OEM 配置文件中声明的所有内置/专有插件 ID 集合
+   */
+  public getAllOEMBuiltinPlugins(): Set<string> {
+    const set = new Set<string>();
+
+    // 优先加载当前已解析的 OEM 配置中的 builtinPlugins 声明
+    const currentConfig = this.getConfig();
+    if (Array.isArray(currentConfig.builtinPlugins)) {
+      currentConfig.builtinPlugins.forEach(id => {
+        if (typeof id === 'string' && id.trim()) set.add(id.trim());
+      });
+    }
+
+    try {
+      const searchDirs = [
+        process.cwd(),
+        app.getAppPath(),
+        path.dirname(app.getPath('exe')),
+      ];
+
+      for (const dir of searchDirs) {
+        if (!dir || !fs.existsSync(dir)) continue;
+        try {
+          const files = fs.readdirSync(dir);
+          for (const file of files) {
+            if (file.startsWith('oem.') && file.endsWith('.json')) {
+              try {
+                const content = fs.readFileSync(path.join(dir, file), 'utf-8');
+                const parsed = JSON.parse(content);
+                if (Array.isArray(parsed.builtinPlugins)) {
+                  parsed.builtinPlugins.forEach((id: string) => {
+                    if (typeof id === 'string') set.add(id);
+                  });
+                }
+              } catch {
+                // 忽略个别损坏配置的解析错误
+              }
+            }
+          }
+        } catch {
+          // 忽略目录读取错误
+        }
+      }
+    } catch (e) {
+      console.warn('[OEMManager] Failed to scan OEM config files for builtin plugins:', e);
+    }
+
+    return set;
+  }
+}
+
+export const oemManager = OEMManager.getInstance();

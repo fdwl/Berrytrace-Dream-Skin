@@ -1,0 +1,551 @@
+import { DatabaseSync } from 'node:sqlite'
+import { app, net } from 'electron'
+import { join, dirname, basename } from 'path'
+import * as fs from 'fs'
+
+import AdmZip from 'adm-zip'
+import { fileURLToPath } from 'url'
+// 延迟加载 pinyin-pro 分词模块（~400KB），仅在数据库迁移时使用
+// 避免将 pinyin-pro 打入主进程 db-manager chunk（456KB → ~50KB）
+let _wordsModule: typeof import('../../src/utils/words') | null = null
+async function getWordsModule() {
+  if (!_wordsModule) _wordsModule = await import('../../src/utils/words')
+  return _wordsModule
+}
+import { WORKSPACE_DIR_NAME, WORKSPACE_META_FILE_NAME } from '../../src/config/constants'
+import { GLOBAL_MIGRATIONS, WORKSPACE_MIGRATIONS, runMigrations, createGlobalTables, createWorkspaceTables } from './db-migrations'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+
+export type SQLInputValue = null | number | bigint | string | NodeJS.ArrayBufferView;
+
+interface DatabaseWithPrepare {
+  prepare(sql: string, options?: { readBigInts?: boolean }): {
+    all(...params: SQLInputValue[]): unknown[];
+  };
+}
+
+/**
+ * 数据库管理器（支持多数据库）
+ * - 全局数据库：存储在 userData，存放用户、workspace 列表等全局数据
+ * - Workspace 数据库：存储在 .berrytrace/workspace.db，存放该 workspace 的笔记、索引等
+ */
+export class DatabaseManager {
+  private static instance: DatabaseManager
+
+  // 全局数据库（用户、workspace 列表、已安装应用等）
+  private globalDB: DatabaseSync | null = null
+
+  // Workspace 数据库缓存（workspacePath -> DatabaseSync）
+  private workspaceDBs = new Map<string, { db: DatabaseSync; path: string }>()
+
+  // DB 就绪状态跟踪（支持 whenReady() 等待）
+  private readyPromise: Promise<void> | null = null
+  private readyResolve: (() => void) | null = null
+
+  private constructor() {}
+
+  /**
+   * DB 是否已完成初始化。
+   * 用于启动早期快速判断，避免 getGlobalDB() throw。
+   */
+  public isReady(): boolean {
+    return this.globalDB !== null
+  }
+
+  /**
+   * 返回一个 Promise，在 DB 初始化完成后 resolve。
+   * 多次调用返回同一个 Promise。DB 初始化失败也会 resolve（调用方需自行检查 isReady）。
+   */
+  public whenReady(): Promise<void> {
+    if (this.isReady()) return Promise.resolve()
+    if (!this.readyPromise) {
+      this.readyPromise = new Promise<void>((resolve) => {
+        this.readyResolve = resolve
+      })
+    }
+    return this.readyPromise
+  }
+
+  public static getInstance(): DatabaseManager {
+    if (!DatabaseManager.instance) {
+      DatabaseManager.instance = new DatabaseManager()
+    }
+    return DatabaseManager.instance
+  }
+
+  /**
+   * 初始化全局数据库
+   */
+  public async initialize(): Promise<void> {
+    try {
+      const dbFolder = app.getPath('userData')
+      if (!fs.existsSync(dbFolder)) {
+        fs.mkdirSync(dbFolder, { recursive: true })
+      }
+      const dbName = !app.isPackaged ? 'berrytrace-dev.db' : 'berrytrace.db'
+      const dbPath = join(dbFolder, dbName)
+      console.log(`[DatabaseManager] Opening global database at: ${dbPath}`)
+
+      this.globalDB = new DatabaseSync(dbPath, { allowExtension: true })
+      try {
+        this.globalDB.exec('PRAGMA journal_mode = WAL;')
+        this.globalDB.exec('PRAGMA busy_timeout = 5000;')
+        this.globalDB.exec('PRAGMA synchronous = NORMAL;')
+      } catch (err) {
+        console.error('[DatabaseManager] Failed to set PRAGMAs for global DB:', err)
+      }
+      
+      // Load simple tokenizer extension（只有全局库需要中文分词）
+      this.loadSimpleExtension(this.globalDB)
+      this.loadVecExtension(this.globalDB)
+
+      runMigrations(this.globalDB, GLOBAL_MIGRATIONS, 'DbUser')
+      console.log('[DatabaseManager] Global database initialized successfully.')
+    } catch (e) {
+      console.error('[DatabaseManager] Failed to initialize global database:', e)
+    } finally {
+      // 无论成功失败都通知 whenReady() 等待方
+      this.readyResolve?.()
+      this.readyResolve = null
+    }
+  }
+
+  /**
+   * 获取（或创建）workspace 数据库
+   * @param workspacePath Workspace 绝对路径
+   * @returns Workspace 数据库实例
+   */
+  public getWorkspaceDB(workspacePath: string): DatabaseSync {
+    // 检查缓存
+    if (this.workspaceDBs.has(workspacePath)) {
+      return this.workspaceDBs.get(workspacePath)!.db
+    }
+
+    // 创建 .berrytrace 目录（如果不存在）
+    const dotFolder = join(workspacePath, WORKSPACE_DIR_NAME)
+    if (!fs.existsSync(dotFolder)) {
+      fs.mkdirSync(dotFolder, { recursive: true })
+    }
+
+    const dbPath = join(dotFolder, 'workspace.db')
+    console.log(`[DatabaseManager] Opening workspace database: ${dbPath}`)
+
+    const db = new DatabaseSync(dbPath, { allowExtension: true })
+    
+    // Enable WAL mode and busy timeout for concurrent safety
+    try {
+      db.exec('PRAGMA journal_mode = WAL;')
+      db.exec('PRAGMA busy_timeout = 5000;')
+    } catch (err) {
+      console.error('[DatabaseManager] Failed to set PRAGMAs for workspace DB:', err)
+    }
+    
+    // Load simple tokenizer extension
+    this.loadSimpleExtension(db)
+    this.loadVecExtension(db)
+
+    // 运行 workspace 数据库迁移
+    createWorkspaceTables(db)
+    runMigrations(db, WORKSPACE_MIGRATIONS, 'FtsFileIndex')
+
+    // 缓存
+    this.workspaceDBs.set(workspacePath, { db, path: dbPath })
+
+    return db
+  }
+
+  /**
+   * 关闭 workspace 数据库（当 workspace 被移除时）
+   */
+  public closeWorkspaceDB(workspacePath: string): void {
+    const cached = this.workspaceDBs.get(workspacePath)
+    if (cached) {
+      try {
+        cached.db.close()
+        console.log(`[DatabaseManager] Closed workspace database: ${cached.path}`)
+      } catch (err) {
+        console.error('[DatabaseManager] Failed to close workspace database:', err)
+      }
+      this.workspaceDBs.delete(workspacePath)
+    }
+  }
+
+  /**
+   * 获取全局数据库（用于用户、workspace 列表等全局数据）
+   */
+  public getGlobalDB(): DatabaseSync {
+    if (!this.globalDB) {
+      throw new Error('[DatabaseManager] Global database not initialized. Call initialize() first.')
+    }
+    return this.globalDB
+  }
+
+  /**
+   * 获取全局数据库的文件路径
+   */
+  public getGlobalDBPath(): string {
+    const dbFolder = app.getPath('userData')
+    const dbName = !app.isPackaged ? 'berrytrace-dev.db' : 'berrytrace.db'
+    return join(dbFolder, dbName)
+  }
+
+  /**
+   * 获取 Workspace 数据库的文件路径
+   */
+  public getWorkspaceDBPath(workspacePath: string): string {
+    const dotFolder = join(workspacePath, WORKSPACE_DIR_NAME)
+    return join(dotFolder, 'workspace.db')
+  }
+
+  // ==================== 向后兼容（临时）====================
+  //  gradually migrate callers to use getGlobalDB() or getWorkspaceDB()
+  
+  public query(sql: string, params: SQLInputValue[] = []): unknown[] {
+    return this.getGlobalDB().prepare(sql).all(...params) as unknown[]
+  }
+
+  public execute(sql: string, params: SQLInputValue[] = []): { changes: number; lastInsertRowid: number } {
+    const stmt = this.getGlobalDB().prepare(sql)
+    const result = stmt.run(...params)
+    return {
+      changes: Number(result.changes),
+      lastInsertRowid: Number(result.lastInsertRowid)
+    }
+  }
+
+  /**
+   * 数据库升级：下载 zip 并导入数据到全局数据库
+   * zip 内包含 data.bin（自定义二进制协议），通过事务 INSERT/UPDATE 写入
+   * @param url 下载地址（zip 包）
+   * @returns Promise<Record<string, number>> 各表的 lastId 映射
+   */
+  public async upgradeDatabase(url: string): Promise<Record<string, number>> {
+    if (!this.globalDB) {
+      throw new Error('[DatabaseManager] Global database not initialized. Call initialize() first.')
+    }
+
+    console.log(`[DatabaseManager] Starting database upgrade from ZIP URL: ${url}`)
+    const response = await net.fetch(url, { redirect: 'follow' })
+    if (!response.ok) {
+      throw new Error(`Failed to download database upgrade package: HTTP ${response.status} ${response.statusText}`)
+    }
+    const arrayBuffer = await response.arrayBuffer()
+    const buffer = Buffer.from(arrayBuffer)
+    console.log(`[DatabaseManager] Downloaded ZIP size: ${buffer.length} bytes, content-type: ${response.headers.get('content-type')}`)
+
+    // 验证 PK 魔数
+    if (buffer.length < 4 || buffer[0] !== 0x50 || buffer[1] !== 0x4b) {
+      const preview = buffer.slice(0, 200).toString('utf-8')
+      console.error(`[DatabaseManager] Downloaded content is NOT a zip file. First 200 bytes: ${preview}`)
+      throw new Error(`[DatabaseManager] Downloaded content is not a valid zip file (missing PK signature). Content-Type: ${response.headers.get('content-type')}`)
+    }
+
+    const zip = new AdmZip(buffer)
+    const entries = zip.getEntries()
+    console.log(`[DatabaseManager] Zip contains ${entries.length} entries:`, entries.map((e: { isDirectory: boolean; entryName: string }) => `${e.isDirectory ? 'DIR' : 'FILE'} ${e.entryName}`))
+
+    const incrementLastIdMap: Record<string, number> = {}
+
+    this.globalDB.exec('BEGIN TRANSACTION')
+    try {
+      for (const entry of entries) {
+        if (entry.isDirectory) continue
+        const fileBuffer = entry.getData()
+        if (fileBuffer.length < 4) continue
+
+        let offset = 0
+        const magic = fileBuffer.readUInt32LE(offset)
+        offset += 4
+        if (magic !== 0x12345678) {
+          throw new Error(`Invalid magic number: ${magic.toString(16)}`)
+        }
+
+        while (offset + 4 <= fileBuffer.length) {
+          const pkgLength = fileBuffer.readUInt32LE(offset)
+          offset += 4
+          if (offset + pkgLength > fileBuffer.length) {
+            throw new Error('Package length exceeds buffer bounds')
+          }
+          const pkgBuffer = fileBuffer.subarray(offset, offset + pkgLength)
+          offset += pkgLength
+
+          const jsonStr = pkgBuffer.toString('utf8')
+          const syncRequest = JSON.parse(jsonStr)
+          const tableName = syncRequest.table
+          const dataList = syncRequest.data || []
+          const lastId = Number(syncRequest.last_id || syncRequest.lastId) || 0
+
+          if (lastId > 0) {
+            incrementLastIdMap[tableName] = Math.max(incrementLastIdMap[tableName] || 0, lastId)
+          }
+
+          if (dataList.length === 0) continue
+
+          const columnNames = this.getTableColumns(tableName)
+          if (columnNames.length === 0) {
+            console.warn(`[DatabaseManager] Table ${tableName} does not exist or has no columns. Skipping.`)
+            continue
+          }
+
+          const wordsModule = await getWordsModule()
+          for (const subItem of dataList) {
+            // 计算分词（pinyin-pro 已通过 getWordsModule 延迟加载）
+            if (tableName === 'DbMenstruation') {
+              const words = wordsModule.computeMenstruationWords(
+                subItem.content || '',
+                subItem.location_name || '',
+                subItem.keywords || [],
+                subItem.attribute || '{}'
+              )
+              subItem.words = JSON.stringify(words)
+              subItem.word_count = subItem.word_count || (subItem.content ? subItem.content.length : 0)
+            } else if (tableName === 'DbCalendarEvent') {
+              const words = wordsModule.computeCalendarEventWords(subItem)
+              subItem.words = JSON.stringify(words)
+            }
+
+            // 字段映射
+            if (tableName === 'DbChatLogs') {
+              if (subItem['chat_session_id'] !== undefined) {
+                subItem['session_uuid'] = subItem['chat_session_id']
+              }
+              if (subItem['context'] !== undefined) {
+                subItem['content'] = subItem['context']
+              }
+              if (subItem['attr'] !== undefined) {
+                subItem['attribute'] = subItem['attr']
+              }
+            }
+
+            const isServerDeleted = subItem.is_delete === true || subItem.is_delete === 1
+
+            interface LocalRow {
+              id: number;
+              is_sync: number;
+              updated_at: string;
+            }
+            let localRow: LocalRow | null = null
+            if (columnNames.includes('remote_id') && columnNames.includes('uuid')) {
+              const rows = this.query(
+                `SELECT id, is_sync, updated_at FROM ${tableName} WHERE remote_id = ? OR uuid = ?`,
+                [subItem.id || null, subItem.uuid || null]
+              ) as LocalRow[]
+              if (rows.length > 0) localRow = rows[0]
+            } else if (columnNames.includes('remote_id')) {
+              const rows = this.query(
+                `SELECT id, is_sync, updated_at FROM ${tableName} WHERE remote_id = ?`,
+                [subItem.id || null]
+              ) as LocalRow[]
+              if (rows.length > 0) localRow = rows[0]
+            } else if (columnNames.includes('uuid')) {
+              const rows = this.query(
+                `SELECT id, is_sync, updated_at FROM ${tableName} WHERE uuid = ?`,
+                [subItem.uuid || null]
+              ) as LocalRow[]
+              if (rows.length > 0) localRow = rows[0]
+            }
+
+            if (localRow) {
+              if (isServerDeleted) {
+                this.execute(`DELETE FROM ${tableName} WHERE id = ?`, [localRow.id])
+              } else if (localRow.updated_at !== subItem.updated_at) {
+                const updateFields: string[] = []
+                const updateValues: SQLInputValue[] = []
+                for (const col of columnNames) {
+                  if (col === 'id' || col === 'remote_id' || col === 'uuid') continue
+                  let val = subItem[col]
+                  if (val !== undefined) {
+                    updateFields.push(`${col} = ?`)
+                    if (col === 'is_sync') {
+                      val = 1
+                    } else if (typeof val === 'boolean') {
+                      val = val ? 1 : 0
+                    } else if (typeof val === 'object' && val !== null) {
+                      val = JSON.stringify(val)
+                    }
+                    updateValues.push(val)
+                  }
+                }
+                if (updateFields.length > 0) {
+                  if (!updateFields.some(f => f.startsWith('is_sync'))) {
+                    updateFields.push('is_sync = ?')
+                    updateValues.push(1)
+                  }
+                  updateValues.push(localRow.id)
+                  this.execute(
+                    `UPDATE ${tableName} SET ${updateFields.join(', ')} WHERE id = ?`,
+                    updateValues
+                  )
+                }
+              }
+            } else {
+              if (isServerDeleted) continue
+
+              const insertCols: string[] = []
+              const insertPlaceholders: string[] = []
+              const insertValues: SQLInputValue[] = []
+
+              for (const col of columnNames) {
+                if (col === 'id') continue
+                let val = subItem[col]
+                if (val !== undefined) {
+                  insertCols.push(col)
+                  insertPlaceholders.push('?')
+                  if (col === 'is_sync') {
+                    val = 1
+                  } else if (typeof val === 'boolean') {
+                    val = val ? 1 : 0
+                  } else if (typeof val === 'object' && val !== null) {
+                    val = JSON.stringify(val)
+                  }
+                  insertValues.push(val)
+                }
+              }
+
+              if (subItem.id !== undefined && columnNames.includes('remote_id') && !insertCols.includes('remote_id')) {
+                insertCols.push('remote_id')
+                insertPlaceholders.push('?')
+                insertValues.push(subItem.id)
+              }
+              if (!insertCols.includes('is_sync') && columnNames.includes('is_sync')) {
+                insertCols.push('is_sync')
+                insertPlaceholders.push('?')
+                insertValues.push(1)
+              }
+
+              if (insertCols.length > 0) {
+                this.execute(
+                  `INSERT INTO ${tableName} (${insertCols.join(', ')}) VALUES (${insertPlaceholders.join(', ')})`,
+                  insertValues
+                )
+              }
+            }
+          }
+        }
+      }
+
+      this.globalDB.exec('COMMIT')
+      console.log('[DatabaseManager] Database upgrade successful.')
+      return incrementLastIdMap
+    } catch (err) {
+      this.globalDB.exec('ROLLBACK')
+      console.error('[DatabaseManager] Database upgrade failed, transaction rolled back:', err)
+      throw err
+    }
+  }
+
+  /**
+   * 获取表的列名列表
+   */
+  public getTableColumns(tableName: string): string[] {
+    try {
+      const rows = this.query(`PRAGMA table_info(${tableName})`) as { name: string }[]
+      return rows.map(r => r.name)
+    } catch (e) {
+      console.error(`[DatabaseManager] Failed to get columns for table ${tableName}:`, e)
+      return []
+    }
+  }
+
+  // ==================== 私有方法 ====================
+
+  private loadSimpleExtension(db: DatabaseSync): void {
+    if (!db) return
+    try {
+      const isDev = !app.isPackaged
+      const binDir = isDev
+        ? join(__dirname, '..', 'dist-electron', 'bin')
+        : join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', 'bin')
+
+      let libName = 'libsimple.so'
+      if (process.platform === 'darwin') {
+        libName = 'libsimple.dylib'
+      } else if (process.platform === 'win32') {
+        libName = 'simple.dll'
+      }
+
+      const libPath = join(binDir, libName)
+      const dictPath = join(binDir, 'dict')
+
+      if (!fs.existsSync(libPath)) {
+        console.warn(`[DatabaseManager] simple extension not found at: ${libPath}`)
+        return
+      }
+
+      console.log(`[DatabaseManager] Loading SQLite simple extension from: ${libPath}`)
+      db.enableLoadExtension(true)
+      db.loadExtension(libPath)
+      console.log(`[DatabaseManager] SQLite simple extension loaded. Initializing dict path: ${dictPath}`)
+
+      const stmt = (db as unknown as DatabaseWithPrepare).prepare('SELECT jieba_dict(?) as res')
+      stmt.all(dictPath)
+      console.log('[DatabaseManager] SQLite simple extension initialized with dict path successfully.')
+    } catch (err) {
+      console.error('[DatabaseManager] Failed to load/initialize SQLite simple extension:', err)
+    }
+  }
+
+  private loadVecExtension(db: DatabaseSync): void {
+    if (!db) return
+    try {
+      const isDev = !app.isPackaged
+      const binDir = isDev
+        ? join(__dirname, '..', 'dist-electron', 'bin')
+        : join(process.resourcesPath, 'app.asar.unpacked', 'dist-electron', 'bin')
+
+      let libName = 'vec0.so'
+      if (process.platform === 'darwin') {
+        libName = 'vec0.dylib'
+      } else if (process.platform === 'win32') {
+        libName = 'vec0.dll'
+      }
+
+      const libPath = join(binDir, libName)
+
+      if (!fs.existsSync(libPath)) {
+        console.warn(`[DatabaseManager] vec0 extension not found at: ${libPath}`)
+        return
+      }
+
+      console.log(`[DatabaseManager] Loading SQLite vec0 extension from: ${libPath}`)
+      db.enableLoadExtension(true)
+      db.loadExtension(libPath)
+      console.log('[DatabaseManager] SQLite vec0 extension loaded successfully.')
+    } catch (err) {
+      console.error('[DatabaseManager] Failed to load/initialize SQLite vec0 extension:', err)
+    }
+  }
+
+  // ==================== 迁移方法（临时）====================
+  // 从旧版 DatabaseManager 迁移过来（兼容性）
+
+  private createTables(): void {
+    // 保留原方法用于向后兼容
+    if (this.globalDB) {
+      createGlobalTables(this.globalDB)
+    }
+  }
+
+  /**
+   * 关闭所有数据库连接（当应用退出时）
+   */
+  public destroy(): void {
+    // 1. 关闭所有 workspace 数据库
+    for (const workspacePath of this.workspaceDBs.keys()) {
+      this.closeWorkspaceDB(workspacePath);
+    }
+    // 2. 关闭全局数据库
+    if (this.globalDB) {
+      try {
+        this.globalDB.close();
+        console.log('[DatabaseManager] Closed global database');
+      } catch (err) {
+        console.error('[DatabaseManager] Failed to close global database:', err);
+      }
+      this.globalDB = null;
+    }
+  }
+}
+

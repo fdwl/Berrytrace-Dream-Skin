@@ -1,0 +1,135 @@
+diff --git a/electron/services/fulltext-index-manager.ts b/electron/services/fulltext-index-manager.ts
+index c16f2fc..b6a005b 100644
+--- a/electron/services/fulltext-index-manager.ts
++++ b/electron/services/fulltext-index-manager.ts
+@@ -43,6 +43,7 @@ interface FileSearchResult {
+   snip: string
+   rank: number
+   line_number?: number
++  score?: number
+ }
+ 
+ /** 全文索引中存储的工具条目 */
+@@ -59,6 +60,7 @@ interface IndexedTool {
+   inputSchema?: { properties?: Record<string, { description?: string }> }
+   isDynamic?: boolean
+   userQueries?: string[]
++  filePath?: string
+ }
+ 
+ /** 全文索引中存储的 Skill 元信息 */
+@@ -173,10 +175,10 @@ export class FullTextIndexManager {
+       checkCount++
+       try {
+         const idleTime = powerMonitor.getSystemIdleTime()
+-        // 至少等待应用启动 10 秒（5 次检查），且系统闲置超过 5 秒
+-        if (checkCount >= 5 && idleTime >= 5) {
++        // Wait at least 10 seconds (5 checks) and system idle >= 5s, OR force run after 20 seconds (10 checks)
++        if ((checkCount >= 5 && idleTime >= 5) || checkCount >= 10) {
+           clearInterval(checkInterval)
+-          console.log(`[FullTextIndex] System is idle (${idleTime}s), starting background index check...`)
++          console.log(`[FullTextIndex] Startup check triggered (checkCount=${checkCount}, idleTime=${idleTime}s), starting background index check...`)
+           this.checkAndBuildIndexOnStartup().catch(err => {
+             console.error('[FullTextIndex] Idle startup index check failed:', err)
+           })
+@@ -210,6 +212,15 @@ export class FullTextIndexManager {
+ 
+       console.log(`[FullTextIndex] Received file changes: ${changedFiles.length} files in ${workspacePath}`)
+ 
++      // If any of the changed files is a workflow file, trigger reindexing of tools library
++      const hasWorkflowChange = changedFiles.some(f => f.endsWith('.workflow'));
++      if (hasWorkflowChange) {
++        console.log(`[FullTextIndex] Workflow file change detected in ${workspacePath}, triggering tools reindexing...`);
++        this.indexToolsLibrary([], workspacePath).catch(err => {
++          console.warn('[FullTextIndex] Failed to reindex tools after workflow file change:', err);
++        });
++      }
++
+       // 收集待更新的文件
+       if (!this.pendingUpdates.has(workspacePath)) {
+         this.pendingUpdates.set(workspacePath, [])
+@@ -1852,6 +1863,47 @@ export class FullTextIndexManager {
+           });
+         }
+ 
++        // Add `.workflow` files as tools from workspace path
++        try {
++          // @ts-ignore
++          const yaml = (await import('js-yaml')) as any;
++          const workflowFiles = await this.findWorkflowFiles(wsPath);
++          for (const file of workflowFiles) {
++            try {
++              const rawContent = fs.readFileSync(file, 'utf-8');
++              const doc = yaml.default.load(rawContent) as any;
++              if (doc && doc.id) {
++                const userQueries: string[] = [];
++                if (doc.triggers) {
++                  if (Array.isArray(doc.triggers.userQueries)) {
++                    userQueries.push(...doc.triggers.userQueries);
++                  }
++                  if (doc.triggers.cron) {
++                    userQueries.push(doc.triggers.cron);
++                  }
++                }
++                allToolsMap.set(doc.id, {
++                  name: doc.id,
++                  displayName: doc.name || doc.id,
++                  description: doc.description || `SOP 自动化工作流: ${doc.name || doc.id}`,
++                  category: 'workflow',
++                  package: 'workflow-engine',
++                  inputSchema: {
++                    properties: {}
++                  },
++                  isDynamic: false,
++                  userQueries,
++                  filePath: relative(wsPath, file)
++                });
++              }
++            } catch (err) {
++              console.warn(`[FullTextIndex] Failed to parse workflow file ${file}:`, err);
++            }
++          }
++        } catch (err) {
++          console.warn('[FullTextIndex] Failed to load js-yaml or search workflows:', err);
++        }
++
+         const mergedTools = Array.from(allToolsMap.values());
+ 
+         // 3. Clear existing tools in FTS and Vector index
+@@ -1874,8 +1926,8 @@ export class FullTextIndexManager {
+ 
+         for (const tool of mergedTools) {
+           try {
+-            const title = tool.name
+-            const displayName = tool.displayName || ''
++            const title = tool.displayName || tool.name
++            const displayName = tool.name
+             const description = tool.description || ''
+ 
+             // Extract parameter descriptions from inputSchema
+@@ -2119,6 +2171,25 @@ export class FullTextIndexManager {
+     console.log('[FullTextIndex] Skills indexing complete.')
+   }
+ 
++  private async findWorkflowFiles(dir: string, depth: number = 0): Promise<string[]> {
++    if (depth > 5 || !fs.existsSync(dir)) return [];
++    const results: string[] = [];
++    try {
++      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
++      for (const entry of entries) {
++        const fullPath = join(dir, entry.name);
++        if (entry.isDirectory()) {
++          if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist') continue;
++          const subFiles = await this.findWorkflowFiles(fullPath, depth + 1);
++          results.push(...subFiles);
++        } else if (entry.isFile() && entry.name.endsWith('.workflow')) {
++          results.push(fullPath);
++        }
++      }
++    } catch { /* ignore */ }
++    return results;
++  }
++
+   private async collectSkillDirs(parentDir: string, skillDirs: Set<string>): Promise<void> {
+     if (!fs.existsSync(parentDir)) return
+     try {

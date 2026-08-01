@@ -1,0 +1,98 @@
+import { create } from 'zustand';
+
+/**
+ * ContentArea 显示模式：
+ * - 'chat'    默认 Agent Chat（包括无会话的空状态）
+ * - 'plans'   已安排（定时任务管理），替代 AgentChat 占据内容区
+ * - 'plugins' 插件管理，替代 AgentChat 占据内容区
+ * - 'automation' 自动化（工作流中心），替代 plans + 工作流
+ *
+ * 切换到 'plans' 或 'plugins' 时，Workspace 自动关闭，
+ * 因为 Workspace 必须依附于会话（AgentChat），不能独立显示。
+ */
+export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation';
+
+interface DashboardState {
+  /** Workspace 面板是否可见（仅在 contentView === 'chat' 时有效） */
+  workspaceVisible: boolean;
+  
+  /** 记录最近一次打开工作区的时间戳，用于避免初始化时的误收起竞态 */
+  workspaceOpenedAt: number;
+
+  /** ContentArea 当前显示的视图 */
+  contentView: ContentView;
+
+  /** 侧边栏选中的项目工作区路径（null = 默认工作区） */
+  selectedProjectPath: string | null;
+
+  /** 当前在侧边栏中展开的项目路径字典 */
+  expandedProjects: Record<string, boolean>;
+
+  /** 切换 Workspace 显示/隐藏 */
+  toggleWorkspace: () => void;
+  /** 显示 Workspace（仅在 chat 模式下有效） */
+  showWorkspace: () => void;
+  /** 隐藏 Workspace */
+  hideWorkspace: () => void;
+
+  /**
+   * 切换 ContentView。
+   * 切换到 'plans' 或 'plugins' 时自动隐藏 Workspace，
+   * 因为 Workspace 依附于 AgentChat 会话，不能独立存在。
+   */
+  setContentView: (view: ContentView) => void;
+
+  /** 设置侧边栏选中项目路径 */
+  setSelectedProjectPath: (path: string | null) => void;
+
+  /** 切换某个项目工作区的展开状态 */
+  toggleProjectExpanded: (path: string) => void;
+  /** 设置某个项目工作区的展开状态 */
+  setProjectExpanded: (path: string, expanded: boolean) => void;
+}
+
+export const useDashboardStore = create<DashboardState>((set) => ({
+  workspaceVisible: false,
+  workspaceOpenedAt: 0,
+  contentView: 'chat',
+  selectedProjectPath: null,
+  expandedProjects: {},
+
+  toggleWorkspace: () => set((s) => {
+    const nextVal = !s.workspaceVisible;
+    console.log(`[DashboardStore:toggleWorkspace] workspaceVisible changing from ${s.workspaceVisible} to ${nextVal}`);
+    return { 
+      workspaceVisible: nextVal,
+      workspaceOpenedAt: !s.workspaceVisible ? Date.now() : s.workspaceOpenedAt
+    };
+  }),
+  showWorkspace: () => set((s) => {
+    console.log(`[DashboardStore:showWorkspace] setting workspaceVisible to true`);
+    return { workspaceVisible: true, workspaceOpenedAt: Date.now() };
+  }),
+  hideWorkspace: () => set((s) => {
+    console.log(`[DashboardStore:hideWorkspace] setting workspaceVisible to false`);
+    return { workspaceVisible: false };
+  }),
+
+  setContentView: (view) => set((s) => {
+    console.log(`[DashboardStore:setContentView] changing contentView to ${view}`);
+    return {
+      contentView: view,
+    };
+  }),
+
+  setSelectedProjectPath: (path) => set({ selectedProjectPath: path }),
+  toggleProjectExpanded: (path) => set((s) => ({
+    expandedProjects: {
+      ...s.expandedProjects,
+      [path]: !s.expandedProjects[path]
+    }
+  })),
+  setProjectExpanded: (path, expanded) => set((s) => ({
+    expandedProjects: {
+      ...s.expandedProjects,
+      [path]: expanded
+    }
+  })),
+}));

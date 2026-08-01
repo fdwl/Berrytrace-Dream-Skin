@@ -1,0 +1,83 @@
+diff --git a/src/stores/dashboard.ts b/src/stores/dashboard.ts
+index 4a5d931..99fc0ed 100644
+--- a/src/stores/dashboard.ts
++++ b/src/stores/dashboard.ts
+@@ -7,10 +7,12 @@ import { create } from 'zustand';
+  * - 'plugins'    插件管理，替代 AgentChat 占据内容区
+  * - 'automation' 自动化（工作流中心），替代 plans + 工作流
+  * - 'settings'   系统设置（内联展示），左边栏变为设置 Tab 导航 + 右侧内容区
++ * - 'sessions'   会话管理，全局管理历史对话与搜索
++ * - 'knowledge'  知识库画廊（包含多路径文档检索与可视化分类管理）
+  *
+  * 所有视图均支持在右侧打开 Workspace 面板（Universal Workspace）。
+  */
+-export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation' | 'settings';
++export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation' | 'settings' | 'sessions' | 'knowledge' | (string & {});
+ 
+ interface DashboardState {
+   /** Workspace 面板是否可见 */
+@@ -22,6 +24,30 @@ interface DashboardState {
+   /** ContentArea 当前显示的视图 */
+   contentView: ContentView;
+ 
++  /** 当 contentView 为插件视图时的插件 View ID */
++  activePluginViewId: string | null;
++
++  /** 引导状态是否在初始化检查中 (用于防闪烁骨架屏) */
++  isCheckingOnboarding: boolean;
++
++  /** 全局引导/Onboarding 是否已完成 */
++  onboardingCompleted: boolean;
++
++  /** 侧边栏 Primary 贡献视图 (默认 'chat'，激活插件后可动态更新为 'online:workbench') */
++  primaryContributionView: string;
++
++  /** 设置全局引导/Onboarding 完成状态 */
++  setOnboardingCompleted: (completed: boolean) => void;
++
++  /** 设置引导检查状态 */
++  setIsCheckingOnboarding: (checking: boolean) => void;
++
++  /** 设置当前激活的插件 View ID */
++  setActivePluginViewId: (viewId: string | null) => void;
++
++  /** 设置侧边栏 Primary 贡献视图 */
++  setPrimaryContributionView: (viewId: string) => void;
++
+   /**
+    * 进入 settings 视图前的上一个视图，用于"返回"按钮导航。
+    * 避免返回到 'settings' 自身形成死循环。
+@@ -37,6 +63,12 @@ interface DashboardState {
+   /** 当前在侧边栏中展开的项目路径字典 */
+   expandedProjects: Record<string, boolean>;
+ 
++  /** Workspace 面板是否最大化全屏展示（折叠隐藏 ContentArea） */
++  workspaceMaximized: boolean;
++
++  /** 切换 Workspace 最大化状态 */
++  setWorkspaceMaximized: (maximized: boolean) => void;
++
+   /** 切换 Workspace 显示/隐藏 */
+   toggleWorkspace: () => void;
+   /** 显示 Workspace */
+@@ -69,10 +101,20 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
+   workspaceVisible: false,
+   workspaceOpenedAt: 0,
+   contentView: 'chat',
++  activePluginViewId: null,
++  isCheckingOnboarding: false,
++  onboardingCompleted: false,
++  primaryContributionView: 'chat',
++  setOnboardingCompleted: (completed) => set({ onboardingCompleted: completed }),
++  setIsCheckingOnboarding: (checking) => set({ isCheckingOnboarding: checking }),
++  setActivePluginViewId: (viewId) => set({ activePluginViewId: viewId }),
++  setPrimaryContributionView: (viewId) => set({ primaryContributionView: viewId }),
+   prevContentView: 'chat',
+   settingsActiveTab: 'general',
+   selectedProjectPath: null,
+   expandedProjects: {},
++  workspaceMaximized: false,
++  setWorkspaceMaximized: (maximized) => set({ workspaceMaximized: maximized }),
+ 
+   toggleWorkspace: () => set((s) => {
+     const nextVal = !s.workspaceVisible;

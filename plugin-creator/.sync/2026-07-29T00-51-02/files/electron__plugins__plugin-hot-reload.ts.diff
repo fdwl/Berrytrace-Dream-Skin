@@ -1,0 +1,98 @@
+diff --git a/electron/plugins/plugin-hot-reload.ts b/electron/plugins/plugin-hot-reload.ts
+index 886f702..58e7f19 100644
+--- a/electron/plugins/plugin-hot-reload.ts
++++ b/electron/plugins/plugin-hot-reload.ts
+@@ -19,6 +19,8 @@ export class PluginHotReload {
+   private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+   private readonly pluginsDir: string;
+ 
++  private isStopped = false;
++
+   private constructor() {
+     this.pluginsDir = join(homedir(), '.berrytrace', 'plugins');
+   }
+@@ -32,17 +34,30 @@ export class PluginHotReload {
+ 
+   public start(): void {
+     if (this.watcher) return;
++    this.isStopped = false;
+ 
+-    // 监听插件 dist/index.js，不监听 node_modules
+-    const pattern = join(this.pluginsDir, '**', 'dist', 'index.js');
+-    console.log(`[PluginHotReload] 👀 Watching: ${pattern}`);
+-
+-    this.watcher = watch(pattern, {
++    console.log(`[PluginHotReload] 👀 Watching directory: ${this.pluginsDir}`);
++    this.watcher = watch(this.pluginsDir, {
+       ignoreInitial: true,
++      ignored: [
++        /node_modules/,
++        /\.git/,
++        /[/\\]src[/\\]/,
++        /[/\\]tests[/\\]/,
++        /[/\\]cline[/\\]/,
++        /\.kanban/,
++      ],
+       awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
+     });
+ 
+-    this.watcher.on('change', (filePath: string) => {
++    this.watcher.on('all', (event: string, filePath: string) => {
++      if (this.isStopped) return;
++      if (!['add', 'change', 'unlink'].includes(event)) return;
++
++      const isPluginJson = filePath.endsWith('plugin.json');
++      const isInDist = /[\\\/]dist[\\\/].*\.js$/.test(filePath);
++      if (!isPluginJson && !isInDist) return;
++
+       const pluginId = this.extractPluginId(filePath);
+       if (!pluginId) return;
+ 
+@@ -53,21 +68,30 @@ export class PluginHotReload {
+         pluginId,
+         setTimeout(() => {
+           this.debounceTimers.delete(pluginId);
+-          this.handleChange(pluginId, filePath);
++          if (!this.isStopped) {
++            this.handleChange(pluginId, filePath);
++          }
+         }, 500),
+       );
+     });
+ 
+-    this.watcher.on('error', (err: Error) => {
++    this.watcher.on('error', (err: unknown) => {
+       console.error('[PluginHotReload] Watcher error:', err);
+     });
+   }
+ 
+   public stop(): void {
+-    this.watcher?.close();
+-    this.watcher = null;
++    this.isStopped = true;
+     this.debounceTimers.forEach(t => clearTimeout(t));
+     this.debounceTimers.clear();
++    if (this.watcher) {
++      try {
++        this.watcher.close();
++      } catch (err) {
++        console.error('[PluginHotReload] Error closing watcher:', err);
++      }
++      this.watcher = null;
++    }
+     console.log('[PluginHotReload] Stopped.');
+   }
+ 
+@@ -82,10 +106,11 @@ export class PluginHotReload {
+   }
+ 
+   private async handleChange(pluginId: string, filePath: string): Promise<void> {
++    if (this.isStopped) return;
+     console.log(`[PluginHotReload] 🔄 Detected change in "${pluginId}" → ${filePath}`);
+ 
+     try {
+-      const { PluginManager } = require('./plugin-manager.js');
++      const { PluginManager } = await import('./plugin-manager.js');
+       const pm = PluginManager.getInstance();
+ 
+       const plugin = pm.getPlugin(pluginId);

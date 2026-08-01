@@ -1,0 +1,341 @@
+# 03 — plugin.json 规范
+
+## 必填字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `string` | `com.berrytrace.plugin.{name}-{uuid}` |
+| `name` | `string` | 显示名称 |
+| `version` | `string` | 语义化版本，如 `1.0.0` |
+| `description` | `string` | 描述 |
+| `type` | `string` | `panel` / `background` / `hybrid` / `main` |
+| `main` | `string` | Node.js 入口文件（background / hybrid / main 必填） |
+| `view` | `string` | 浏览器入口文件（panel / hybrid 必填） |
+
+## 可选字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `resident` | `boolean` | `false` | 常驻插件：不会被空闲回收，启动时预加载 |
+| `startupPriority` | `"high"` \| `"normal"` | `"normal"` | 启动优先级，`high` = 启动时预加载 |
+| `idleTimeout` | `number` | `300000` | 空闲回收超时（ms），仅对非 resident 插件生效 |
+| `processIsolation` | `"required"` \| `"recommended"` \| `"optional"` | `"optional"` | 进程隔离：`required`/`recommended` = 独立进程，`optional` = 共享池 |
+| `scope` | `"global"` \| `"workspace"` | — | 插件作用域 |
+| `nativeElectron` | `boolean` | `false` | 是否使用 Electron 原生窗口 |
+
+## ID 格式
+
+```
+com.berrytrace.plugin.{project-name}-{uuid}
+
+project-name: kebab-case 英文，如 desk-clock
+uuid: scripts/generate-uuid.js 生成的纯数字
+
+✅ com.berrytrace.plugin.desk-clock-4829173645
+❌ com.berrytrace.plugin.li-work-4829173645    # 泄露本地路径
+❌ com.berrytrace.plugin.desk-clock             # 缺少 uuid
+```
+
+---
+
+## `contributes` — 声明式贡献
+
+### events — 事件注册 ✅
+
+声明插件会 **监听** 和 **发射** 的事件。宿主根据 `listens` 声明自动管理插件的按需加载和事件路由。
+
+```json
+{
+  "contributes": {
+    "events": {
+      "listens": [
+        { "name": "workspace:file-changed", "description": "监听文件变化以更新索引" },
+        { "name": "agent:step_update", "description": "监听 Agent 步骤状态" }
+      ],
+      "emits": [
+        { "name": "my-plugin:data-updated", "description": "数据更新完成通知" }
+      ]
+    }
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `listens[].name` | 监听的事件名（平台事件或自定义事件） |
+| `listens[].description` | 事件用途描述（可选，供 AI 和文档工具使用） |
+| `emits[].name` | 会发射的事件名 |
+| `emits[].description` | 事件用途描述（可选） |
+
+**关键规则**：
+- `listens` 声明的事件：插件未运行时收到该事件 → **自动唤醒** 插件并重放事件
+- `emits` 声明的事件：仅用于声明意图，便于工具链分析数据流，不影响运行时行为
+- **未声明的事件不会推送给该插件**（减少 ~70% IPC 冗余）
+- 平台事件（如 `agent:step_update`、`workspace:context-changed`）和自定义事件（`{pluginId}:{name}`）都可以声明
+
+**事件唤醒流程**：
+
+```
+事件触发
+  → PluginManager/PluginLauncher 查询 EventSubscriptionRegistry
+  → 插件已运行 → 直接 sdk:events:on 转发
+  → 插件未运行 → ensurePluginLoaded → 创建进程 → 重放触发事件
+```
+
+**事件名规范**：
+
+| 类型 | 格式 | 示例 |
+|------|------|------|
+| 平台事件 | `{namespace}:{event}` | `agent:step_update`, `workspace:file-changed` |
+| 插件自定义 | `{pluginId}:{event}` | `com.berrytrace.plugin.xxx:data-updated` |
+
+---
+
+### workspaceViews — 工作区标签页 ✅
+
+```json
+{
+  "contributes": {
+    "workspaceViews": [
+      { "id": "my-plugin:workspace", "title": "我的工具", "view": "dist/renderer.js" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 视图唯一 ID |
+| `title` | 标签页标题 |
+| `view` | 渲染进程入口文件路径 |
+
+用户点击标签页时，宿主自动加载插件 → 注册 view class → 渲染视图。
+
+---
+
+### commands — 命令面板 ✅
+
+```json
+{
+  "contributes": {
+    "commands": [
+      { "command": "my-plugin.search", "title": "搜索", "category": "我的插件" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `command` | 命令 ID |
+| `title` | 命令标题 |
+| `category` | 命令分类（可选） |
+
+用户执行命令时，宿主自动加载插件 → 调用 `commands:execute` → 触发 handler。
+
+---
+
+### folderContextMenuItems — 文件夹右键菜单 ✅
+
+```json
+{
+  "contributes": {
+    "folderContextMenuItems": [
+      { "id": "my-plugin:sync", "label": "同步到云端", "command": "my-plugin.syncFolder" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 菜单项唯一 ID |
+| `label` | 菜单显示文字 |
+| `command` | 点击时执行的命令 ID |
+
+用户点击菜单项时，宿主自动加载插件 → 执行对应命令。
+
+---
+
+### selectionMenuItems — 划词菜单 ✅
+
+用户选中文本时弹出的工具条：
+
+```json
+{
+  "contributes": {
+    "selectionMenuItems": [
+      { "id": "translate", "label": "翻译", "icon": "🌐", "action": "translator.translate" }
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 菜单项 ID |
+| `label` | 按钮文字 |
+| `icon` | 图标 |
+| `action` | 点击触发的命令 ID |
+
+### shortcutActions — 快捷动作 ✅
+
+```json
+{
+  "contributes": {
+    "shortcutActions": [
+      { "id": "quick-note", "label": "快速笔记", "icon": "📝" }
+    ]
+  }
+}
+```
+
+---
+
+## `contributes` — 计划中的声明项
+
+无（所有声明式贡献项已实现）
+
+---
+
+## `activationEvents` — 启动时机 ✅
+
+不声明则不自动启动。声明后宿主在对应事件触发时自动激活插件。
+
+```json
+{ "activationEvents": ["onView:my-editor", "onCommand:myPlugin.doSomething", "onFileExtension:md", "onMcpCall:my_tool"] }
+```
+
+| 事件 | 触发条件 |
+|------|---------|
+| `*` | 应用启动时（少用） |
+| `onView:{viewId}` | 打开视图 |
+| `onCommand:{commandId}` | 执行命令 |
+| `onFileExtension:{ext}` | 打开对应文件 |
+| `onMcpCall:{toolName}` | AI 调用 MCP 工具 |
+
+---
+
+## `permissions` — 权限 ✅
+
+```json
+{ "permissions": ["storage", "filesystem", "ai"] }
+```
+
+| 权限 | 作用 |
+|------|------|
+| `storage` | KV + SQLite |
+| `filesystem` | 文件读写 |
+| `ai` | AI 推理 |
+| `context` | 系统情境感知 |
+| `clipboard` | 剪贴板 |
+| `network` | 网络请求 |
+| `notification` | 系统通知 |
+
+> CLI 模板生成的是 `"ai:inference"` 格式，也可用。
+
+---
+
+## `fileAssociations` — 文件关联 ✅
+
+```json
+{ "fileAssociations": ["md", "markdown", "txt"] }
+```
+
+打开对应扩展名文件时，自动用该插件打开。
+
+---
+
+## MCP 工具声明 ✅
+
+```json
+{
+  "mcp": {
+    "tools": [
+      {
+        "name": "my_tool",
+        "description": "工具描述",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "input": { "type": "string", "description": "输入参数" } },
+          "required": ["input"]
+        }
+      }
+    ]
+  }
+}
+```
+
+声明后必须在代码中注册处理器：`sdk.mcp.registerToolHandler('my_tool', handler)`
+
+---
+
+## 窗口/UI 配置字段
+
+| 字段 | 说明 |
+|------|------|
+| `width` | 窗口宽度 |
+| `height` | 窗口高度 |
+| `position` | 窗口位置 |
+| `hideTitleBar` | 隐藏标题栏 |
+| `disableDefaultDrag` | 禁用默认拖拽 |
+| `supportTabs` | 支持标签页 |
+| `triggerPrefix` | 快捷面板触发词 |
+| `interceptKeys` | 拦截的快捷键 |
+| `windowConfig` | 窗口详细配置 |
+| `nativeElectron` | 启用原生 Electron 集成 |
+
+---
+
+## 完整示例
+
+```json
+{
+  "id": "com.berrytrace.plugin.markdown-editor-4829173645",
+  "name": "Markdown Editor",
+  "version": "1.0.0",
+  "description": "Markdown 编辑器插件",
+  "type": "hybrid",
+  "main": "dist/background.js",
+  "view": "dist/renderer.js",
+  "permissions": ["storage", "filesystem"],
+  "fileAssociations": ["md", "markdown"],
+  "activationEvents": ["onView:markdown-editor", "onFileExtension:md"],
+  "contributes": {
+    "events": {
+      "listens": [
+        { "name": "workspace:file-changed", "description": "文件变更时更新预览" },
+        { "name": "agent:step_update", "description": "Agent 步骤状态变化" }
+      ],
+      "emits": [
+        { "name": "com.berrytrace.plugin.markdown-editor-4829173645:preview-updated", "description": "预览渲染完成" }
+      ]
+    },
+    "commands": [
+      { "command": "markdown-editor.format", "title": "格式化 Markdown", "category": "Markdown" }
+    ],
+    "workspaceViews": [
+      { "id": "markdown-editor:workspace", "title": "Markdown 预览", "view": "dist/renderer.js" }
+    ],
+    "folderContextMenuItems": [
+      { "id": "markdown-editor:render", "label": "渲染为 HTML", "command": "markdown-editor.renderFolder" }
+    ],
+    "selectionMenuItems": [
+      { "id": "markdown.format", "label": "Markdown 格式化", "icon": "✨", "action": "markdown.formatSelection" }
+    ]
+  },
+  "mcp": {
+    "tools": [
+      {
+        "name": "markdown_render",
+        "description": "将 Markdown 渲染为 HTML",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "content": { "type": "string", "description": "Markdown 内容" } },
+          "required": ["content"]
+        }
+      }
+    ]
+  }
+}
+```

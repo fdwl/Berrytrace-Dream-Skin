@@ -1,0 +1,2290 @@
+import { app, shell, nativeTheme, ipcMain, dialog, BrowserWindow, clipboard, Notification, globalShortcut, Tray, Menu, desktopCapturer } from 'electron';
+import type { SaveDialogOptions, OpenDialogOptions, BrowserWindowConstructorOptions } from 'electron';
+import { join, extname, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { ApiDispatcher } from '../api-dispatcher';
+import { promises as fs } from 'fs';
+import * as fsSync from 'fs';
+import { spawn, execFileSync } from 'child_process';
+import type { ChildProcess } from 'child_process';
+import { ElectronMainWindow } from '../../windows/main-window';
+import { addLog } from '../../services/logger';
+import { ApiContext, BaseApiController } from './api-context';
+import { getMouseHook } from '../../services/mouse-hook';
+import { cache, CacheAttribute } from '../../config/index';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+
+let _resolvedShellPath: string | null = null;
+
+export function getShellPath(): string {
+  if (_resolvedShellPath !== null) return _resolvedShellPath;
+
+  if (process.platform === 'win32') {
+    const home = process.env.USERPROFILE || process.env.HOME || app.getPath('home');
+    const extras = [
+      `${home}\\AppData\\Roaming\\npm`,
+      `${home}\\AppData\\Local\\Programs\\node`,
+      `${home}\\AppData\\Local\\nvm`,
+      'C:\\Program Files\\nodejs',
+      'C:\\Program Files (x86)\\nodejs',
+    ].join(';');
+    const existing = process.env.PATH || '';
+    _resolvedShellPath = existing ? `${existing};${extras}` : extras;
+    return _resolvedShellPath;
+  }
+
+  const loginShell = process.env.SHELL || '/bin/zsh';
+  try {
+    const result = execFileSync(loginShell, ['-l', '-i', '-c', 'echo $PATH'], {
+      timeout: 5000,
+      encoding: 'utf-8',
+      env: { ...process.env, TERM: 'dumb' },
+    }).trim();
+    if (result) {
+      _resolvedShellPath = result;
+      return _resolvedShellPath;
+    }
+  } catch {
+    // login shell failed — fall through to static fallback
+  }
+
+  const home = process.env.HOME || app.getPath('home');
+  _resolvedShellPath = [
+    process.env.PATH || '',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+    '/opt/homebrew/bin',
+    '/opt/homebrew/sbin',
+    '/opt/local/bin',
+    `${home}/.npm-global/bin`,
+    `${home}/.volta/bin`,
+    `${home}/.cargo/bin`,
+  ].filter(Boolean).join(':');
+  return _resolvedShellPath;
+}
+
+export interface ActiveProcess {
+  child: ChildProcess;
+  sessionId?: string;
+  command: string;
+  stdout: string;
+  stderr: string;
+  exitPromise: Promise<ExecCommandResult>;
+  resolveExit?: (res: ExecCommandResult) => void;
+  resolvedEarly: boolean;
+  resolveEarly?: () => void;
+}
+
+const activeChildProcesses = new Map<string, ActiveProcess>();
+const completedProcessHistory = new Map<string, ExecCommandResult>();
+
+export function killProcessesForSession(sessionId: string) {
+  console.log(`[PluginBridge] Killing active child processes for session: ${sessionId}`);
+  for (const [key, item] of activeChildProcesses.entries()) {
+    if (item.sessionId === sessionId) {
+      try {
+        item.child.kill('SIGTERM');
+        console.log(`[PluginBridge] Killed process ${key}`);
+      } catch (err) {
+        console.warn(`[PluginBridge] Failed to kill process ${key}:`, err);
+      }
+      activeChildProcesses.delete(key);
+    }
+  }
+}
+
+ipcMain.on('agent:cancel-session', async (_event, payload: any) => {
+  if (payload && typeof payload.sessionId === 'string') {
+    killProcessesForSession(payload.sessionId);
+    try {
+      const { PluginManager } = await import('../plugin-manager');
+      const pm = PluginManager.getInstance();
+      const kernelPluginId = pm.getAgentKernelPluginId();
+      if (kernelPluginId) {
+        pm.emitToBackgroundPlugin(kernelPluginId, 'agent:cancel_session', { sessionId: payload.sessionId });
+        console.log(`[PluginBridge] Forwarded agent:cancel_session to background plugin: ${kernelPluginId}`);
+      }
+    } catch (err) {
+      console.error('[PluginBridge] Failed to forward agent:cancel_session to background plugin:', err);
+    }
+  }
+});
+
+export function writeStdinForSession(sessionId: string, text: string): boolean {
+  console.log(`[PluginBridge] Writing to stdin for session: ${sessionId}, text length: ${text.length}`);
+  let written = false;
+  for (const item of activeChildProcesses.values()) {
+    if (item.sessionId === sessionId) {
+      if (item.child.stdin && !item.child.stdin.destroyed) {
+        try {
+          item.child.stdin.write(text + '\n');
+          console.log(`[PluginBridge] Wrote text to stdin of process`);
+          written = true;
+        } catch (err) {
+          console.warn(`[PluginBridge] Failed to write to stdin:`, err);
+        }
+      }
+    }
+  }
+  return written;
+}
+
+ipcMain.on('agent:send-stdin', (_event, payload: any) => {
+  if (payload && typeof payload.sessionId === 'string' && typeof payload.text === 'string') {
+    writeStdinForSession(payload.sessionId, payload.text);
+  }
+});
+
+interface ExecCommandOptions {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;
+  shell?: boolean;
+  streamEventName?: string;
+  sessionId?: string;
+  resolveOnSilenceMs?: number;
+  sudo?: boolean;
+}
+
+interface ExecCommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  signal: string | null;
+  resolvedEarly?: boolean;
+}
+
+async function executeSudoCommand(
+  options: ExecCommandOptions,
+  sender?: Electron.WebContents,
+): Promise<ExecCommandResult> {
+  const mod = await import('electron-sudo-universal') as Record<string, unknown>;
+  const SudoerClass = (mod.default as Record<string, unknown>)?.["electron-sudo"] as new (opts: { name: string }) => any
+    || (mod as Record<string, unknown>)["electron-sudo"] as new (opts: { name: string }) => any;
+  if (!SudoerClass) {
+    throw new Error('Failed to load electron-sudo-universal: SudoerClass not found in module exports');
+  }
+  const { oemManager } = await import('../../services/oem-manager');
+  const appName = oemManager.getConfig().appName || '莓莓印记';
+  const sudoer = new SudoerClass({ name: appName });
+
+  const commandStr = [options.command, ...(options.args || [])].map(arg => {
+    if (arg.includes(' ') && !arg.startsWith('"') && !arg.startsWith("'")) {
+      return `"${arg.replace(/"/g, '\\"')}"`;
+    }
+    return arg;
+  }).join(' ');
+
+  const cwd = typeof options.cwd === 'string' && options.cwd.trim() ? options.cwd : app.getPath('home');
+  const env = options.env || {};
+
+  return new Promise<ExecCommandResult>((resolve) => {
+    if (options.sessionId) {
+      const mainWin = ElectronMainWindow.getInstance().getWindow();
+      if (mainWin && !mainWin.isDestroyed()) {
+        mainWin.webContents.send('agent:process-started', { sessionId: options.sessionId });
+      }
+    }
+
+    const streamEventName = options.streamEventName;
+
+    sudoer.exec(commandStr, { env, cwd })
+      .then((output: string | Buffer) => {
+        const stdout = typeof output === 'string' ? output : (output as Buffer).toString('utf-8');
+        
+        if (streamEventName) {
+          emitExecStream(sender, streamEventName, { stream: 'stdout', chunk: stdout });
+          emitExecStream(sender, streamEventName, { stream: 'exit', code: 0, signal: null });
+        }
+
+        if (options.sessionId) {
+          const mainWin = ElectronMainWindow.getInstance().getWindow();
+          if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send('agent:process-exited', { sessionId: options.sessionId });
+          }
+        }
+
+        resolve({
+          code: 0,
+          stdout,
+          stderr: '',
+          signal: null,
+        });
+      })
+      .catch((err: Error) => {
+        const errorText = err instanceof Error ? err.message : String(err);
+        if (streamEventName) {
+          emitExecStream(sender, streamEventName, { stream: 'stderr', chunk: errorText });
+          emitExecStream(sender, streamEventName, { stream: 'exit', code: 1, signal: null });
+        }
+
+        if (options.sessionId) {
+          const mainWin = ElectronMainWindow.getInstance().getWindow();
+          if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send('agent:process-exited', { sessionId: options.sessionId });
+          }
+        }
+
+        resolve({
+          code: 1,
+          stdout: '',
+          stderr: errorText,
+          signal: null,
+        });
+      });
+  });
+}
+
+function emitExecStream(
+  sender: Electron.WebContents | undefined,
+  streamEventName: string | undefined,
+  payload: any,
+): void {
+  if (!streamEventName) return;
+
+  if (sender && !sender.isDestroyed()) {
+    sender.send(streamEventName, payload);
+    return;
+  }
+
+  BrowserWindow.getAllWindows().forEach((win) => {
+    if (!win.isDestroyed()) {
+      win.webContents.send(streamEventName, payload);
+    }
+  });
+}
+
+export function getBundledNpmPaths(): { npmCli: string; npxCli: string } | null {
+  const npmCandidates: string[] = [];
+  if (process.resourcesPath) {
+    npmCandidates.push(join(process.resourcesPath, 'npm', 'bin', 'npm-cli.js'));
+  }
+  npmCandidates.push(join(app.getAppPath(), '..', 'build-resources', 'npm', 'bin', 'npm-cli.js'));
+  npmCandidates.push(join(app.getAppPath(), 'build-resources', 'npm', 'bin', 'npm-cli.js'));
+
+  for (const npmCli of npmCandidates) {
+    if (fsSync.existsSync(npmCli)) {
+      const npxCli = npmCli.replace('npm-cli.js', 'npx-cli.js');
+      if (fsSync.existsSync(npxCli)) {
+        return { npmCli, npxCli };
+      }
+    }
+  }
+  return null;
+}
+
+export function ensureSandboxShims(sandboxDir: string, bundled: { npmCli: string; npxCli: string }) {
+  const binDir = join(sandboxDir, 'bin');
+  if (!fsSync.existsSync(sandboxDir)) {
+    fsSync.mkdirSync(sandboxDir, { recursive: true });
+  }
+  if (!fsSync.existsSync(binDir)) {
+    fsSync.mkdirSync(binDir, { recursive: true });
+  }
+
+  const execPath = process.execPath;
+
+  if (process.platform === 'win32') {
+    const shims = [
+      {
+        path: join(sandboxDir, 'node.cmd'),
+        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" %*\r\n`
+      },
+      {
+        path: join(sandboxDir, 'npm.cmd'),
+        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npmCli}" %*\r\n`
+      },
+      {
+        path: join(sandboxDir, 'npx.cmd'),
+        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npxCli}" %*\r\n`
+      },
+      {
+        path: join(binDir, 'node.cmd'),
+        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" %*\r\n`
+      },
+      {
+        path: join(binDir, 'npm.cmd'),
+        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npmCli}" %*\r\n`
+      },
+      {
+        path: join(binDir, 'npx.cmd'),
+        content: `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${execPath}" "${bundled.npxCli}" %*\r\n`
+      }
+    ];
+
+    for (const shim of shims) {
+      if (!fsSync.existsSync(shim.path) || fsSync.readFileSync(shim.path, 'utf8') !== shim.content) {
+        try {
+          fsSync.writeFileSync(shim.path, shim.content, 'utf8');
+        } catch (err) {
+          console.error(`[PluginBridge] Failed to write Windows shim ${shim.path}:`, err);
+        }
+      }
+    }
+  } else {
+    const shims = [
+      {
+        path: join(binDir, 'node'),
+        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec "${execPath}" "$@"\n`
+      },
+      {
+        path: join(binDir, 'npm'),
+        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec "${execPath}" "${bundled.npmCli}" "$@"\n`
+      },
+      {
+        path: join(binDir, 'npx'),
+        content: `#!/bin/sh\nexport ELECTRON_RUN_AS_NODE=1\nexec "${execPath}" "${bundled.npxCli}" "$@"\n`
+      }
+    ];
+
+    for (const shim of shims) {
+      if (!fsSync.existsSync(shim.path) || fsSync.readFileSync(shim.path, 'utf8') !== shim.content) {
+        try {
+          fsSync.writeFileSync(shim.path, shim.content, { encoding: 'utf8', mode: 0o755 });
+        } catch (err) {
+          console.error(`[PluginBridge] Failed to write POSIX shim ${shim.path}:`, err);
+        }
+      }
+    }
+  }
+}
+
+export async function executeSystemCommand(
+  _pluginId: string,
+  options: ExecCommandOptions,
+  sender?: Electron.WebContents,
+): Promise<ExecCommandResult> {
+  if (!options || typeof options.command !== 'string' || !options.command.trim()) {
+    throw new Error('system.execCommand requires a non-empty command string');
+  }
+
+  if (options.sudo) {
+    return executeSudoCommand(options, sender);
+  }
+
+  const args = Array.isArray(options.args) ? options.args.map((arg) => {
+    let s = String(arg);
+    if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
+      s = s.slice(1, -1);
+    }
+    return s;
+  }) : [];
+  const timeoutMs =
+    typeof options.timeoutMs === 'number'
+      ? Math.max(0, Math.min(30 * 60 * 1000, Math.floor(options.timeoutMs)))
+      : 0;
+  const cwd = typeof options.cwd === 'string' && options.cwd.trim() ? options.cwd : app.getPath('home');
+
+  const sandboxDir = join(app.getPath('userData'), 'npx-tools-sandbox');
+  const binDir = join(sandboxDir, 'bin');
+
+  const env: Record<string, string> = {
+    ...Object.entries(process.env).reduce<Record<string, string>>((acc, [key, value]) => {
+      if (typeof value === 'string') acc[key] = value;
+      return acc;
+    }, {}),
+    PATH: getShellPath(),
+    ...(options.env || {}),
+  };
+
+  const bundled = getBundledNpmPaths();
+  if (bundled) {
+    ensureSandboxShims(sandboxDir, bundled);
+    env.npm_config_prefix = sandboxDir;
+    env.npm_config_cache = join(sandboxDir, '.npm-cache');
+    env.npm_config_tmp = join(sandboxDir, '.npm-tmp');
+    env.npm_config_registry = 'https://registry.npmmirror.com';
+  }
+
+  const sandboxBinLocal = join(sandboxDir, 'node_modules', '.bin');
+  const separator = process.platform === 'win32' ? ';' : ':';
+  let currentPath = options.env?.PATH || env.PATH || getShellPath();
+  const prependedPaths = [sandboxBinLocal, binDir];
+  if (process.platform === 'win32') {
+    prependedPaths.push(sandboxDir);
+  }
+  env.PATH = [...prependedPaths, currentPath].filter(Boolean).join(separator);
+
+  if (_pluginId && _pluginId.includes('npx-tools')) {
+    const home = app.getPath('home');
+    let unifiedHome: string;
+    if (process.platform === 'win32') {
+      unifiedHome = join(process.env.APPDATA || app.getPath('appData'), 'BerryTrace');
+      env.USERPROFILE = unifiedHome;
+      env.APPDATA = unifiedHome;
+    } else if (process.platform === 'darwin') {
+      unifiedHome = join(app.getPath('appData'), 'BerryTrace');
+      env.HOME = unifiedHome;
+    } else {
+      unifiedHome = join(home, '.local', 'share', 'berrytrace');
+      env.HOME = unifiedHome;
+    }
+
+    if (!fsSync.existsSync(unifiedHome)) {
+      fsSync.mkdirSync(unifiedHome, { recursive: true });
+    }
+  }
+
+  let runCommand = options.command;
+  let runArgs = args;
+  if (runCommand === 'node' || runCommand === 'builtin-node') {
+    runCommand = process.execPath;
+    env.ELECTRON_RUN_AS_NODE = '1';
+
+    if (args.length > 0 && typeof args[0] === 'string' && !fsSync.existsSync(args[0])) {
+      const scriptPath = args[0];
+      const match = scriptPath.match(/(plugins-dev\/[^\/]+)\/node_modules\/(.+)$/);
+      if (match) {
+        let fallbackPath = join(app.getAppPath(), 'node_modules', match[2]);
+        if (!fsSync.existsSync(fallbackPath)) {
+          fallbackPath = join(app.getAppPath(), '..', 'node_modules', match[2]);
+        }
+        if (fsSync.existsSync(fallbackPath)) {
+          runArgs = [fallbackPath, ...args.slice(1)];
+        }
+      }
+    }
+  }
+
+  let useShell = Boolean(options.shell);
+  if (process.platform === 'win32' && !options.shell) {
+    if (!extname(runCommand)) {
+      const pathDirs = (env.PATH || '').split(';');
+      for (const dir of pathDirs) {
+        const cmdPath = join(dir, `${runCommand}.cmd`);
+        if (dir && fsSync.existsSync(cmdPath)) {
+          runCommand = cmdPath;
+          useShell = true;
+          break;
+        }
+      }
+    } else if (runCommand.endsWith('.cmd') || runCommand.endsWith('.bat')) {
+      useShell = true;
+    }
+  }
+
+  let retryCount = 0;
+
+  const doSpawn = (): Promise<ExecCommandResult> => {
+    return new Promise<ExecCommandResult>((resolve) => {
+      const child = spawn(runCommand, runArgs, {
+        cwd,
+        env,
+        shell: useShell,
+        windowsHide: true,
+      });
+
+      if (options.sessionId) {
+        const mainWin = ElectronMainWindow.getInstance().getWindow();
+        if (mainWin && !mainWin.isDestroyed()) {
+          mainWin.webContents.send('agent:process-started', { sessionId: options.sessionId });
+        }
+      }
+
+      const processKey = options.streamEventName || `proc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+      let resolveExit: ((res: ExecCommandResult) => void) | undefined;
+      const exitPromise = new Promise<ExecCommandResult>((r) => {
+        resolveExit = r;
+      });
+
+      const processItem: ActiveProcess = {
+        child,
+        sessionId: options.sessionId,
+        command: options.command,
+        stdout: '',
+        stderr: '',
+        exitPromise,
+        resolveExit,
+        resolvedEarly: false,
+        resolveEarly: () => {
+          if (!settled) {
+            settled = true;
+            processItem.resolvedEarly = true;
+            if (options.sessionId) {
+              const mainWin = ElectronMainWindow.getInstance().getWindow();
+              if (mainWin && !mainWin.isDestroyed()) {
+                mainWin.webContents.send('agent:process-resolved-early', { sessionId: options.sessionId });
+              }
+            }
+            resolve({
+              code: 0,
+              stdout,
+              stderr,
+              signal: null,
+              resolvedEarly: true,
+            });
+          }
+        }
+      };
+      activeChildProcesses.set(processKey, processItem);
+
+      const cleanup = (finalResult?: ExecCommandResult) => {
+        activeChildProcesses.delete(processKey);
+        if (options.sessionId) {
+          if (finalResult) {
+            completedProcessHistory.set(options.sessionId, finalResult);
+          }
+          const mainWin = ElectronMainWindow.getInstance().getWindow();
+          if (mainWin && !mainWin.isDestroyed()) {
+            mainWin.webContents.send('agent:process-exited', { sessionId: options.sessionId });
+          }
+        }
+      };
+
+      let stdout = '';
+      let stderr = '';
+      let timedOut = false;
+      let settled = false;
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      let silenceTimer: NodeJS.Timeout | undefined;
+      const silenceMs = typeof options.resolveOnSilenceMs === 'number' ? options.resolveOnSilenceMs : 0;
+
+      const appendBounded = (base: string, chunk: string) => {
+        const merged = base + chunk;
+        const maxLen = 1024 * 1024;
+        if (merged.length <= maxLen) return merged;
+        return merged.slice(merged.length - maxLen);
+      };
+
+      const resetSilenceTimer = () => {
+        if (silenceMs > 0) {
+          if (silenceTimer) clearTimeout(silenceTimer);
+          silenceTimer = setTimeout(() => {
+            if (processItem.resolveEarly) {
+              processItem.resolveEarly();
+            }
+          }, silenceMs);
+        }
+      };
+
+      if (timeoutMs > 0) {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGTERM');
+        }, timeoutMs);
+      }
+
+      resetSilenceTimer();
+
+      child.stdout.on('data', (chunk: Buffer | string) => {
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+        stdout = appendBounded(stdout, text);
+        processItem.stdout = stdout;
+        emitExecStream(sender, options.streamEventName, { stream: 'stdout', chunk: text });
+        resetSilenceTimer();
+      });
+
+      child.stderr.on('data', (chunk: Buffer | string) => {
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+        stderr = appendBounded(stderr, text);
+        processItem.stderr = stderr;
+        emitExecStream(sender, options.streamEventName, { stream: 'stderr', chunk: text });
+        resetSilenceTimer();
+      });
+
+      child.on('error', (error) => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        if (silenceTimer) clearTimeout(silenceTimer);
+
+        const errorCode = (error as any).code;
+        if ((errorCode === 'ENOENT' || errorCode === 'EACCES') && retryCount < 1 && bundled) {
+          retryCount++;
+          console.warn(`[PluginBridge] Command failed with ${errorCode}. Attempting shim self-healing and retry...`);
+          cleanup();
+          try {
+            ensureSandboxShims(sandboxDir, bundled);
+            doSpawn().then(resolve);
+            return;
+          } catch (repairErr) {
+            console.error('[PluginBridge] Shim self-healing failed:', repairErr);
+          }
+        }
+
+        const errorText = error instanceof Error ? error.message : String(error);
+        const hint = `Command spawn failed: ${options.command} (${errorText})`;
+        stderr = appendBounded(stderr, hint);
+        processItem.stderr = stderr;
+        emitExecStream(sender, options.streamEventName, { stream: 'stderr', chunk: `${hint}\n` });
+        emitExecStream(sender, options.streamEventName, { stream: 'exit', code: 127, signal: null });
+
+        const finalResult: ExecCommandResult = {
+          code: 127,
+          stdout,
+          stderr,
+          signal: null,
+        };
+
+        cleanup(finalResult);
+        if (processItem.resolveExit) {
+          processItem.resolveExit(finalResult);
+        }
+
+        if (!settled) {
+          settled = true;
+          resolve(finalResult);
+        }
+      });
+
+      child.on('close', (code, signal) => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        if (silenceTimer) clearTimeout(silenceTimer);
+        const exitCode = timedOut ? 124 : (code ?? 0);
+        emitExecStream(sender, options.streamEventName, { stream: 'exit', code: exitCode, signal });
+
+        const finalResult: ExecCommandResult = {
+          code: exitCode,
+          stdout,
+          stderr,
+          signal,
+        };
+
+        cleanup(finalResult);
+        if (processItem.resolveExit) {
+          processItem.resolveExit(finalResult);
+        }
+
+        if (!settled) {
+          settled = true;
+          resolve(finalResult);
+        }
+      });
+    });
+  };
+
+  return await doSpawn();
+}
+
+async function waitSystemCommand(
+  sessionId: string,
+): Promise<ExecCommandResult> {
+  for (const item of activeChildProcesses.values()) {
+    if (item.sessionId === sessionId) {
+      console.log(`[PluginBridge] Waiting for active process in session ${sessionId} to finish...`);
+      return item.exitPromise;
+    }
+  }
+  const history = completedProcessHistory.get(sessionId);
+  if (history) {
+    completedProcessHistory.delete(sessionId);
+    return history;
+  }
+  return {
+    code: 0,
+    stdout: 'No active background command running in this session.',
+    stderr: '',
+    signal: null,
+  };
+}
+
+export function resolveCommandEarly(sessionId: string): boolean {
+  console.log(`[PluginBridge] Request to resolve command early for session: ${sessionId}`);
+  let resolved = false;
+  for (const item of activeChildProcesses.values()) {
+    if (item.sessionId === sessionId) {
+      if (item.resolveEarly) {
+        item.resolveEarly();
+        resolved = true;
+      }
+    }
+  }
+  return resolved;
+}
+
+const captureWindows = new Map<string, BrowserWindow>();
+
+export interface FloatWindowOptions extends Partial<Omit<BrowserWindowConstructorOptions, 'webPreferences'>> {
+  url: string;
+  ignoreMouseEvents?: boolean;
+}
+
+export class SystemController extends BaseApiController {
+  private trays = new Map<string, Tray>();
+  private floatWindows = new Map<string, BrowserWindow>();
+
+  // ── system namespace ──
+
+  /**
+   * 获取当前系统主题。
+   * @returns 返回 'dark' 或 'light'
+   */
+  async system_getTheme(): Promise<string> {
+    return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
+  }
+
+  /**
+   * 获取宿主应用的 OEM 基础信息（如软件名称）
+   */
+  async system_getAppInfo(): Promise<{ appName: string; oemId: string; apiGateway: string; logoPath?: string; browserPolicy?: Record<string, unknown> }> {
+    const { oemManager } = await import('../../services/oem-manager');
+    const config = oemManager.getConfig();
+    return {
+      appName: config.appName,
+      oemId: config.oemId,
+      apiGateway: config.apiGateway,
+      logoPath: config.logoPath,
+      browserPolicy: config.browserPolicy as Record<string, unknown> | undefined,
+    };
+  }
+
+  /**
+   * 获取所有当前已启用插件声明的子代理（SubAgent）规格列表。
+   */
+  async system_getSubagentsList(): Promise<unknown[]> {
+    const { PluginManager } = await import('../plugin-manager');
+    return PluginManager.getInstance().getDeclaredSubAgents();
+  }
+
+  /**
+   * 获取可用于屏幕捕获的源列表（屏幕/窗口）。
+   * @param options types — 捕获类型：'screen' 或 'window'
+   * @returns 源列表，每项包含 id 和 name
+   */
+  async system_getDesktopCapturerSources(options: { types: Array<'screen' | 'window'> }): Promise<Array<{ id: string; name: string }>> {
+    const sources = await desktopCapturer.getSources({
+      types: options.types,
+      thumbnailSize: { width: 0, height: 0 }
+    });
+    return sources.map(s => ({
+      id: s.id,
+      name: s.name
+    }));
+  }
+
+  /**
+   * 发送系统原生通知。点击通知会恢复并聚焦主窗口。
+   * @param options title — 通知标题，body — 通知正文，silent — 是否静默（默认 false）
+   * @example
+   * await callApi('system', 'showNotification', [{ title: '任务完成', body: '构建成功' }]);
+   */
+  async system_showNotification(options: { title: string; body: string; silent?: boolean }, context: ApiContext): Promise<null> {
+    if (Notification.isSupported()) {
+      const { oemManager } = await import('../../services/oem-manager');
+      const oemLogo = oemManager.getOEMLogoPath();
+      const iconPath = oemLogo && fsSync.existsSync(oemLogo)
+        ? oemLogo
+        : app.isPackaged
+        ? join(app.getAppPath(), 'dist', process.platform === 'win32' ? 'icon.ico' : 'icon.png')
+        : join(app.getAppPath(), 'public', process.platform === 'win32' ? 'icon.ico' : 'icon.png');
+
+      const notification = new Notification({
+        title: options.title,
+        body: options.body,
+        icon: iconPath,
+        silent: options.silent ?? false,
+      });
+      const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+      notification.on('click', () => {
+        if (win) {
+          if (win.isMinimized()) win.restore();
+          win.focus();
+        }
+      });
+      notification.show();
+    }
+    return null;
+  }
+
+  /**
+   * 切换快速面板（语音助手面板）的显示/隐藏。
+   */
+  async system_toggleQuickPanel(): Promise<null> {
+    const { ElectronQuickPanelWindow } = await import('../../windows/quick-panel');
+    process.nextTick(() => {
+      ElectronQuickPanelWindow.getInstance().toggleQuickPanelWindow();
+    });
+    return null;
+  }
+
+  /**
+   * 在系统默认浏览器中打开 URL。
+   * @param targetUrl 目标 URL
+   * @example
+   * await callApi('system', 'openExternal', ['https://example.com']);
+   */
+  async system_openExternal(targetUrl: string): Promise<null> {
+    await shell.openExternal(targetUrl);
+    return null;
+  }
+
+  /**
+   * 打开 URL。internal=true 时在应用内嵌浏览器打开，否则在系统浏览器打开。
+   * @param targetUrl 目标 URL
+   * @param options internal — 是否内嵌打开，width/height — 内嵌窗口尺寸，alwaysOnTop — 是否置顶
+   * @example
+   * await callApi('system', 'openUrl', [{ targetUrl: 'https://example.com', internal: true, width: 1024, height: 768 }]);
+   */
+  async system_openUrl(targetUrl: string, options?: { internal?: boolean; width?: number; height?: number; alwaysOnTop?: boolean }): Promise<null> {
+    const opts = options || {};
+    if (opts.internal) {
+      const mainWindow = ElectronMainWindow.getInstance().getWindow();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        const width = opts.width || 800;
+        const height = opts.height || 600;
+        const alwaysOnTop = opts.alwaysOnTop !== false;
+        mainWindow.webContents.send('window:open-child', {
+          name: `internal-browser:width=${width}&height=${height}&alwaysOnTop=${alwaysOnTop}`,
+          url: targetUrl,
+          features: `width=${width},height=${height},alwaysOnTop=${alwaysOnTop}`
+        });
+        return null;
+      }
+    }
+    await shell.openExternal(targetUrl);
+    return null;
+  }
+
+  /**
+   * 向系统剪贴板写入文本。
+   * @param text 文本内容
+   */
+  async system_clipboardWriteText(text: string): Promise<null> {
+    clipboard.writeText(text);
+    return null;
+  }
+
+  /**
+   * 执行系统命令。支持 shell 命令、超时控制、流式输出、sudo 提权。
+   * @param options command — 命令字符串，args — 参数数组，cwd — 工作目录，timeoutMs — 超时毫秒，streamEventName — 流事件名，sessionId — 会话 ID，sudo — 是否提权
+   * @returns code — 退出码，stdout — 标准输出，stderr — 标准错误，signal — 终止信号
+   * @example
+   * await callApi('system', 'execCommand', [{ command: 'ls', args: ['-la'], cwd: '/tmp', timeoutMs: 10000 }]);
+   */
+  async system_execCommand(options: ExecCommandOptions, context: ApiContext): Promise<ExecCommandResult> {
+    return executeSystemCommand(context.pluginId, options, context.sender);
+  }
+
+  /**
+   * 解析内置 npm CLI 路径，用于插件中的 npm 操作。
+   * @returns { npmCli, npxCli } 或 null
+   */
+  async system_resolveNpmCli(): Promise<unknown> {
+    const paths = getBundledNpmPaths();
+    if (paths) {
+      console.log(`[PluginBridge] npm-cli.js resolved: ${paths.npmCli}`);
+      return paths;
+    }
+    console.warn('[PluginBridge] Bundled npm-cli.js not found in extraResources or build-resources.');
+    return null;
+  }
+
+  /**
+   * 等待指定会话的 execCommand 完成，阻塞直到进程退出。
+   * @param options sessionId — execCommand 时传入的会话 ID
+   * @example
+   * await callApi('system', 'waitCommand', [{ sessionId: 'my-session' }]);
+   */
+  async system_waitCommand(options: { sessionId: string }): Promise<ExecCommandResult> {
+    return waitSystemCommand(options.sessionId);
+  }
+
+  /**
+   * 提前终止指定会话的 execCommand，不等进程退出即返回已有输出。
+   * @param options sessionId — execCommand 时传入的会话 ID
+   * @example
+   * await callApi('system', 'resolveCommandEarly', [{ sessionId: 'my-session' }]);
+   */
+  async system_resolveCommandEarly(options: { sessionId: string }): Promise<boolean> {
+    return resolveCommandEarly(options.sessionId);
+  }
+
+  /**
+   * 向正在运行的 execCommand 进程的 stdin 写入文本。
+   * @param options sessionId — 会话 ID，text — 写入文本
+   * @example
+   * await callApi('system', 'writeStdin', [{ sessionId: 'my-session', text: 'y\\n' }]);
+   */
+  async system_writeStdin(options: { sessionId: string; text: string }): Promise<boolean> {
+    return writeStdinForSession(options.sessionId, options.text);
+  }
+
+  /**
+   * 获取当前系统焦点元素的输入信息（选中文本、输入值、角色）。
+   * @returns selection — 选中文本，value — 输入值，role — AX 角色
+   * @example
+   * await callApi('system', 'getFocusedInputInfo', []);
+   */
+  async system_getFocusedInputInfo(): Promise<{ selection: string; value: string; role: string }> {
+    console.log('[SystemController] getFocusedInputInfo called');
+    const hook = getMouseHook();
+    if (hook && hook.getFocusedInputInfo) {
+      try {
+        const info = hook.getFocusedInputInfo();
+        console.log('[SystemController] getFocusedInputInfo result:', info);
+        return info;
+      } catch (err) {
+        console.error('[SystemController] Failed to call native getFocusedInputInfo:', err);
+      }
+    } else {
+      console.warn('[SystemController] getFocusedInputInfo is not supported on this platform/addon');
+    }
+    return { selection: '', value: '', role: '' };
+  }
+
+  /**
+   * 检测当前系统焦点元素是否处于可编辑的输入区域。
+   * 业务层可在触发 AI 填充前调用此接口，如果返回 isInput=false
+   * 则提示用户将光标移入输入框后再执行。
+   *
+   * 返回值：
+   *   isInput    — 是否为任何可输入区域（含 contenteditable）
+   *   isEditable — 是否明确可编辑（AXEditable=true 或 native role）
+   *   role       — AX Role 字符串，如 "AXTextField" / "AXWebArea"
+   */
+  async system_isFocusedInInputArea(): Promise<{ isInput: boolean; isEditable: boolean; role: string }> {
+    console.log('[SystemController] isFocusedInInputArea called');
+    const focusedWin = BrowserWindow.getFocusedWindow();
+    if (focusedWin) {
+      try {
+        const isInput = await focusedWin.webContents.executeJavaScript(`
+          (() => {
+            let el = document.activeElement;
+            while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+              el = el.shadowRoot.activeElement;
+            }
+            if (!el) return false;
+            const tagName = el.tagName.toLowerCase();
+            if (tagName === 'input' || tagName === 'textarea') return true;
+            if (el.contentEditable === 'true' || el.contentEditable === 'plaintext-only') return true;
+            if (el.getAttribute('role') === 'textbox') return true;
+            
+            let parent = el;
+            while (parent && parent !== document.body) {
+              if (parent.contentEditable === 'true' || parent.contentEditable === 'plaintext-only') return true;
+              parent = parent.parentElement;
+            }
+            return false;
+          })()
+        `);
+        console.log('[SystemController] Focused inside Electron window, JS input detection:', isInput);
+        return { isInput: !!isInput, isEditable: !!isInput, role: isInput ? 'AXTextArea' : '' };
+      } catch (err) {
+        console.error('[SystemController] Failed to check focus in Electron window:', err);
+      }
+    }
+
+    const hook = getMouseHook();
+    if (hook && hook.isFocusedInInputArea) {
+      try {
+        const result = hook.isFocusedInInputArea();
+        console.log('[SystemController] isFocusedInInputArea result:', result);
+        return result;
+      } catch (err) {
+        console.error('[SystemController] Failed to call native isFocusedInInputArea:', err);
+      }
+    } else {
+      console.warn('[SystemController] isFocusedInInputArea is not supported on this platform/addon');
+    }
+    return { isInput: false, isEditable: false, role: '' };
+  }
+
+
+  /**
+   * 向当前焦点输入框插入文本。自动检测输入区域类型，按优先级尝试：
+   * 1. IPC 直发（同应用窗口）2. 模拟键盘输入 3. Accessibility API 注入 4. 剪贴板粘贴。
+   * 插入前会自动恢复之前缓存的活动应用焦点。失败时将文本写入剪贴板作为安全备份。
+   * @param options text — 要插入的文本
+   * @returns 是否插入成功
+   * @example
+   * await callApi('system', 'insertText', [{ text: 'Hello World' }]);
+   */
+  async system_insertText(options: { text: string }): Promise<boolean> {
+    console.log(`[SystemController] insertText called with text length: ${options.text?.length}`);
+    if (!options || typeof options.text !== 'string') {
+      throw new Error('system.insertText requires a text parameter');
+    }
+
+    const hook = getMouseHook();
+
+    // 1. Focus restoration: if we have a stashed target PID, reactivate it first
+    const stashedPid = cache.get('lastActiveAppPid') as string | null;
+    if (stashedPid) {
+      console.log(`[SystemController] Restoring focus to stashed active app PID: ${stashedPid}`);
+      try {
+        if (hook && hook.activeWindow) {
+          hook.activeWindow(stashedPid);
+          // Give the OS window manager a brief moment to complete the focus transition
+          await new Promise((resolve) => setTimeout(resolve, 80));
+        }
+      } catch (err) {
+        console.error('[SystemController] Failed to restore focus to stashed PID:', err);
+      }
+      // Clear stashed PID
+      cache.set('lastActiveAppPid', null);
+    }
+
+    let success = false;
+    let viaAX = false;
+    let viaTyping = false;
+    let viaIPC = false;
+
+    // A. If the focused window belongs to our own Electron application, insert via direct IPC
+    const focusedWin = BrowserWindow.getFocusedWindow();
+    if (focusedWin && !focusedWin.isDestroyed()) {
+      try {
+        const url = focusedWin.webContents.getURL();
+        if (url && url.includes('fn-voice-panel')) {
+          console.log('[SystemController:insertText] Focused window is the voice panel itself, bypassing direct IPC');
+        } else {
+          console.log('[SystemController:insertText] Direct IPC target: Our own app window found. Sending system:insert-text-direct event...');
+          focusedWin.webContents.send('system:insert-text-direct', { text: options.text });
+          success = true;
+          viaIPC = true;
+          return true;
+        }
+      } catch (err) {
+        console.error('[SystemController:insertText] Failed to route insert text via direct IPC:', err);
+      }
+    }
+
+    if (!hook) {
+      console.error('[SystemController:insertText] MouseHook native module not loaded, cannot insert text!');
+      return false;
+    }
+
+    // B. Check if the active window actually has a focused input field right now (for external apps)
+    let isInputArea = false;
+    if (hook.isFocusedInInputArea) {
+      try {
+        const focusInfo = hook.isFocusedInInputArea();
+        isInputArea = focusInfo.isInput;
+        console.log(`[SystemController:insertText:focus-debug] Target focus verification: isInput=${focusInfo.isInput}, isEditable=${focusInfo.isEditable}, role="${focusInfo.role}"`);
+      } catch (err) {
+        console.error('[SystemController:insertText:focus-debug] Failed to query isFocusedInInputArea:', err);
+      }
+    }
+
+    if (!isInputArea) {
+      // Enhanced diagnostics: log everything we know about the current focus state
+      const frontmostAppId = hook?.getFrontmostAppId?.() || 'N/A';
+      const frontmostPid = hook?.getFrontmostAppPid?.() || 'N/A';
+      const focusInfoRetry = hook?.isFocusedInInputArea?.();
+      console.warn(
+        `[SystemController:insertText:focus-debug] Insertion validation FAILED — entering copy-fallback. Diagnostics:\n` +
+        `  restoredPid: ${stashedPid || 'N/A'}\n` +
+        `  frontmostAppId: ${frontmostAppId}\n` +
+        `  frontmostPid: ${frontmostPid}\n` +
+        `  focusInfo: ${JSON.stringify(focusInfoRetry)}\n` +
+        `  textLength: ${options.text.length}`
+      );
+      // Copy to clipboard as safety backup
+      try {
+        clipboard.writeText(options.text);
+        console.log('[SystemController:insertText:focus-debug] Text copied to clipboard as a safety backup');
+      } catch (clipErr) {
+        console.error('[SystemController:insertText:focus-debug] Failed to write backup to clipboard:', clipErr);
+      }
+      return false;
+    }
+
+    // 1. Try Simulated Typing (Keyboard simulation) - safest and most reliable for React/Monaco/Electron/Web editors
+    if (!success && hook.simulateTyping) {
+      console.log(`[SystemController:insertText] Mode [1/3] - Attempting native simulated typing for text of length: ${options.text.length}`);
+      try {
+        hook.simulateTyping(options.text);
+        success = true;
+        viaTyping = true;
+        console.log('[SystemController:insertText] Native simulated typing successfully posted to OS event queue');
+      } catch (err) {
+        console.error('[SystemController:insertText] Native simulated typing failed:', err);
+      }
+    }
+
+    // 2. Fallback to Accessibility API (AXUIElement)
+    if (!success && hook.insertTextViaAX) {
+      console.log('[SystemController:insertText] Mode [2/3] - Fallback to Accessibility AXUIElement injection...');
+      try {
+        success = hook.insertTextViaAX(options.text);
+        if (success) {
+          console.log('[SystemController:insertText] Text successfully injected via AXUIElement (Accessibility API)');
+          viaAX = true;
+        } else {
+          console.warn('[SystemController:insertText] AXUIElement injection returned false (not editable or element lost)');
+        }
+      } catch (err) {
+        console.error('[SystemController:insertText] AXUIElement injection failed with exception:', err);
+      }
+    }
+
+    // 3. Absolute Fallback to Clipboard Paste
+    if (!success) {
+      console.log('[SystemController:insertText] Mode [3/3] - Fallback to Clipboard Copy & Paste Keystroke...');
+      try {
+        const oldText = clipboard.readText();
+        clipboard.writeText(options.text);
+        if (hook.simulatePasteKeystroke) {
+          console.log('[SystemController:insertText] Simulating Cmd+V/Ctrl+V keystroke...');
+          hook.simulatePasteKeystroke();
+          success = true;
+        } else {
+          console.warn('[SystemController:insertText] simulatePasteKeystroke is not supported, skipping keyboard paste simulation');
+        }
+        setTimeout(() => {
+          console.log('[SystemController:insertText] Restoring original clipboard text...');
+          clipboard.writeText(oldText);
+        }, 150);
+      } catch (err) {
+        console.error('[SystemController:insertText] Clipboard copy-paste fallback failed:', err);
+      }
+    }
+
+    console.log(`[SystemController:insertText] Insertion session completed. Success: ${success}, Method: ${viaIPC ? 'IPC' : viaTyping ? 'Typing' : viaAX ? 'AX' : success ? 'Clipboard' : 'None'}`);
+
+    // 3. Optional Auto-Send Enter simulation
+    if (success && cache.get(CacheAttribute.prefFnAutoSendEnabled) === true) {
+      const delay = viaAX ? 50 : 150;
+      setTimeout(() => {
+        if (hook.simulateEnterKeystroke) {
+          console.log(`[SystemController] Simulating Enter key after ${delay}ms`);
+          hook.simulateEnterKeystroke();
+        } else {
+          console.warn('[SystemController] simulateEnterKeystroke is not supported');
+        }
+      }, delay);
+    }
+
+    return success;
+  }
+
+  /**
+   * 打开捕获窗口用于网页截屏/数据抓取。headless=true 时不可见，等待页面加载后返回。
+   * @param url 要加载的 URL
+   * @param token 捕获令牌（用于后续 triggerCapture / closeCaptureWindow）
+   * @param headless 是否无头模式，默认 false
+   */
+  async system_openCaptureWindow(url: string, token: string, headless?: boolean): Promise<boolean> {
+    const existing = captureWindows.get(token);
+    if (existing && !existing.isDestroyed()) {
+      try {
+        existing.close();
+      } catch (e) {
+        console.error('[PluginBridge] Failed to close existing capture window:', e);
+      }
+    }
+
+    const captureWin = new BrowserWindow({
+      width: 1024,
+      height: 768,
+      show: !headless,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+      }
+    });
+
+    if (headless) {
+      captureWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    }
+
+    captureWindows.set(token, captureWin);
+
+    captureWin.on('closed', () => {
+      captureWindows.delete(token);
+      const mainWin = ElectronMainWindow.getInstance().getWindow();
+      if (mainWin && !mainWin.isDestroyed()) {
+        mainWin.webContents.send('npx-tools:capture-window-closed', { token });
+      }
+    });
+
+    if (headless) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error(`[openCaptureWindow] Page load timeout (30s) for: ${url}`));
+        }, 30000);
+
+        captureWin.webContents.once('did-finish-load', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+
+        captureWin.webContents.on('did-fail-load', (_event, errCode, errDesc) => {
+          clearTimeout(timeout);
+          reject(new Error(`[openCaptureWindow] Page load failed: ${errCode} ${errDesc}`));
+        });
+
+        captureWin.loadURL(url).catch(reject);
+      });
+      return true;
+    }
+
+    captureWin.loadURL(url);
+    return true;
+  }
+
+  /**
+   * 触发捕获窗口截取页面 HTML 并关闭窗口。
+   * @param token 捕获令牌
+   * @returns 页面完整 HTML
+   */
+  async system_triggerCapture(token: string): Promise<string> {
+    const captureWin = captureWindows.get(token);
+    if (!captureWin || captureWin.isDestroyed()) {
+      throw new Error('Capture window not found or already closed');
+    }
+
+    const html = await captureWin.webContents.executeJavaScript('document.documentElement.outerHTML');
+    try {
+      captureWin.close();
+    } catch (e) {
+      console.error('[PluginBridge] Failed to close capture window on triggerCapture:', e);
+    }
+    return html;
+  }
+
+  /**
+   * 强制关闭指定令牌的捕获窗口。
+   * @param token 捕获令牌
+   */
+  async system_closeCaptureWindow(token: string): Promise<boolean> {
+    const captureWin = captureWindows.get(token);
+    if (captureWin && !captureWin.isDestroyed()) {
+      try {
+        captureWin.close();
+      } catch (e) {
+        console.error('[PluginBridge] Failed to close capture window on closeCaptureWindow:', e);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * 在桌面创建插件快捷方式（Windows .lnk / macOS .webloc / Linux .desktop）。
+   * @param options name — 名称，icon — 图标路径（可选），description — 描述（可选）
+   * @returns 创建成功返回 true
+   * @example
+   * await callApi("system", "createDesktopShortcut", [{ name: "我的插件" }]);
+   */
+  async system_createDesktopShortcut(options: { name: string; icon?: string; description?: string }, context: ApiContext): Promise<boolean> {
+    const desktopPath = app.getPath('desktop');
+    try {
+      if (process.platform === 'win32') {
+        const lnkPath = join(desktopPath, `${options.name}.lnk`);
+        const execPath = process.execPath;
+        const iconPath = options.icon || join(app.getAppPath(), 'dist', 'icon.ico');
+        const tempVbsPath = join(app.getPath('temp'), `shortcut-${Date.now()}.vbs`);
+
+        const vbsContent = [
+          'Set WshShell = CreateObject("WScript.Shell")',
+          `Set Shortcut = WshShell.CreateShortcut("${lnkPath.replace(/\\/g, '\\\\')}")`,
+          `Shortcut.TargetPath = "${execPath.replace(/\\/g, '\\\\')}"`,
+          `Shortcut.Arguments = "--run-plugin=${context.pluginId} --silent"`,
+          `Shortcut.IconLocation = "${iconPath.replace(/\\/g, '\\\\')}"`,
+          'Shortcut.Save'
+        ].join('\r\n');
+
+        await fs.writeFile(tempVbsPath, vbsContent, 'utf-8');
+        const { exec } = await import('child_process');
+        await new Promise((resolve, reject) => {
+          exec(`cscript.exe //NoLogo "${tempVbsPath}"`, (error) => {
+            fs.unlink(tempVbsPath).catch(() => {});
+            if (error) reject(error);
+            else resolve(true);
+          });
+        });
+        return true;
+      } else if (process.platform === 'darwin') {
+        const weblocPath = join(desktopPath, `${options.name}.webloc`);
+        const scheme = !app.isPackaged ? 'berrytrace-dev' : 'berrytrace';
+        const weblocContent = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>URL</key>
+	<string>${scheme}://open-plugin?id=${context.pluginId}&amp;silent=true</string>
+</dict>
+</plist>`;
+        await fs.writeFile(weblocPath, weblocContent, 'utf-8');
+        return true;
+      } else {
+        const desktopFilePath = join(desktopPath, `${options.name}.desktop`);
+        const iconPath = options.icon || '';
+        const execPath = process.execPath;
+        const desktopContent = `[Desktop Entry]
+Name=${options.name}
+Exec="${execPath}" --run-plugin=${context.pluginId} --silent
+Icon=${iconPath}
+Type=Application
+Terminal=false
+Categories=Utility;`;
+        await fs.writeFile(desktopFilePath, desktopContent, { encoding: 'utf-8', mode: 0o755 });
+
+        const appsPath = join(app.getPath('home'), '.local', 'share', 'applications');
+        await fs.mkdir(appsPath, { recursive: true }).catch(() => {});
+        const localDesktopPath = join(appsPath, `berrytrace-plugin-${context.pluginId}.desktop`);
+        await fs.writeFile(localDesktopPath, desktopContent, { encoding: 'utf-8', mode: 0o755 });
+        return true;
+      }
+    } catch (err) {
+      console.error('[SystemController:createDesktopShortcut] Failed to create shortcut:', err);
+      return false;
+    }
+  }
+
+  /**
+   * 设置插件的系统托盘菜单。首次调用自动创建托盘图标。
+   * @param menuTemplate 菜单项数组，每项包含 label、type（normal/separator/checkbox）、clickCommand
+   * @example
+   * await callApi("system", "setTrayMenu", [{ menuTemplate: [{ label: "打开", clickCommand: "open" }] }]);
+   */
+  async system_setTrayMenu(menuTemplate: Array<{ label: string; type?: 'normal' | 'separator' | 'checkbox'; checked?: boolean; clickCommand: string }>, context: ApiContext): Promise<boolean> {
+    try {
+      let tray = this.trays.get(context.pluginId);
+      if (!tray) {
+        const { oemManager } = await import('../../services/oem-manager');
+        const oemLogo = oemManager.getConfig().logoPath;
+        const iconPath = oemLogo && fsSync.existsSync(oemLogo)
+          ? oemLogo
+          : app.isPackaged
+          ? join(app.getAppPath(), 'dist', process.platform === 'win32' ? 'icon.ico' : 'icon.png')
+          : join(app.getAppPath(), 'public', process.platform === 'win32' ? 'icon.ico' : 'icon.png');
+        tray = new Tray(iconPath);
+        this.trays.set(context.pluginId, tray);
+      }
+
+      const template = menuTemplate.map(item => {
+        if (item.type === 'separator') {
+          return { type: 'separator' as const };
+        }
+        return {
+          label: item.label,
+          type: item.type as any,
+          checked: item.checked,
+          click: () => {
+            const dispatcher = ApiDispatcher.getInstance();
+            dispatcher.dispatch(context.pluginId, 'commands', 'execute', [item.clickCommand]).catch((err: unknown) => {
+              console.error('[TrayMenu] Failed to execute clickCommand:', item.clickCommand, err);
+            });
+          }
+        };
+      });
+
+      template.push({ type: 'separator' as const });
+      template.push({
+        label: `关闭 ${context.pluginId}`,
+        type: 'normal' as const,
+        checked: undefined,
+        click: () => {
+          tray?.destroy();
+          this.trays.delete(context.pluginId);
+          const { ElectronFloatBall } = require('../../windows/float-ball');
+          ElectronFloatBall.getInstance().closePluginWindows(context.pluginId);
+        }
+      });
+
+      const contextMenu = Menu.buildFromTemplate(template);
+      tray.setContextMenu(contextMenu);
+      const { oemManager } = await import('../../services/oem-manager');
+      const appName = oemManager.getConfig().appName || '莓莓印记';
+      tray.setToolTip(`${appName}插件: ${context.pluginId}`);
+      return true;
+    } catch (err) {
+      console.error('[SystemController:setTrayMenu] Failed to set tray menu:', err);
+      return false;
+    }
+  }
+
+  /**
+   * 注册全局快捷键，按下时自动执行指定的 commandId。
+   * @param accelerator 快捷键（如 "CmdOrCtrl+Shift+K"）
+   * @param commandId 触发时执行的命令 ID
+   * @returns 注册成功返回 true
+   */
+  async system_registerGlobalShortcut(accelerator: string, commandId: string, context: ApiContext): Promise<boolean> {
+    try {
+      const isRegistered = globalShortcut.register(accelerator, () => {
+        const dispatcher = ApiDispatcher.getInstance();
+        dispatcher.dispatch(context.pluginId, 'commands', 'execute', [commandId]).catch((err: unknown) => {
+          console.error('[GlobalShortcut] Failed to execute hotkey command:', commandId, err);
+        });
+      });
+      return isRegistered;
+    } catch (err) {
+      console.error('[GlobalShortcut] Registration failed:', err);
+      return false;
+    }
+  }
+
+  /**
+   * 注销全局快捷键。
+   * @param accelerator 快捷键
+   */
+  async system_unregisterGlobalShortcut(accelerator: string): Promise<null> {
+    globalShortcut.unregister(accelerator);
+    return null;
+  }
+
+  /**
+   * 注册快捷动作（显示在快捷键列表 UI 中）。必须在后台进程注册。
+   * @param options id — 唯一 ID，label — 显示名称，icon — 图标（可选）
+   */
+  async system_registerShortcutAction(options: { id: string; label: string; icon?: string }, context: ApiContext): Promise<void> {
+    const { getShortcutActionRegistry } = await import('../../services/shortcut-action-registry.js');
+    const registry = getShortcutActionRegistry();
+    const dispatcher = ApiDispatcher.getInstance();
+    registry.register({
+      id: options.id,
+      label: options.label,
+      icon: options.icon || '⚡',
+      pluginId: context.pluginId,
+      handler: () => {
+        dispatcher.dispatch(context.pluginId, 'commands', 'execute', [options.id]).catch((err: unknown) => {
+          console.error('[ShortcutAction] Failed to execute command:', options.id, err);
+        });
+      },
+    });
+  }
+
+  /**
+   * 注销快捷动作。
+   * @param id 快捷动作 ID
+   */
+  async system_unregisterShortcutAction(id: string): Promise<void> {
+    const { getShortcutActionRegistry } = await import('../../services/shortcut-action-registry.js');
+    const registry = getShortcutActionRegistry();
+    registry.unregister(id);
+  }
+
+  /**
+   * 列出所有已注册的快捷动作。
+   */
+  async system_listShortcutActions(): Promise<Array<{ id: string; label: string; icon: string; pluginId: string }>> {
+    const { getShortcutActionRegistry } = await import('../../services/shortcut-action-registry.js');
+    const registry = getShortcutActionRegistry();
+    return registry.listActions().map(a => ({ id: a.id, label: a.label, icon: a.icon, pluginId: a.pluginId }));
+  }
+
+  /**
+   * 设置窗口鼠标事件穿透（用于桌面特效等场景）。
+   * @param ignore 是否忽略鼠标事件
+   * @param options forward — 是否将事件转发到下层窗口
+   */
+  async system_setIgnoreMouseEvents(ignore: boolean, options: { forward: boolean } | undefined, context: ApiContext): Promise<null> {
+    const targetWin = context.sender ? BrowserWindow.fromWebContents(context.sender) : (BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow());
+    if (targetWin && !targetWin.isDestroyed()) {
+      targetWin.setIgnoreMouseEvents(ignore, options);
+    }
+    return null;
+  }
+
+  // ── dialog namespace ──
+
+  /**
+   * 打开原生文件保存对话框。
+   * @param options Electron SaveDialogOptions
+   * @returns { filePath, canceled }
+   * @example
+   * await callApi("dialog", "showSaveDialog", [{ defaultPath: "/path/to/file.md" }]);
+   */
+  async dialog_showSaveDialog(options: SaveDialogOptions): Promise<unknown> {
+    const focusedWindow = BrowserWindow.getFocusedWindow();
+    if (focusedWindow) {
+      return dialog.showSaveDialog(focusedWindow, options);
+    }
+    return dialog.showSaveDialog(options);
+  }
+
+  /**
+   * 打开原生文件/目录选择对话框。
+   * @param options Electron OpenDialogOptions
+   * @example
+   * await callApi("dialog", "showOpenDialog", [{ properties: ["openFile", "multiSelections"] }]);
+   */
+  async dialog_showOpenDialog(options: OpenDialogOptions): Promise<unknown> {
+    const focusedWindow = BrowserWindow.getFocusedWindow();
+    if (focusedWindow) {
+      return dialog.showOpenDialog(focusedWindow, options);
+    }
+    return dialog.showOpenDialog(options);
+  }
+
+  // ── log namespace ──
+
+  /**
+   * 记录 info 级别日志，输出到宿主应用统一日志系统。
+   * @param message 日志消息
+   * @example
+   * await callApi("log", "info", ["插件已启动"]);
+   */
+  async log_info(message: string, context: ApiContext): Promise<null> {
+    addLog("info", `plugin:${context.pluginId}`, message);
+    return null;
+  }
+
+  /**
+   * 记录 warn 级别日志。
+   * @param message 日志消息
+   */
+  async log_warn(message: string, context: ApiContext): Promise<null> {
+    addLog("warn", `plugin:${context.pluginId}`, message);
+    return null;
+  }
+
+  /**
+   * 记录 error 级别日志。
+   * @param message 日志消息
+   */
+  async log_error(message: string, context: ApiContext): Promise<null> {
+    addLog("error", `plugin:${context.pluginId}`, message);
+    return null;
+  }
+
+  /**
+   * 记录 debug 级别日志（仅开发模式可见）。
+   * @param message 日志消息
+   */
+  async log_debug(message: string, context: ApiContext): Promise<null> {
+    addLog("debug", `plugin:${context.pluginId}`, message);
+    return null;
+  }
+
+  // ── window namespace ──
+
+  /**
+   * 开始窗口拖拽（macOS 专用）。
+   */
+  async window_startDrag(context: ApiContext): Promise<null> {
+    const targetWin = context.sender ? BrowserWindow.fromWebContents(context.sender) : (BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow());
+    if (targetWin && !targetWin.isDestroyed()) {
+      const targetWinWithDrag = targetWin as unknown as { performDrag?: () => void };
+      if (typeof targetWinWithDrag.performDrag === 'function') {
+        targetWinWithDrag.performDrag();
+      } else {
+        console.log('[PluginBridge] performDrag is not supported on this platform/version');
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 相对移动当前窗口。
+   * @param deltaX 水平偏移像素
+   * @param deltaY 垂直偏移像素
+   * @example
+   * await callApi("window", "move", [{ deltaX: 100, deltaY: 50 }]);
+   */
+  async window_move(deltaX: number, deltaY: number, context: ApiContext): Promise<null> {
+    const targetWin = context.sender ? BrowserWindow.fromWebContents(context.sender) : (BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow());
+    if (targetWin && !targetWin.isDestroyed()) {
+      const [x, y] = targetWin.getPosition();
+      targetWin.setPosition(Math.round(x + deltaX), Math.round(y + deltaY), false);
+    }
+    return null;
+  }
+
+  /**
+   * 最大化/还原当前窗口。
+   */
+  async window_maximize(context: ApiContext): Promise<null> {
+    const targetWin = context.sender ? BrowserWindow.fromWebContents(context.sender) : (BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow());
+    if (targetWin && !targetWin.isDestroyed()) {
+      if (targetWin.isMaximized()) {
+        targetWin.unmaximize();
+      } else {
+        targetWin.maximize();
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 关闭窗口。不传 floatId 关闭当前窗口，传 floatId 关闭指定浮动窗口。
+   * @param floatId 浮动窗口 ID（从 window_create 获取，可选）
+   */
+  async window_close(floatId?: string, context?: ApiContext): Promise<null> {
+    if (floatId && this.floatWindows.has(floatId)) {
+      const win = this.floatWindows.get(floatId)!;
+      if (!win.isDestroyed()) win.close();
+      this.floatWindows.delete(floatId);
+      return null;
+    }
+    const targetWin = context?.sender ? BrowserWindow.fromWebContents(context.sender) : (BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow());
+    if (targetWin && !targetWin.isDestroyed()) {
+      targetWin.close();
+    }
+    return null;
+  }
+
+  /**
+   * 最小化当前窗口。
+   */
+  async window_minimize(context: ApiContext): Promise<null> {
+    const targetWin = context.sender ? BrowserWindow.fromWebContents(context.sender) : (BrowserWindow.getFocusedWindow() || ElectronMainWindow.getInstance().getWindow());
+    if (targetWin && !targetWin.isDestroyed()) {
+      targetWin.minimize();
+    }
+    return null;
+  }
+
+
+
+  /**
+   * 创建浮动窗口。支持 url / blob: / file: 协议，自动注入 winId 参数。
+   * @param opts url — 页面 URL，width/height — 尺寸（默认 800x600），alwaysOnTop — 置顶，transparent — 透明，frame — 标题栏，ignoreMouseEvents — 鼠标穿透
+   * @returns 窗口 ID（用于后续 show/hide/close/getState）
+   * @example
+   * const winId = await callApi("window", "create", [{ url: "popup.html", width: 600, height: 400, alwaysOnTop: true }]);
+   */
+  async window_create(opts: FloatWindowOptions, context: ApiContext): Promise<string> {
+    const url = String(opts.url || 'about:blank');
+
+    let isNativeElectron = false;
+    if (context.pluginId) {
+      try {
+        const { PluginManager } = await import('../plugin-manager');
+        const plugin = PluginManager.getInstance().getPlugin(context.pluginId);
+        if (plugin?.manifest?.nativeElectron === true) {
+          isNativeElectron = true;
+        }
+      } catch (err) {
+        console.error('[Window] Failed to check plugin nativeElectron manifest:', err);
+      }
+    }
+
+    const { url: _u, ignoreMouseEvents: _i, ...restOpts } = opts;
+    const preloadPath = join(__dirname, 'plugin-preload.cjs');
+
+    const win = new BrowserWindow({
+      width: 800,
+      height: 600,
+      ...restOpts,
+      webPreferences: isNativeElectron ? {
+        nodeIntegration: true,
+        contextIsolation: false,
+        sandbox: false,
+        webSecurity: false,
+        preload: preloadPath,
+      } : {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        preload: preloadPath,
+      },
+    });
+
+    if (opts.ignoreMouseEvents === true) {
+      win.setIgnoreMouseEvents(true, { forward: true });
+    }
+
+    const winId = `float-${context.pluginId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.floatWindows.set(winId, win);
+
+    win.on('closed', () => {
+      this.floatWindows.delete(winId);
+    });
+
+    // Append winId to URL query string so the child window renderer can identify its winId
+    let finalUrl = url;
+    if (!url.startsWith('data:')) {
+      try {
+        const urlObj = new URL(url);
+        urlObj.searchParams.set('winId', winId);
+        finalUrl = urlObj.toString();
+      } catch {
+        const separator = url.includes('?') ? '&' : '?';
+        finalUrl = `${url}${separator}winId=${winId}`;
+      }
+    }
+
+    win.loadURL(finalUrl);
+    return winId;
+  }
+
+  /**
+   * 显示指定浮动窗口。
+   * @param winId 窗口 ID
+   */
+  async window_show(winId: string): Promise<null> {
+    const win = this.floatWindows.get(winId);
+    if (win && !win.isDestroyed()) win.show();
+    return null;
+  }
+
+  /**
+   * 隐藏指定浮动窗口。
+   * @param winId 窗口 ID
+   */
+  async window_hide(winId: string): Promise<null> {
+    const win = this.floatWindows.get(winId);
+    if (win && !win.isDestroyed()) win.hide();
+    return null;
+  }
+
+  /**
+   * 获取浮动窗口状态。
+   * @param winId 窗口 ID
+   * @returns { id, visible, bounds: { x, y, width, height }, alwaysOnTop }
+   */
+  async window_getState(winId: string): Promise<unknown> {
+    const win = this.floatWindows.get(winId);
+    if (!win || win.isDestroyed()) return null;
+    const bounds = win.getBounds();
+    return {
+      id: winId,
+      visible: win.isVisible(),
+      bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+      alwaysOnTop: win.isAlwaysOnTop(),
+    };
+  }
+
+  /**
+   * 获取浮动窗口的原生操作系统句柄（HWND on Windows, NSWindow* on macOS）。
+   * 通用窗口管理基础设施 — 可用于 ffmpeg 窗口捕获、自动化测试、外设绑定等场景。
+   */
+  async window_getNativeHandle(opts: { winId: string }): Promise<{
+    handle: number;
+    platform: string;
+    title: string;
+  }> {
+    const win = this.floatWindows.get(opts.winId);
+    if (!win || win.isDestroyed()) {
+      throw new Error(`[System:getNativeHandle] Float window not found or destroyed: ${opts.winId}`);
+    }
+
+    if (process.platform === 'win32') {
+      const buf = win.getNativeWindowHandle();
+      // On x64 Windows, handle is 8 bytes; on 32-bit, 4 bytes
+      const hwnd = typeof (buf as any).readBigUInt64LE === 'function'
+        ? (buf as Buffer).readBigUInt64LE(0)
+        : buf.readUInt32LE(0);
+      addLog('info', 'System', `[System:getNativeHandle] win32 HWND=${hwnd} title="${win.getTitle()}"`);
+      return { handle: Number(hwnd), platform: 'win32', title: win.getTitle() };
+    }
+
+    if (process.platform === 'darwin') {
+      const winId = win.getNativeWindowHandle().readUInt32LE(0);
+      addLog('info', 'System', `[System:getNativeHandle] darwin windowId=${winId} title="${win.getTitle()}"`);
+      return { handle: winId, platform: 'darwin', title: win.getTitle() };
+    }
+
+    throw new Error(`[System:getNativeHandle] Unsupported platform: ${process.platform}`);
+  }
+
+  /**
+   * 动态更新浮动窗口属性（尺寸、位置、置顶、可缩放）。
+   * @param targetWindowId 窗口 ID
+   * @param options width/height/x/y/alwaysOnTop/resizable
+   */
+  async window_updateWindowOptions(targetWindowId: string, options: {
+    width?: number;
+    height?: number;
+    x?: number;
+    y?: number;
+    alwaysOnTop?: boolean;
+    resizable?: boolean;
+  }): Promise<null> {
+    let win = this.floatWindows.get(targetWindowId);
+    if (!win || win.isDestroyed()) {
+      const { ElectronFloatBall } = require('../../windows/float-ball');
+      const floatBall = ElectronFloatBall.getInstance();
+      const instance = floatBall.getFloatWebWindowInstance(targetWindowId);
+      if (instance && !instance.win.isDestroyed()) {
+        win = instance.win;
+      }
+    }
+
+    if (win && !win.isDestroyed()) {
+      if (options.width !== undefined || options.height !== undefined) {
+        const size = win.getSize();
+        const w = options.width !== undefined ? options.width : size[0];
+        const h = options.height !== undefined ? options.height : size[1];
+        win.setSize(w, h);
+      }
+      if (options.x !== undefined || options.y !== undefined) {
+        const pos = win.getPosition();
+        const x = options.x !== undefined ? options.x : pos[0];
+        const y = options.y !== undefined ? options.y : pos[1];
+        win.setPosition(x, y);
+      }
+      if (options.alwaysOnTop !== undefined) {
+        win.setAlwaysOnTop(options.alwaysOnTop);
+      }
+      if (options.resizable !== undefined) {
+        win.setResizable(options.resizable);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 禁用/启用窗口默认拖拽行为。
+   * @param disabled true 为禁用
+   */
+  async window_disableDefaultDrag(disabled: boolean, context: ApiContext): Promise<null> {
+    if (context.sender && !context.sender.isDestroyed()) {
+      context.sender.send('window:set-default-drag', disabled);
+    }
+    return null;
+  }
+
+  // ── user namespace ──
+
+  /**
+   * 查询当前用户会员状态。
+   * @returns { isVip, points }
+   */
+  async user_getMembershipStatus(): Promise<unknown> {
+    const { HookRegistry } = await import('../hook-registry.js');
+    try {
+      const result = await HookRegistry.getInstance().call('user:getMembershipStatus', []);
+      if (result) {
+        return result;
+      }
+    } catch (err) {
+      console.error('[SystemController] Failed to call user:getMembershipStatus hook:', err);
+    }
+    return {
+      isVip: false
+    };
+  }
+
+  async user_setUser(user: { id: string; name: string }): Promise<void> {
+    const { ElectronAuthManager } = await import('../../services/auth-manager');
+    ElectronAuthManager.getInstance().setUser(user);
+  }
+
+  async user_getUser(): Promise<{ id: string; name: string } | null> {
+    const { ElectronAuthManager } = await import('../../services/auth-manager');
+    return ElectronAuthManager.getInstance().getUser();
+  }
+
+  async user_setLoggedIn(loggedIn: boolean): Promise<void> {
+    const { ElectronAuthManager } = await import('../../services/auth-manager');
+    ElectronAuthManager.getInstance().setLoggedIn(loggedIn);
+  }
+
+  async user_isLoggedIn(): Promise<boolean> {
+    const { ElectronAuthManager } = await import('../../services/auth-manager');
+    return ElectronAuthManager.getInstance().isLoggedIn();
+  }
+
+  // ── commands namespace ──
+
+  /**
+   * 注册命令。
+   * @param options id — 命令 ID（可选，不传自动生成），返回命令 ID
+   */
+  async commands_register(options: any, _context: ApiContext): Promise<string> {
+    const id = options?.id || `cmd:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+    console.log(`[SystemController] commands_register: ${id}`);
+    return id;
+  }
+
+  /**
+   * 注销命令。
+   * @param id 命令 ID
+   */
+  async commands_unregister(id: string, _context: ApiContext): Promise<void> {
+    console.log(`[SystemController] commands_unregister: ${id}`);
+  }
+
+  /**
+   * 执行命令，广播到所有渲染进程和后台进程。
+   * @param id 命令 ID
+   * @param args 命令参数（可选）
+   */
+  async commands_execute(id: string, args?: Record<string, unknown>, _context?: ApiContext): Promise<void> {
+    console.log(`[SystemController] commands_execute: ${id} args=`, args);
+
+    // Hook 截流：调用 commands:beforeExecute
+    try {
+      const { HookRegistry } = require('../hook-registry');
+      const hookResult = await HookRegistry.getInstance().call(
+        'commands:beforeExecute',
+        [{ commandId: id, commandArgs: args }],
+        _context?.sender,
+        false,  // merge=false: 返回第一个结果
+        3000,
+      );
+
+      if (hookResult && typeof hookResult === 'object' && (hookResult as any).block) {
+        console.log(`[SystemController] 命令 "${id}" 被 hook 截流:`, (hookResult as any).reason || 'no reason');
+        return;
+      }
+    } catch (err) {
+      console.warn('[SystemController] commands:beforeExecute hook 调用失败:', err);
+    }
+
+    // Broadcast "commands:execute" event to renderer windows
+    const windows = BrowserWindow.getAllWindows().filter((win) => !win.isDestroyed());
+    console.log(`[SystemController] Broadcasting commands:execute "${id}" to ${windows.length} windows`);
+    windows.forEach((win) => {
+      win.webContents.send('commands:execute', { commandId: id, args });
+    });
+
+    // Notify background utility processes
+    try {
+      const { PluginLauncher } = require('../plugin-launcher');
+      const backgroundProcesses = PluginLauncher.getInstance().getBackgroundProcesses();
+      console.log(`[SystemController] Notifying ${backgroundProcesses.size} background processes of command: ${id}`);
+      for (const [pluginId, proc] of backgroundProcesses.entries()) {
+        proc.sendMessage({
+          type: 'sdk:events:on',
+          eventName: 'commands:execute',
+          payload: { commandId: id, args }
+        });
+      }
+    } catch (err) {
+      console.error('[SystemController] Failed to notify background processes of command:', id, err);
+    }
+  }
+
+  /**
+   * 获取当前系统的屏幕布局信息。
+   */
+  async system_getDisplays(): Promise<Array<{ id: number; bounds: { x: number; y: number; width: number; height: number }; scaleFactor: number; isPrimary: boolean }>> {
+    try {
+      const { screen } = await import('electron');
+      const displays = screen.getAllDisplays();
+      const primaryId = screen.getPrimaryDisplay().id;
+      return displays.map(d => ({
+        id: d.id,
+        bounds: { x: d.bounds.x, y: d.bounds.y, width: d.bounds.width, height: d.bounds.height },
+        scaleFactor: d.scaleFactor,
+        isPrimary: d.id === primaryId
+      }));
+    } catch (err) {
+      console.error('[SystemController] system_getDisplays failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 列出当前系统的所有打开窗口。
+   */
+  async system_listWindows(): Promise<Array<{ id: number; title: string; appName: string; x: number; y: number; width: number; height: number; isMinimized: boolean }>> {
+    try {
+      const { Window } = await import('node-screenshots');
+      const windows = Window.all();
+      return windows.map(win => ({
+        id: win.id(),
+        title: win.title(),
+        appName: win.appName(),
+        x: win.x(),
+        y: win.y(),
+        width: win.width(),
+        height: win.height(),
+        isMinimized: win.isMinimized()
+      }));
+    } catch (err) {
+      console.error('[SystemController] system_listWindows failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 截取指定 ID 窗口的屏幕缓冲。支持局部裁剪与图像压缩质量设置。
+   */
+  async system_captureWindow(options: {
+    windowId: number;
+    quality?: 'low' | 'medium' | 'high';
+    crop?: { x: number; y: number; width: number; height: number };
+  }): Promise<string> {
+    try {
+      const { Window } = await import('node-screenshots');
+      const windows = Window.all();
+      const target = windows.find(win => win.id() === options.windowId);
+      if (!target) {
+        throw new Error(`Window with ID ${options.windowId} not found`);
+      }
+      const image = await target.captureImage();
+      const buffer = await image.toPng();
+
+      const sharpModule = await import('sharp');
+      const sharp = sharpModule.default || sharpModule;
+      let sharpImg = sharp(buffer);
+
+      if (options.crop) {
+        const metadata = await sharpImg.metadata();
+        const origW = metadata.width || target.width();
+        const origH = metadata.height || target.height();
+
+        const left = Math.max(0, Math.round(options.crop.x * origW));
+        const top = Math.max(0, Math.round(options.crop.y * origH));
+        const width = Math.min(origW - left, Math.round(options.crop.width * origW));
+        const height = Math.min(origH - top, Math.round(options.crop.height * origH));
+
+        if (width > 0 && height > 0) {
+          sharpImg = sharpImg.extract({ left, top, width, height });
+        }
+      }
+
+      const quality = options.quality || 'high';
+      let targetQuality = 90;
+      let resizeWidth: number | null = null;
+
+      if (quality === 'low') {
+        resizeWidth = 800;
+        targetQuality = 60;
+      } else if (quality === 'medium') {
+        resizeWidth = 1280;
+        targetQuality = 80;
+      }
+
+      if (resizeWidth !== null) {
+        sharpImg = sharpImg.resize({ width: resizeWidth, withoutEnlargement: true });
+      }
+
+      const outputBuffer = await sharpImg
+        .jpeg({ quality: targetQuality })
+        .toBuffer();
+
+      return outputBuffer.toString('base64');
+    } catch (err) {
+      console.error('[SystemController] system_captureWindow failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 模拟鼠标移动并点击指定物理屏幕坐标。
+   */
+  async system_simulateClick(options: { x: number; y: number; button: 'left' | 'right' | 'middle'; doubleClick?: boolean }): Promise<boolean> {
+    try {
+      const { mouse, Button, Point } = await import('@nut-tree-fork/nut-js');
+      const originalPos = await mouse.getPosition();
+      
+      // 取消操作之间的默认延迟，保证操作的毫秒级即时性
+      mouse.config.autoDelayMs = 0;
+      
+      // 瞬移到目标点击点
+      await mouse.setPosition(new Point(options.x, options.y));
+      
+      const btn = options.button === 'right' ? Button.RIGHT : options.button === 'middle' ? Button.MIDDLE : Button.LEFT;
+      if (options.doubleClick) {
+        await mouse.doubleClick(btn);
+      } else {
+        await mouse.click(btn);
+      }
+      
+      // 瞬移回原鼠标位置
+      await mouse.setPosition(originalPos);
+      return true;
+    } catch (err) {
+      console.error('[SystemController] system_simulateClick failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 模拟鼠标拖拽（从起点拖拽到终点，常用于滑块验证码）。
+   */
+  async system_simulateDrag(options: { startX: number; startY: number; endX: number; endY: number }): Promise<boolean> {
+    try {
+      const { mouse, Point, straightTo } = await import('@nut-tree-fork/nut-js');
+      const originalPos = await mouse.getPosition();
+      const startPoint = new Point(options.startX, options.startY);
+      const endPoint = new Point(options.endX, options.endY);
+      
+      mouse.config.autoDelayMs = 0;
+      // 瞬移到拖拽起点
+      await mouse.setPosition(startPoint);
+      // 执行拖拽路径
+      await mouse.drag(straightTo(endPoint));
+      // 瞬移回原鼠标位置
+      await mouse.setPosition(originalPos);
+      return true;
+    } catch (err) {
+      console.error('[SystemController] system_simulateDrag failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 模拟键盘打字输入文本。
+   */
+  async system_simulateType(options: { text: string }): Promise<boolean> {
+    try {
+      const { keyboard } = await import('@nut-tree-fork/nut-js');
+      await keyboard.type(options.text);
+      return true;
+    } catch (err) {
+      console.error('[SystemController] system_simulateType failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 模拟键盘按键及组合快捷键。
+   */
+  async system_simulateKeyPress(options: { keys: string[] }): Promise<boolean> {
+    try {
+      const { keyboard, Key } = await import('@nut-tree-fork/nut-js');
+      const keyMap: Record<string, any> = {
+        'enter': Key.Enter,
+        'escape': Key.Escape,
+        'space': Key.Space,
+        'backspace': Key.Backspace,
+        'tab': Key.Tab,
+        'control': Key.LeftControl,
+        'ctrl': Key.LeftControl,
+        'shift': Key.LeftShift,
+        'alt': Key.LeftAlt,
+        'command': Key.LeftSuper,
+        'cmd': Key.LeftSuper,
+        'win': Key.LeftSuper,
+        'meta': Key.LeftSuper,
+        'up': Key.Up,
+        'down': Key.Down,
+        'left': Key.Left,
+        'right': Key.Right,
+      };
+
+      // Add a-z
+      for (let charCode = 65; charCode <= 90; charCode++) {
+        const char = String.fromCharCode(charCode);
+        keyMap[char.toLowerCase()] = (Key as any)[char];
+      }
+      // Add 0-9
+      for (let i = 0; i <= 9; i++) {
+        keyMap[i.toString()] = (Key as any)[`Num${i}`] || (Key as any)[`N${i}`] || i;
+      }
+
+      const resolvedKeys = options.keys.map(k => {
+        const lower = k.toLowerCase();
+        const mapped = keyMap[lower];
+        if (mapped === undefined) {
+          throw new Error(`Key ${k} not supported or recognized`);
+        }
+        return mapped;
+      });
+
+      if (resolvedKeys.length === 1) {
+        await keyboard.pressKey(resolvedKeys[0]);
+        await keyboard.releaseKey(resolvedKeys[0]);
+      } else if (resolvedKeys.length > 1) {
+        for (const k of resolvedKeys) {
+          await keyboard.pressKey(k);
+        }
+        for (let i = resolvedKeys.length - 1; i >= 0; i--) {
+          await keyboard.releaseKey(resolvedKeys[i]);
+        }
+      }
+      return true;
+    } catch (err) {
+      console.error('[SystemController] system_simulateKeyPress failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * 启动一个应用程序（如果已运行则将其激活置前）。
+   * appName: 应用名称（如 "微信"、"WeChat"、"Google Chrome"）或 bundle ID（如 "com.tencent.xinWeChat"）。
+   * waitMs: 启动后等待的毫秒数（默认 1500ms，给应用加载时间）。
+   */
+  async system_launchApp(options: { appName: string; waitMs?: number }): Promise<{ launched: boolean; windowCount: number }> {
+    try {
+      const { execFile } = await import('child_process');
+      const { promisify } = await import('util');
+      const execFileAsync = promisify(execFile);
+
+      const waitMs = options.waitMs ?? 1500;
+      let actualAppName = options.appName;
+
+      console.log(`[SystemController] system_launchApp: input="${options.appName}"`);
+
+      // Use macOS `open -a` to launch or activate. Works cross-platform via electron shell too.
+      if (process.platform === 'darwin') {
+        const appMap: Record<string, string> = {
+          '微信': 'WeChat',
+          'wechat': 'WeChat',
+          'qq': 'QQ',
+          '钉钉': 'DingTalk',
+          'dingtalk': 'DingTalk',
+          '飞书': 'Feishu',
+          'feishu': 'Feishu',
+          '谷歌浏览器': 'Google Chrome',
+          '谷歌': 'Google Chrome',
+          'chrome': 'Google Chrome',
+          'safari': 'Safari',
+          '网易云': 'NeteaseMusic',
+          '网易云音乐': 'NeteaseMusic',
+          'netease': 'NeteaseMusic',
+        };
+        const lowerName = options.appName.toLowerCase();
+        if (appMap[lowerName]) {
+          actualAppName = appMap[lowerName];
+        } else {
+          for (const [zh, en] of Object.entries(appMap)) {
+            if (lowerName.includes(zh)) {
+              actualAppName = en;
+              break;
+            }
+          }
+        }
+
+        // Fuzzy scan /Applications directory for a matching .app
+        try {
+          const fs = await import('fs/promises');
+          const apps = await fs.readdir('/Applications');
+          const matchedApp = apps.find(a => {
+            const base = a.replace(/\.app$/, '').toLowerCase();
+            return base.includes(lowerName) || lowerName.includes(base);
+          });
+          if (matchedApp) {
+            actualAppName = matchedApp.replace(/\.app$/, '');
+          }
+        } catch { /* ignore */ }
+
+        console.log(`[SystemController] system_launchApp resolved name: "${actualAppName}"`);
+
+        try {
+          // Try as app name first
+          await execFileAsync('open', ['-a', actualAppName]);
+        } catch {
+          // If that fails, try open with bundle ID via osascript
+          try {
+            await execFileAsync('osascript', [
+              '-e', `tell application id "${actualAppName}" to activate`
+            ]);
+          } catch {
+            // Last resort: shell.openExternal or just return false
+            const { shell } = await import('electron');
+            await shell.openExternal(`file:///Applications/${actualAppName}.app`).catch(() => {/* ignore */});
+          }
+        }
+      } else if (process.platform === 'win32') {
+        await execFileAsync('cmd', ['/c', 'start', '', options.appName]).catch(() => {/* ignore */});
+      } else {
+        await execFileAsync('xdg-open', [options.appName]).catch(() => {/* ignore */});
+      }
+
+      // Wait for the app to load / window to appear
+      if (waitMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+
+      // Count windows after launch
+      let windowCount = 0;
+      try {
+        const { Window } = await import('node-screenshots');
+        const windows = Window.all();
+        const lower = options.appName.toLowerCase();
+        windowCount = windows.filter(w => {
+          const title = (w.title() || '').toLowerCase();
+          const app = (w.appName() || '').toLowerCase();
+          return title.includes(lower) || app.includes(lower);
+        }).length;
+      } catch { /* ignore */ }
+
+      console.log(`[SystemController] system_launchApp: "${options.appName}" launched, found ${windowCount} window(s).`);
+      return { launched: true, windowCount };
+    } catch (err) {
+      console.error('[SystemController] system_launchApp failed:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Stub implementation of querySelectorAtCoordinate to prevent plugin calls from crashing.
+   * Currently returns null so client plugins fall back to visual matching naturally.
+   */
+  async system_querySelectorAtCoordinate(options: { x: n
+
+[... 文件过长，已截断 ...]

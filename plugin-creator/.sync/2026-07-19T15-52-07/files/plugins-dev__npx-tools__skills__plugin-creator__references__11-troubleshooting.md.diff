@@ -1,0 +1,231 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md b/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md
+index b2c03b4..286a5ed 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/11-troubleshooting.md
+@@ -2,28 +2,70 @@
+ 
+ ---
+ 
+-## 1. 插件加载失败
++## 1. `Cannot find package 'xxx'`（最常见）
++
++**现象**：
++```
++Error: Cannot find module 'bplist-creator'
++Error: Cannot find module 'ws'
++Error: Cannot find package 'playwright-core'
++```
++
++**原因与修复路径**：
++
++```
++报错的包名
++│
++├── 纯 JS 包（ws、zod、axios 等）
++│   原因：该包被加入了 external 但安装目录没有 node_modules
++│   修复：从 external 移除，让 esbuild bundle 进去
++│
++├── berrytrace-plugin-sdk（仅 background 构建）
++│   原因：background 构建需要 external SDK
++│   修复：确保 external: ['berrytrace-plugin-sdk']
++│   注意：view 构建（browser）不再需要 external SDK，已通过全局 shim 注入
++│
++└── bplist-creator / bufferutil / 某个陌生间接依赖
++    原因：你依赖了 playwright-core 等"有动态 require 的大型包"
++    修复步骤：
++      1. bundle.mjs → 把所有 dependencies 加入 external
++      2. plugin.json → 加 "files": ["dist","node_modules","plugin.json","package.json"]
++      3. npm run build → berrytrace pack → 重新安装 .btp
++```
++
++**判断是否是"动态 require 大型包"**：
++```bash
++# 如果 playwright-core 没有 dependencies 字段但 node_modules 里有几十个包
++cat node_modules/playwright-core/package.json | python3 -c \
++  "import json,sys; p=json.load(sys.stdin); print(len(p.get('dependencies',{})), 'deps')"
++# 输出 0 deps → 说明它靠 npm hoist + 动态 require，必须用 files 字段全量打包
++```
++
++---
++
++## 2. 插件加载失败（无声静默）
+ 
+ **现象**：插件列表显示"加载失败"或根本不出现
+ 
+ **排查步骤**：
+-1. 检查 `plugin.json` 是否为合法 JSON
+-2. 确认 `id` 格式：`com.berrytrace.plugin.{name}-{uuid}`
++1. 检查 `plugin.json` 是否为合法 JSON（用 `cat plugin.json | python3 -m json.tool`）
++2. 确认 `id` 格式：`com.berrytrace.plugin.{name}-{uuid}` 不含空格
+ 3. 确认 `main` 和 `view` 文件路径正确且文件存在
+-4. 检查 `type` 字段是否为合法值
++4. 检查 `type` 字段是否为合法值：`panel` / `background` / `hybrid` / `main`
++5. 查看日志：`plugin_manager_get_logs { pluginId: "xxx", limit: 50 }`
+ 
+ ---
+ 
+-## 2. activate() 从未被调用（无声失败）
++## 3. `activate()` 从未被调用（无声失败）
+ 
+ **现象**：
+-- `plugin_manager_get_logs` 无任何插件输出
++- `plugin_manager_get_logs` 无任何输出
+ - MCP 工具全部不可用
+ - `plugin_manager_list_tools` 返回空
+ 
+ **原因**：background 类型插件通过 `utilityProcess.fork()` 启动为独立子进程。`activate()` 被正确导出但**从未执行**。
+ 
+-**修复**：在 `src/background.ts` 文件末尾添加：
++**修复**：在 `src/index.ts` 文件末尾添加：
+ 
+ ```typescript
+ activate().catch(err => {
+@@ -33,7 +75,7 @@ activate().catch(err => {
+ 
+ ---
+ 
+-## 3. 浏览器报错：`Failed to resolve module specifier "berrytrace-plugin-sdk"`
++## 4. 浏览器报错：`Failed to resolve module specifier "berrytrace-plugin-sdk"`
+ 
+ **现象**：
+ ```
+@@ -41,28 +83,29 @@ TypeError: Failed to resolve module specifier "berrytrace-plugin-sdk".
+ Relative references must start with either "/", "./", or "../".
+ ```
+ 
+-**原因**：渲染进程在浏览器环境中运行，浏览器不支持 Node.js 的裸包名解析。
++**原因**：渲染进程（Panel 插件）在浏览器环境运行，不支持 Node.js 裸包名解析。
+ 
+-**修复**：
+-- **方案 A**：在 `scripts/bundle.mjs` 中使用 `sdkShimPlugin`（参考 [05-sdk-setup.md](./05-sdk-setup.md)）
+-- **方案 B**：宿主启用 Import Maps（由宿主处理）
++**修复**：使用 `berrytrace build` 命令构建（它内置了全局 shim 插件），或确保你的 bundle.mjs 包含 `globalSdkPlugin` 和 `globalReactPlugin`。SDK、React、zustand 现在通过 `window` 全局变量注入，不再需要手动 external。
+ 
+ ---
+ 
+-## 4. renderer 报错：`does not export a default class`
++## 5. `ReferenceError: require is not defined`
+ 
+-**现象**：
+-```
+-[ERROR] Failed to load plugin "xxx": Plugin entry point does not export a default class
+-```
++**现象**：Background 插件运行时报错
++
++**原因**：ESM 格式（`format: 'esm'`）没有 `require`，但代码里（或依赖里）用了 `require()`
+ 
+-**原因**：background 类型的插件在渲染进程中的加载尝试。这是**预期行为**——background 插件不应在渲染进程中加载。
++**修复**：在 bundle.mjs 的 `banner` 里添加 CJS shim：
+ 
+-**处理**：可以忽略此错误，不影响功能。如果持续出现，检查 `plugin.json` 的 `type` 是否为 `"background"`。
++```javascript
++banner: {
++  js: `import { createRequire as _cr } from 'module'; const require = _cr(import.meta.url);`,
++},
++```
+ 
+ ---
+ 
+-## 5. MCP 工具注册后不可用
++## 6. MCP 工具注册后不可用
+ 
+ **现象**：插件激活成功，但调用 MCP 工具返回"tool not found"
+ 
+@@ -70,66 +113,47 @@ Relative references must start with either "/", "./", or "../".
+ 1. `plugin_manager_list_tools` 查询已注册工具列表
+ 2. 确认工具名在列表中 → 如不在，检查注册代码
+ 3. 确认 `sdk.mcp.registerToolHandler()` 的第一个参数**完全匹配** `plugin.json` 中 `mcp.tools[].name`
+-4. 确认 `activate()` 正常执行完（检查日志中激活成功的消息）
++4. 确认 `activate()` 正常执行完（检查日志）
+ 5. 检查 `activate()` 中是否有 JS 异常跳过了注册代码
+ 
+ ---
+ 
+-## 6. IPC 通信失败
++## 7. Panel 界面白屏 / JS 报错
+ 
+-**现象**：API 调用无响应或返回错误
++**常见原因**：
+ 
+-**排查步骤**：
+-1. 确认 API 方法在当前 SDK 版本中存在
+-2. 检查参数类型和格式
+-3. 确认插件已声明所需权限（`permissions` 字段）
+-4. 查看渲染进程控制台错误
++| 错误 | 原因 | 修复 |
++|---|---|---|
++| `fs is not defined` | Panel 代码里用了 Node.js API | 改用 `sdk.filesystem.*` |
++| `path is not defined` | 同上 | 改用字符串处理 |
++| `Uncaught SyntaxError` | 产物格式错误 | 检查 bundle platform 是 `browser`，且包含 globalSdkPlugin |
+ 
+ ---
+ 
+-## 7. 热重载不生效
+-
+-**现象**：修改代码并 build 后 reload，变更未生效
++## 8. 热重载不生效
+ 
+ **排查步骤**：
+-1. 使用 `plugin_manager_reload` 而非 `plugin_manager_load_unpacked`（后者仅首次加载）
++1. 用 `plugin_manager_reload`，不是 `plugin_manager_load_unpacked`（后者仅首次加载）
+ 2. `plugin_manager_get_logs` 检查是否有 JS 语法错误
+ 3. 确认 `npm run build` 成功，`dist/` 目录产物已更新
+ 
+ ---
+ 
+-## 8. `Cannot find global variable 'berrytrace'`
++## 9. node_modules 没有随 .btp 打包（间接依赖丢失）
+ 
+-**现象**：
+-```
+-ReferenceError: berrytrace is not defined
+-```
++**现象**：开发目录运行正常，安装 .btp 后报 MODULE_NOT_FOUND
+ 
+-**原因**：
+-- Node.js 后台进程中不存在全局 `berrytrace` 对象
+-- 应通过 `import { createPluginSDK } from 'berrytrace-plugin-sdk'` 获取
++**原因**：SDK pack 默认只包含 `package.json` 直接 dependencies，间接依赖被漏掉
+ 
+-**修复**：
+-```typescript
+-// ❌ 错误
+-const sdk = globalThis.berrytrace;
++**修复**：在 `plugin.json` 加 `files` 字段：
+ 
+-// ✅ 正确
+-import { createPluginSDK } from 'berrytrace-plugin-sdk';
+-const sdk = createPluginSDK('com.berrytrace.plugin.xxx');
++```json
++{
++  "files": ["dist", "node_modules", "plugin.json", "package.json"]
++}
+ ```
+ 
+----
+-
+-## 9. 构建产物包含 Node.js API 在浏览器报错
+-
+-**现象**：renderer.js 运行时 `fs is not defined`, `path is not defined` 等
+-
+-**原因**：renderer 入口文件中错误引用了 Node.js 专有 API
+-
+-**修复**：
+-- renderer 入口不应包含 `fs`, `path`, `child_process` 等 Node.js API
+-- 需要文件操作时使用 `sdk.filesystem.*`，通过 IPC 桥接
++加了 `files` 字段后，SDK pack 会**严格按列表打包**，跳过依赖过滤，包含整个 `node_modules`。
+ 
+ ---
+ 
+@@ -155,6 +179,9 @@ plugin_manager_get_logs { pluginId: "xxx", limit: 50 }
+ # 重新加载
+ plugin_manager_reload { pluginId: "xxx" }
+ 
+-# 重新加载（自路径）
+-plugin_manager_load_unpacked { path: "plugins-dev/xxx" }
++# 验证安装目录内容
++ls ~/.berrytrace/plugins/com.berrytrace.plugin.xxx/
++
++# 验证 node_modules 是否包含
++ls ~/.berrytrace/plugins/com.berrytrace.plugin.xxx/node_modules/ | head -20
+ ```

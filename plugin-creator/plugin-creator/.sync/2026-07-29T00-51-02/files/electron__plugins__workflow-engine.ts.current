@@ -1,0 +1,802 @@
+import { EventEmitter } from 'events';
+import { McpHost } from './mcp-host';
+import type {
+  WorkflowDefinition,
+  WorkflowStep,
+  WorkflowExecutionContext,
+  WorkflowExecutionResult,
+  StepExecutionResult,
+} from './workflow-types';
+import { WorkflowDagBuilder } from './workflow-dag-builder';
+import type { PersistentRunState } from './workflow-state-store';
+import { WorkflowStateStore } from './workflow-state-store';
+import { WorkflowCredentialStore } from './workflow-credential-store';
+import * as fs from 'fs';
+import * as path from 'path';
+import { BrowserWindow, ipcMain } from 'electron';
+
+export interface RunStatus {
+  runId: string;
+  workflowId: string;
+  status: 'running' | 'paused' | 'completed' | 'failed' | 'canceled';
+  currentStepIndex: number;
+  totalSteps: number;
+  currentStepId?: string;
+  startedAt: number;
+  elapsedMs: number;
+  stepResults: StepExecutionResult[];
+}
+
+export class WorkflowEngine extends EventEmitter {
+  private static instance: WorkflowEngine | null = null;
+  private workflows = new Map<string, WorkflowDefinition>();
+  private activeExecutions = new Map<string, AbortController>();
+  private pausedRuns = new Set<string>();
+  private runStatuses = new Map<string, RunStatus>();
+
+  private constructor() {
+    super();
+    this.recoverUnfinishedRuns();
+  }
+
+  public static getInstance(): WorkflowEngine {
+    if (!WorkflowEngine.instance) {
+      WorkflowEngine.instance = new WorkflowEngine();
+    }
+    return WorkflowEngine.instance;
+  }
+
+  /**
+   * 恢复与清理系统重启前因崩溃中断的 Run 任务
+   */
+  public recoverUnfinishedRuns(): void {
+    try {
+      const store = WorkflowStateStore.getInstance();
+      const unfinished = store.getUnfinishedRuns();
+      if (unfinished.length > 0) {
+        console.log(`[WorkflowEngine] Found ${unfinished.length} unfinished run(s) from previous session. Auto-recovering state...`);
+        for (const run of unfinished) {
+          run.status = 'failed';
+          run.error = '[Crash Recovery] Session restarted during execution';
+          store.saveRunState(run);
+          console.log(`[WorkflowEngine] Recovered crashed run "${run.runId}" (workflow: "${run.workflowId}")`);
+        }
+      }
+    } catch (err) {
+      console.error(`[WorkflowEngine] Failed to recover unfinished runs:`, err);
+    }
+  }
+
+  /**
+   * 注册 Workflow 定义
+   */
+  public register(definition: WorkflowDefinition): void {
+    if (!definition.id) {
+      throw new Error('[WorkflowEngine] Workflow definition must have an id.');
+    }
+    console.log(`[WorkflowEngine] Registering workflow "${definition.id}" (${definition.name || 'unnamed'})`);
+    this.workflows.set(definition.id, definition);
+  }
+
+  /**
+   * 注销 Workflow 定义
+   */
+  public unregister(workflowId: string, pluginId?: string): boolean {
+    const existing = this.workflows.get(workflowId);
+    if (!existing) return false;
+    if (pluginId && existing.pluginId && existing.pluginId !== pluginId) {
+      throw new Error(`[WorkflowEngine] Plugin "${pluginId}" cannot unregister workflow "${workflowId}" owned by "${existing.pluginId}"`);
+    }
+    this.workflows.delete(workflowId);
+    console.log(`[WorkflowEngine] Unregistered workflow "${workflowId}"`);
+    return true;
+  }
+
+  /**
+   * 插件注销时批量清理该插件注册的所有 Workflow
+   */
+  public unregisterPlugin(pluginId: string): number {
+    let count = 0;
+    for (const [id, def] of Array.from(this.workflows.entries())) {
+      if (def.pluginId === pluginId) {
+        this.workflows.delete(id);
+        count++;
+      }
+    }
+    if (count > 0) {
+      console.log(`[WorkflowEngine] Unregistered ${count} workflow(s) for plugin "${pluginId}"`);
+    }
+    return count;
+  }
+
+  public get(workflowId: string): WorkflowDefinition | undefined {
+    return this.workflows.get(workflowId);
+  }
+
+  public list(pluginId?: string): WorkflowDefinition[] {
+    const result: WorkflowDefinition[] = [];
+    for (const def of this.workflows.values()) {
+      if (!pluginId || def.pluginId === pluginId) {
+        result.push(def);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * 执行 Workflow（支持 DAG Fork/Join 并行、断点持久化与凭证反解）
+   */
+  public async execute(
+    workflowId: string,
+    input: Record<string, unknown> = {},
+    triggerType: WorkflowExecutionContext['triggerType'] = 'direct',
+    globalTimeoutMs: number = 600000,
+    startFromStepId?: string,
+    parentContext?: { depth?: number; callStack?: string[]; idempotencyKey?: string }
+  ): Promise<WorkflowExecutionResult> {
+    const def = this.workflows.get(workflowId);
+    if (!def) {
+      throw new Error(`[WorkflowEngine] Workflow "${workflowId}" not found.`);
+    }
+
+    // 幂等键 Deduplication 去重拦截
+    if (parentContext?.idempotencyKey) {
+      const existing = WorkflowStateStore.getInstance().getRunByIdempotencyKey(parentContext.idempotencyKey);
+      if (existing) {
+        console.log(`[WorkflowEngine] Idempotency match for key "${parentContext.idempotencyKey}" (runId: "${existing.runId}"). Returning existing result.`);
+        return {
+          runId: existing.runId,
+          workflowId: existing.workflowId,
+          success: existing.status === 'completed',
+          steps: existing.stepResults,
+          finalOutput: existing.stepOutputs,
+          totalDurationMs: (existing.updatedAt || Date.now()) - existing.startedAt,
+          error: existing.error,
+          startedAt: existing.startedAt,
+        };
+      }
+    }
+
+    const depth = (parentContext?.depth || 0) + 1;
+    const callStack = [...(parentContext?.callStack || []), workflowId];
+
+    if (depth > 10) {
+      throw new Error(`[WorkflowEngine] Maximum sub-workflow depth (10) exceeded for "${workflowId}". Call stack: ${callStack.join(' -> ')}`);
+    }
+
+    // 并发保护检查 (Concurrency Controls: singleton, cancel_previous, maxInstances)
+    const activeRun = this.getActiveRun(workflowId);
+    if (def.concurrency?.mode === 'singleton' && activeRun) {
+      throw new Error(`[WorkflowEngine] Workflow "${workflowId}" is configured with singleton concurrency, run "${activeRun.runId}" is active.`);
+    } else if (def.concurrency?.mode === 'cancel_previous' && activeRun) {
+      console.log(`[WorkflowEngine] Concurrency mode "cancel_previous": Canceling existing run "${activeRun.runId}"...`);
+      this.cancel(activeRun.runId);
+    }
+
+    if (def.concurrency?.maxInstances) {
+      const activeCount = Array.from(this.runStatuses.values()).filter(r => r.workflowId === workflowId && r.status === 'running').length;
+      if (activeCount >= def.concurrency.maxInstances) {
+        throw new Error(`[WorkflowEngine] Workflow "${workflowId}" exceeded maximum concurrency limit (${def.concurrency.maxInstances} instances).`);
+      }
+    }
+
+    // 构建 DAG 拓扑图与分层排序
+    const dagResult = WorkflowDagBuilder.buildGraph(def.steps);
+    if (!dagResult.valid) {
+      throw new Error(`[WorkflowEngine] Failed to build DAG for workflow "${workflowId}": ${dagResult.error}`);
+    }
+
+    const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const startedAt = Date.now();
+    const abortController = new AbortController();
+    this.activeExecutions.set(runId, abortController);
+
+    console.log(`[WorkflowEngine] Starting DAG execution "${runId}" for workflow "${workflowId}" (${dagResult.layers.length} layers)${startFromStepId ? ` from step "${startFromStepId}"` : ''}`);
+
+    const ctx: WorkflowExecutionContext = { workflowId, runId, input, triggerType, startedAt, depth, callStack };
+    const stepResults: StepExecutionResult[] = [];
+    const stepOutputs = new Map<string, unknown>();
+    stepOutputs.set('input', input);
+
+    // 初始化内存与磁盘持久化状态
+    const initialRunState: PersistentRunState = {
+      runId, workflowId, status: 'running', input, stepOutputs: { input }, stepResults: [], startedAt, updatedAt: startedAt
+    };
+    WorkflowStateStore.getInstance().saveRunState(initialRunState);
+
+    this.runStatuses.set(runId, {
+      runId, workflowId, status: 'running', currentStepIndex: 0, totalSteps: def.steps.length, startedAt, elapsedMs: 0, stepResults: [],
+    });
+
+    if (def.preflight?.requiredMcpTools) {
+      for (const toolName of def.preflight.requiredMcpTools) {
+        if (!McpHost.getInstance().hasToolHandler(toolName)) {
+          console.warn(`[WorkflowEngine] Preflight warning: tool "${toolName}" may need on-demand lazy load.`);
+        }
+      }
+    }
+
+    let overallSuccess = true;
+    let finalError: string | undefined;
+    let skipUntilStepId = startFromStepId || null;
+    let globalStepCounter = 0;
+
+    const timeoutTimer = setTimeout(() => {
+      abortController.abort();
+      console.error(`[WorkflowEngine] Execution "${runId}" timed out after ${globalTimeoutMs}ms!`);
+    }, globalTimeoutMs);
+
+    this.sendIpcProgress(runId, workflowId, 'workflow_started', null, { totalSteps: def.steps.length, triggerType });
+
+    try {
+      // 遍历 DAG 拓扑层级（相同 Layer 内的节点可并行）
+      for (const layer of dagResult.layers) {
+        await this.waitIfPaused(runId, abortController.signal);
+        if (abortController.signal.aborted) {
+          throw new Error('Execution aborted or timed out.');
+        }
+
+        // 并行调度当前 Layer 内的所有 Step 节点
+        const layerPromises = layer.steps.map(async (step) => {
+          if (skipUntilStepId) {
+            if (step.id === skipUntilStepId) {
+              skipUntilStepId = null;
+            } else {
+              const skipped: StepExecutionResult = { stepId: step.id, success: true, durationMs: 0, retriesUsed: 0, skipped: true };
+              return skipped;
+            }
+          }
+
+          this.sendIpcProgress(runId, workflowId, 'step_started', step.id, { stepName: step.name, stepIndex: globalStepCounter, totalSteps: def.steps.length });
+          
+          let result: StepExecutionResult;
+          if (step.type === 'parallel' || (step.branches && step.branches.length > 0)) {
+            result = await this.executeParallelNode(step, stepOutputs, ctx, abortController.signal);
+          } else if (step.type === 'sub_workflow' && step.subWorkflowId) {
+            result = await this.executeSubWorkflowNode(step, stepOutputs, ctx, abortController.signal);
+          } else {
+            result = await this.executeStep(step, stepOutputs, ctx, abortController.signal);
+          }
+
+          globalStepCounter++;
+          return result;
+        });
+
+        const layerResults = await Promise.all(layerPromises);
+
+        for (const res of layerResults) {
+          stepResults.push(res);
+          if (res.success) {
+            if (res.output !== undefined) {
+              const offloadHandle = WorkflowStateStore.getInstance().offloadLargeOutput(runId, res.stepId, res.output);
+              const memoryOutput = offloadHandle || res.output;
+              stepOutputs.set(res.stepId, memoryOutput);
+
+              const stepDef = def.steps.find((s) => s.id === res.stepId);
+              if (stepDef?.outputDataPath) {
+                this.writeOutputToWorkspace(stepDef.outputDataPath, res.output);
+              }
+            }
+            this.sendIpcProgress(runId, workflowId, 'step_success', res.stepId, { durationMs: res.durationMs, output: res.output });
+          } else {
+            const stepDef = def.steps.find((s) => s.id === res.stepId);
+            this.sendIpcProgress(runId, workflowId, 'step_failed', res.stepId, { error: res.error });
+            if (stepDef?.onError === 'skip') {
+              console.log(`[WorkflowEngine] Step "${res.stepId}" onError=skip, continuing DAG...`);
+            } else {
+              overallSuccess = false;
+              finalError = `Step "${res.stepId}" failed: ${res.error}`;
+              break;
+            }
+          }
+        }
+
+        // 同步落盘实时状态 (SQLite / StateStore)
+        const currentOutputsObj: Record<string, unknown> = {};
+        for (const [k, v] of stepOutputs.entries()) currentOutputsObj[k] = v;
+
+        WorkflowStateStore.getInstance().saveRunState({
+          runId, workflowId, status: overallSuccess ? 'running' : 'failed',
+          input, stepOutputs: currentOutputsObj, stepResults, startedAt, updatedAt: Date.now(), error: finalError
+        });
+
+        if (!overallSuccess) break;
+      }
+    } catch (err: unknown) {
+      overallSuccess = false;
+      finalError = err instanceof Error ? err.message : String(err);
+    } finally {
+      clearTimeout(timeoutTimer);
+      this.activeExecutions.delete(runId);
+      this.pausedRuns.delete(runId);
+    }
+
+    const totalDurationMs = Date.now() - startedAt;
+    const lastStep = stepResults[stepResults.length - 1];
+    const finalOutput = lastStep && lastStep.success ? lastStep.output : null;
+
+    const runResult: WorkflowExecutionResult = { runId, workflowId, success: overallSuccess, steps: stepResults, finalOutput, totalDurationMs, error: finalError, startedAt };
+
+    // 标记持久化完成
+    WorkflowStateStore.getInstance().markCompleted(runId, overallSuccess, runResult);
+
+    // 触发 Saga 事务补偿 Error Workflow (当总体判定失败且声明了 errorWorkflowId 时)
+    if (!overallSuccess && def.errorWorkflowId && def.errorWorkflowId !== workflowId) {
+      console.log(`[WorkflowEngine] Workflow "${workflowId}" failed. Triggering Saga Error Workflow "${def.errorWorkflowId}"`);
+      this.execute(def.errorWorkflowId, {
+        failedWorkflowId: workflowId,
+        failedRunId: runId,
+        failedStepId: lastStep?.stepId,
+        error: finalError,
+        originalInput: input,
+      }, 'direct').catch((err) => {
+        console.error(`[WorkflowEngine] Error Workflow "${def.errorWorkflowId}" execution failed:`, err);
+      });
+    }
+
+    const finalStatus = this.runStatuses.get(runId);
+    if (finalStatus) {
+      finalStatus.status = overallSuccess ? 'completed' : 'failed';
+      finalStatus.elapsedMs = totalDurationMs;
+      finalStatus.stepResults = stepResults;
+    }
+
+    this.sendIpcProgress(runId, workflowId, 'workflow_completed', null, { success: overallSuccess, totalDurationMs, error: finalError });
+    console.log(`[WorkflowEngine] DAG Execution "${runId}" finished in ${totalDurationMs}ms (Success: ${overallSuccess})`);
+    this.saveRunTraceToDisk(runResult);
+    setTimeout(() => this.runStatuses.delete(runId), 5 * 60 * 1000);
+
+    return runResult;
+  }
+
+  /**
+   * 执行 type: "parallel" 包含 branches 的并发分叉节点
+   */
+  private async executeParallelNode(
+    parallelStep: WorkflowStep,
+    stepOutputs: Map<string, unknown>,
+    ctx: WorkflowExecutionContext,
+    abortSignal: AbortSignal
+  ): Promise<StepExecutionResult> {
+    const startMs = Date.now();
+    const branches = parallelStep.branches || [];
+    console.log(`[WorkflowEngine] Executing parallel node "${parallelStep.id}" with ${branches.length} branches.`);
+
+    const branchPromises = branches.map(async (branchStep) => {
+      const branchOutputs = new Map(stepOutputs);
+      return this.executeStep(branchStep, branchOutputs, ctx, abortSignal);
+    });
+
+    const branchResults = await Promise.all(branchPromises);
+    const branchOutputsMap: Record<string, unknown> = {};
+    let allSuccess = true;
+    let firstError: string | undefined;
+
+    for (const res of branchResults) {
+      if (res.success) {
+        branchOutputsMap[res.stepId] = res.output;
+        stepOutputs.set(res.stepId, res.output);
+      } else {
+        allSuccess = false;
+        if (!firstError) firstError = res.error;
+      }
+    }
+
+    return {
+      stepId: parallelStep.id,
+      success: allSuccess,
+      output: branchOutputsMap,
+      error: allSuccess ? undefined : `Parallel branch failed: ${firstError}`,
+      durationMs: Date.now() - startMs,
+      retriesUsed: 0,
+    };
+  }
+
+  /**
+   * 执行 type: "sub_workflow" 的递归子工作流节点
+   */
+  private async executeSubWorkflowNode(
+    step: WorkflowStep,
+    stepOutputs: Map<string, unknown>,
+    ctx: WorkflowExecutionContext,
+    _abortSignal: AbortSignal
+  ): Promise<StepExecutionResult> {
+    const startMs = Date.now();
+    const subId = step.subWorkflowId!;
+    const resolvedParams = (this.resolveValue(step.params, stepOutputs) as Record<string, unknown>) || {};
+    const currentCallStack = ctx.callStack || [ctx.workflowId];
+
+    if (currentCallStack.includes(subId)) {
+      return {
+        stepId: step.id,
+        success: false,
+        error: `Circular sub-workflow dependency detected: "${subId}" is already in call stack [${currentCallStack.join(' -> ')}]`,
+        durationMs: Date.now() - startMs,
+        retriesUsed: 0,
+      };
+    }
+
+    console.log(`[WorkflowEngine] Executing sub-workflow "${subId}" for step "${step.id}" (depth=${(ctx.depth || 1) + 1})`);
+
+    try {
+      const subResult = await this.execute(subId, resolvedParams, 'direct', 600000, undefined, {
+        depth: ctx.depth || 1,
+        callStack: currentCallStack,
+      });
+      return {
+        stepId: step.id,
+        success: subResult.success,
+        output: subResult.finalOutput,
+        error: subResult.error,
+        durationMs: Date.now() - startMs,
+        retriesUsed: 0,
+      };
+    } catch (err: unknown) {
+      return {
+        stepId: step.id,
+        success: false,
+        error: `Sub-workflow "${subId}" execution failed: ${err instanceof Error ? err.message : String(err)}`,
+        durationMs: Date.now() - startMs,
+        retriesUsed: 0,
+      };
+    }
+  }
+
+  public pause(runId: string): boolean {
+    if (!this.activeExecutions.has(runId)) return false;
+    this.pausedRuns.add(runId);
+    const status = this.runStatuses.get(runId);
+    if (status) status.status = 'paused';
+    this.sendIpcProgress(runId, '', 'workflow_paused', null, {});
+    return true;
+  }
+
+  public resume(runId: string): boolean {
+    if (!this.pausedRuns.has(runId)) return false;
+    this.pausedRuns.delete(runId);
+    const status = this.runStatuses.get(runId);
+    if (status) status.status = 'running';
+    this.sendIpcProgress(runId, '', 'workflow_resumed', null, {});
+    return true;
+  }
+
+  public async executeFrom(workflowId: string, fromStepId: string, previousInput: Record<string, unknown> = {}): Promise<WorkflowExecutionResult> {
+    return this.execute(workflowId, previousInput, 'manual', 600000, fromStepId);
+  }
+
+  public getActiveRun(workflowId: string): RunStatus | null {
+    for (const status of this.runStatuses.values()) {
+      if (status.workflowId === workflowId && (status.status === 'running' || status.status === 'paused')) {
+        return status;
+      }
+    }
+    return null;
+  }
+
+  public getRunStatus(runId: string): RunStatus | null {
+    return this.runStatuses.get(runId) || null;
+  }
+
+  public listRecentRuns(workflowId?: string, limit = 20): WorkflowExecutionResult[] {
+    try {
+      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
+      if (!fs.existsSync(runsDir)) return [];
+      const files = fs.readdirSync(runsDir).filter(f => f.endsWith('.json')).sort().reverse().slice(0, limit * 3);
+      const results: WorkflowExecutionResult[] = [];
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(path.join(runsDir, file), 'utf-8');
+          const run = JSON.parse(content) as WorkflowExecutionResult;
+          if (!workflowId || run.workflowId === workflowId) results.push(run);
+          if (results.length >= limit) break;
+        } catch {
+          // ignore
+        }
+      }
+      return results;
+    } catch {
+      return [];
+    }
+  }
+
+  public deleteRun(runId: string): boolean {
+    try {
+      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
+      const filePath = path.join(runsDir, `${runId}.json`);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+    return false;
+  }
+
+  public clearRuns(workflowId: string): boolean {
+    try {
+      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
+      if (!fs.existsSync(runsDir)) return true;
+      const files = fs.readdirSync(runsDir).filter(f => f.endsWith('.json'));
+      for (const file of files) {
+        const filePath = path.join(runsDir, file);
+        try {
+          const content = fs.readFileSync(filePath, 'utf-8');
+          const run = JSON.parse(content) as WorkflowExecutionResult;
+          if (run.workflowId === workflowId) fs.unlinkSync(filePath);
+        } catch {
+          // ignore
+        }
+      }
+      return true;
+    } catch {
+      // ignore
+    }
+    return false;
+  }
+
+  private async waitIfPaused(runId: string, abortSignal: AbortSignal): Promise<void> {
+    while (this.pausedRuns.has(runId) && !abortSignal.aborted) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+
+  private sendIpcProgress(runId: string, workflowId: string, event: string, stepId: string | null, data: Record<string, unknown>): void {
+    try {
+      const wins = BrowserWindow.getAllWindows();
+      const payload = { runId, workflowId, event, stepId, timestamp: Date.now(), ...data };
+      this.emit('step-progress', payload);
+      for (const win of wins) {
+        if (!win.isDestroyed()) win.webContents.send('workflow:step-progress', payload);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  public cancel(runId: string): boolean {
+    const controller = this.activeExecutions.get(runId);
+    if (controller) {
+      controller.abort();
+      this.activeExecutions.delete(runId);
+      return true;
+    }
+    return false;
+  }
+
+  private async executeStep(
+    step: WorkflowStep,
+    stepOutputs: Map<string, unknown>,
+    ctx: WorkflowExecutionContext,
+    abortSignal: AbortSignal
+  ): Promise<StepExecutionResult> {
+    const startMs = Date.now();
+
+    if (step.condition && !this.evaluateCondition(step.condition, stepOutputs)) {
+      return { stepId: step.id, success: true, output: null, durationMs: 0, retriesUsed: 0, skipped: true };
+    }
+
+    if (step.forEach) {
+      const items = this.resolveValue(step.forEach, stepOutputs);
+      if (Array.isArray(items)) {
+        const singleStep: WorkflowStep = { ...step, forEach: undefined };
+        const batchOutputs: unknown[] = [];
+        const concurrency = Math.max(1, step.maxConcurrency || 1);
+
+        for (let i = 0; i < items.length; i += concurrency) {
+          const chunk = items.slice(i, i + concurrency);
+          const chunkPromises = chunk.map((item) => {
+            const itemOutputs = new Map(stepOutputs);
+            itemOutputs.set('item', item);
+            return this.executeStep(singleStep, itemOutputs, ctx, abortSignal);
+          });
+          const chunkResults = await Promise.all(chunkPromises);
+          for (const res of chunkResults) {
+            if (!res.success && step.onError !== 'skip') {
+              return { stepId: step.id, success: false, error: res.error, durationMs: Date.now() - startMs, retriesUsed: res.retriesUsed };
+            }
+            batchOutputs.push(res.output);
+          }
+        }
+        return { stepId: step.id, success: true, output: batchOutputs, input: items, durationMs: Date.now() - startMs, retriesUsed: 0 };
+      }
+    }
+
+    const isHumanInTheLoop = step.humanInTheLoop || (step as unknown as Record<string, unknown>).type === 'human_in_the_loop';
+    if (isHumanInTheLoop) {
+      const rawMessage = step.humanInTheLoop?.message || (step as unknown as Record<string, unknown>).message || '请确认当前步骤是否完成';
+      const resolvedMessage = String(this.resolveValue(rawMessage, stepOutputs) || rawMessage);
+      const timeoutMs = (step.humanInTheLoop?.timeoutMs || (step as unknown as Record<string, unknown>).timeoutMs || 300000) as number;
+
+      const approved = await this.promptHumanInTheLoop(step.id, resolvedMessage, timeoutMs);
+      if (!approved) {
+        return { stepId: step.id, success: false, input: resolvedMessage, error: `Human-in-the-Loop rejected`, durationMs: Date.now() - startMs, retriesUsed: 0 };
+      }
+      if (!step.tool) {
+        return { stepId: step.id, success: true, input: resolvedMessage, output: 'Approved', durationMs: Date.now() - startMs, retriesUsed: 0 };
+      }
+    }
+
+    const resolvedParams = (this.resolveValue(step.params, stepOutputs) as Record<string, unknown>) || {};
+    const maxAttempts = 1 + (step.retryCount || 0);
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (abortSignal.aborted) {
+        return { stepId: step.id, success: false, input: resolvedParams, error: 'Canceled', durationMs: Date.now() - startMs, retriesUsed: attempt };
+      }
+
+      try {
+        const stepTimeoutMs = step.timeout || 60000;
+        const toolPromise = McpHost.getInstance().callTool(step.tool!, resolvedParams);
+        const output = await this.withTimeout(toolPromise, stepTimeoutMs, `Step "${step.id}" timeout`);
+
+        if (output && typeof output === 'object') {
+          const obj = output as Record<string, unknown>;
+          if (obj.isError === true) {
+            const errText = Array.isArray(obj.content) && obj.content[0] && typeof obj.content[0] === 'object'
+              ? (obj.content[0] as Record<string, unknown>).text || JSON.stringify(output)
+              : JSON.stringify(output);
+            throw new Error(String(errText));
+          }
+          if (obj.success === false) {
+            throw new Error(String(obj.error || JSON.stringify(output)));
+          }
+        }
+
+        return { stepId: step.id, success: true, output, input: resolvedParams, durationMs: Date.now() - startMs, retriesUsed: attempt };
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (step.aiFallback && attempt === maxAttempts - 1) {
+          try {
+            const fallbackPrompt = (this.resolveValue(step.aiFallback.prompt, stepOutputs) as string) || step.aiFallback.prompt;
+            const fallbackOutput = await this.executeAiFallback(fallbackPrompt, step.aiFallback.model);
+            return { stepId: step.id, success: true, output: fallbackOutput, input: fallbackPrompt, durationMs: Date.now() - startMs, retriesUsed: maxAttempts, aiFallbackUsed: true };
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    return { stepId: step.id, success: false, input: resolvedParams, error: lastError?.message || 'Failed', durationMs: Date.now() - startMs, retriesUsed: maxAttempts - 1 };
+  }
+
+  /**
+   * 递归解析表达式与参数引用 ($input.xxx, $stepId.field, $credential.key)
+   */
+  private resolveValue(value: unknown, stepOutputs: Map<string, unknown>): unknown {
+    if (typeof value === 'string') {
+      const resolvedStr = value;
+      // 反解加密凭证表达式如 "$credential.my_api_key"
+      if (resolvedStr.includes('$credential.')) {
+        return WorkflowCredentialStore.getInstance().resolveCredentialExpression(resolvedStr);
+      }
+      if (resolvedStr.startsWith('$')) {
+        return this.evaluateRefPath(resolvedStr.slice(1), stepOutputs);
+      }
+      return resolvedStr;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.resolveValue(item, stepOutputs));
+    }
+
+    if (value && typeof value === 'object') {
+      const result: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value)) {
+        result[k] = this.resolveValue(v, stepOutputs);
+      }
+      return result;
+    }
+
+    return value;
+  }
+
+  private evaluateRefPath(pathStr: string, stepOutputs: Map<string, unknown>): unknown {
+    const normalizedPath = pathStr.replace(/\[(\d+)\]/g, '.$1');
+    const parts = normalizedPath.split('.');
+    const rootKey = parts[0];
+    let current = stepOutputs.get(rootKey);
+
+    for (let i = 1; i < parts.length; i++) {
+      if (current === undefined || current === null) return undefined;
+      if (typeof current === 'object') {
+        current = (current as Record<string, unknown>)[parts[i]];
+      } else {
+        return undefined;
+      }
+    }
+
+    return current;
+  }
+
+  private evaluateCondition(condition: string, stepOutputs: Map<string, unknown>): boolean {
+    try {
+      const resolved = condition.replace(/\$([a-zA-Z0-9_.[\]]+)/g, (_, refPath) => {
+        const val = this.evaluateRefPath(refPath, stepOutputs);
+        return JSON.stringify(val ?? null);
+      });
+
+      if (!/^[a-zA-Z0-9_\s.+\-*/%=!<>&|"'`[\]{}:,()]+$/.test(resolved)) {
+        return false;
+      }
+      return Boolean(Function(`"use strict"; return (${resolved})`)());
+    } catch {
+      return true;
+    }
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+    let timer: NodeJS.Timeout;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+  }
+
+  private saveRunTraceToDisk(result: WorkflowExecutionResult): void {
+    try {
+      const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
+      if (!fs.existsSync(runsDir)) fs.mkdirSync(runsDir, { recursive: true });
+      fs.writeFileSync(path.join(runsDir, `${result.runId}.json`), JSON.stringify(result, null, 2), 'utf-8');
+    } catch {
+      // ignore
+    }
+  }
+
+  private writeOutputToWorkspace(targetPath: string, data: unknown): void {
+    try {
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const resolvedPath = targetPath.replace('$date', todayStr);
+      const wsRoot = process.cwd();
+      const absolutePath = path.isAbsolute(resolvedPath) ? path.normalize(resolvedPath) : path.resolve(wsRoot, resolvedPath);
+
+      const relative = path.relative(wsRoot, absolutePath);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) return;
+
+      const dir = path.dirname(absolutePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+      const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+      fs.writeFileSync(absolutePath, content, 'utf-8');
+    } catch {
+      // ignore
+    }
+  }
+
+  private async executeAiFallback(prompt: string, model?: string): Promise<unknown> {
+    const mcpHost = McpHost.getInstance();
+    if (mcpHost.hasToolHandler('ai_generate_text')) {
+      return mcpHost.callTool('ai_generate_text', { prompt, model });
+    }
+    const { AiController } = await import('./controllers/ai');
+    const aiCtrl = new AiController();
+    return aiCtrl.ai_chat({ messages: [{ role: 'user', content: prompt }], modelId: model }, { pluginId: 'workflow-engine', apiName: 'ai' });
+  }
+
+  private async promptHumanInTheLoop(stepId: string, message: string, timeoutMs: number = 300000): Promise<boolean> {
+    const { ElectronMainWindow } = await import('../windows/main-window');
+    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+
+    if (!mainWindow || mainWindow.isDestroyed()) return true;
+
+    return new Promise<boolean>((resolve) => {
+      mainWindow.webContents.send('workflow:human-approval-request', { stepId, message, timeoutMs });
+
+      const channel = `workflow:human-approval-response:${stepId}`;
+
+      const handler = (_event: unknown, response: { approved: boolean }) => {
+        clearTimeout(timer);
+        ipcMain.removeListener(channel, handler);
+        resolve(Boolean(response?.approved));
+      };
+
+      ipcMain.once(channel, handler);
+      const timer = setTimeout(() => {
+        ipcMain.removeListener(channel, handler);
+        resolve(false);
+      }, timeoutMs);
+    });
+  }
+}

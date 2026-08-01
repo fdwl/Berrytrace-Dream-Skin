@@ -1,0 +1,149 @@
+import type { IpcMainEvent } from 'electron';
+import { ipcMain, BrowserWindow } from 'electron';
+import { dispatchPluginApiCall } from './api-dispatcher';
+import { McpHost } from './mcp-host';
+import type { PluginManager } from './plugin-manager';
+
+export function createMainSDKInstance(pluginId: string, pm: PluginManager): Record<string, unknown> {
+  const callApi = (apiName: string, methodName: string, args: unknown[] = []) => {
+    return dispatchPluginApiCall(pluginId, apiName, methodName, args);
+  };
+
+  return {
+    callApi,
+    log: {
+      info: (msg: string) => callApi('log', 'info', [msg]),
+      warn: (msg: string) => callApi('log', 'warn', [msg]),
+      error: (msg: string) => callApi('log', 'error', [msg]),
+      debug: (msg: string) => callApi('log', 'debug', [msg]),
+    },
+    plugin: {
+      getInfo: () => callApi('plugin', 'getInfo')
+    },
+    events: {
+      on: (event: string, callback: (...args: unknown[]) => void) => {
+        const handler = (_event: IpcMainEvent, ...args: unknown[]) => callback(...args);
+        ipcMain.on(event, handler);
+        return () => {
+          ipcMain.off(event, handler);
+        };
+      },
+      emit: (event: string, ...args: unknown[]) => {
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) {
+            win.webContents.send(event, ...args);
+          }
+        });
+      }
+    },
+    storage: {
+      kv: {
+        get: (key: string, def?: unknown) => callApi('storage', 'kv.get', [key, def]),
+        set: (key: string, val: unknown) => callApi('storage', 'kv.set', [key, val]),
+        delete: (key: string) => callApi('storage', 'kv.delete', [key]),
+        clear: () => callApi('storage', 'kv.clear')
+      },
+      db: {
+        execute: (sql: string, params?: unknown[]) => callApi('storage', 'db.execute', [sql, params])
+      }
+    },
+    filesystem: {
+      readFile: (path: string, enc?: string) => callApi('filesystem', 'readFile', [path, enc]),
+      writeFile: (path: string, content: unknown) => callApi('filesystem', 'writeFile', [path, content]),
+      renameFile: (oldPath: string, newPath: string) => callApi('filesystem', 'renameFile', [oldPath, newPath]),
+      deleteFile: (path: string) => callApi('filesystem', 'deleteFile', [path]),
+      getSafePath: (name: string) => callApi('filesystem', 'getSafePath', [name]),
+      showItemInFolder: (path: string) => callApi('filesystem', 'showItemInFolder', [path])
+    },
+    mcp: {
+      registerToolHandler: (toolName: string, handler: (args: Record<string, unknown>) => Promise<unknown>) => {
+        const manifest = pm.getPlugin(pluginId)?.manifest;
+        interface McpToolSpec {
+          name: string;
+          description: string;
+          inputSchema: Record<string, unknown>;
+        }
+        const mcpWithTools = manifest?.mcp as { tools?: McpToolSpec[] } | undefined;
+        const toolSpec = mcpWithTools?.tools?.find((t) => t.name === toolName);
+        if (toolSpec) {
+          McpHost.getInstance().registerHostTool(
+            {
+              name: toolName,
+              description: toolSpec.description,
+              inputSchema: toolSpec.inputSchema as Record<string, unknown>,
+            },
+            async (args) => {
+              const res = await handler(args);
+              if (res && typeof res === 'object' && 'content' in res) {
+                return res;
+              }
+              return { content: [{ type: 'text', text: JSON.stringify(res) }] };
+            },
+            pluginId
+          );
+        } else {
+          console.warn(`[PluginManager] Tool schema for "${toolName}" not found in plugin.json for "${pluginId}"`);
+        }
+      }
+    },
+    system: {
+      getTheme: () => callApi('system', 'getTheme'),
+      showNotification: (options: { title: string; body: string; silent?: boolean }) =>
+        callApi('system', 'showNotification', [options]),
+      openUrl: (url: string, options?: { internal?: boolean; width?: number; height?: number; alwaysOnTop?: boolean }) =>
+        callApi('system', 'openUrl', [url, options]),
+      openExternal: (url: string) => callApi('system', 'openExternal', [url]),
+      execCommand: (options: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+        timeoutMs?: number;
+        shell?: boolean;
+      }) => callApi('system', 'execCommand', [options])
+    },
+    workspace: {
+      getPath: () => callApi('workspace', 'getPath'),
+      getMetadata: () => callApi('workspace', 'getMetadata')
+    },
+    selectionMenu: {
+      registerItem: (item: Record<string, unknown>) => callApi('selectionMenu', 'registerItem', [item]),
+      unregisterItem: (id: string) => callApi('selectionMenu', 'unregisterItem', [id]),
+    },
+    publish: {
+      createShare: (options: Record<string, unknown>) => callApi('publish', 'createShare', [options]),
+      deleteShare: (options: Record<string, unknown>) => callApi('publish', 'deleteShare', [options]),
+      listShares: () => callApi('publish', 'listShares'),
+      updateShare: (options: Record<string, unknown>) => callApi('publish', 'updateShare', [options]),
+      getShareByPath: (filePath: string) => callApi('publish', 'getShareByPath', [filePath]),
+      addOrUpdateShare: (filePath: string, record: Record<string, unknown>) => callApi('publish', 'addOrUpdateShare', [filePath, record]),
+      removeShare: (filePath: string) => callApi('publish', 'removeShare', [filePath]),
+    },
+    workflow: {
+      register: (def: Record<string, unknown>) => callApi('workflow', 'register', [def]),
+      execute: (workflowId: string, input?: Record<string, unknown>, triggerType?: string) =>
+        callApi('workflow', 'execute', [workflowId, input, triggerType]),
+      list: () => callApi('workflow', 'list'),
+      get: (workflowId: string) => callApi('workflow', 'get', [workflowId]),
+      unregister: (workflowId: string) => callApi('workflow', 'unregister', [workflowId]),
+      cancel: (runId: string) => callApi('workflow', 'cancel', [runId]),
+      matchIntent: (userQuery: string) => callApi('workflow', 'matchIntent', [userQuery]),
+      getHistory: (workflowId: string) => callApi('workflow', 'getHistory', [workflowId]),
+      listRecentRuns: (workflowId?: string, limit?: number) => callApi('workflow', 'listRecentRuns', [workflowId, limit]),
+      deleteRun: (runId: string) => callApi('workflow', 'deleteRun', [runId]),
+      clearRuns: (workflowId: string) => callApi('workflow', 'clearRuns', [workflowId]),
+      deleteSnapshot: (workflowId: string, timestamp: number) => callApi('workflow', 'deleteSnapshot', [{ workflowId, timestamp }]),
+      clearSnapshots: (workflowId: string) => callApi('workflow', 'clearSnapshots', [workflowId]),
+    },
+    context: {
+      set: (key: string, value: unknown, options?: Record<string, unknown>) =>
+        callApi('context', 'set', [key, value, options]),
+      get: (key: string, options?: Record<string, unknown>) =>
+        callApi('context', 'get', [key, options]),
+      list: (options?: Record<string, unknown>) =>
+        callApi('context', 'list', [options]),
+      clear: (options?: Record<string, unknown>) =>
+        callApi('context', 'clear', [options]),
+    }
+  };
+}

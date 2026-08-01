@@ -1,0 +1,12 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md b/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md
+index 5cd57fd..f241a83 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/03-plugin-json.md
+@@ -19,7 +19,7 @@
+ | `resident` | `boolean` | `false` | 常驻插件：不会被空闲回收，启动时预加载 |
+ | `startupPriority` | `"high"` \| `"normal"` | `"normal"` | 启动优先级，`high` = 启动时预加载 |
+ | `idleTimeout` | `number` | `300000` | 空闲回收超时（ms），仅对非 resident 插件生效 |
+-| `processIsolation` | `"required"` \| `"recommended"` \| `"optional"` | `"optional"` | 进程隔离等级 |
++| `processIsolation` | `"required"` \| `"recommended"` \| `"optional"` | `"optional"` | 进程隔离：`required`/`recommended` = 独立进程，`optional` = 共享池 |
+ | `scope` | `"global"` \| `"workspace"` | — | 插件作用域 |
+ | `nativeElectron` | `boolean` | `false` | 是否使用 Electron 原生窗口 |

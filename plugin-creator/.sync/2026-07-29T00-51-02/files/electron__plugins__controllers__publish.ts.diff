@@ -1,0 +1,14 @@
+diff --git a/electron/plugins/controllers/publish.ts b/electron/plugins/controllers/publish.ts
+index efe1f63..03f818c 100644
+--- a/electron/plugins/controllers/publish.ts
++++ b/electron/plugins/controllers/publish.ts
+@@ -4,7 +4,8 @@ import { cache as electronCache } from '../../config/index';
+ setStorageBackend(electronCache);
+ 
+ import { httpService } from '../../../src/services/http';
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { ElectronAuthManager } from '../../services/auth-manager';
+ 
+ /**

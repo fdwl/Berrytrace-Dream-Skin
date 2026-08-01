@@ -1,0 +1,274 @@
+diff --git a/src/views/plugins/PluginsManagementPanel.tsx b/src/views/plugins/PluginsManagementPanel.tsx
+index 2b5c7dc..59ed646 100644
+--- a/src/views/plugins/PluginsManagementPanel.tsx
++++ b/src/views/plugins/PluginsManagementPanel.tsx
+@@ -2,12 +2,52 @@ import React, { useState, useMemo, useEffect } from 'react';
+ import { MOCK_ONLINE_ASSETS } from './types';
+ import type { Asset } from './types';
+ 
++interface PluginItem {
++  id: string;
++  name: string;
++  version: string;
++  description?: string;
++  isActive: boolean;
++  isDevFolder: boolean;
++  isPinned?: boolean;
++  view?: string;
++  type?: string;
++  updateVersion?: string;
++  updateUrl?: string;
++  updateChangelog?: string;
++}
++
++interface SkillItem {
++  id?: string;
++  name: string;
++  displayName?: string;
++  description?: string;
++  source?: string;
++  [key: string]: string | number | boolean | undefined | null;
++}
++
++interface ToolItem {
++  id?: string;
++  name: string;
++  isInstalled: boolean;
++  description?: string;
++  [key: string]: string | number | boolean | undefined | null;
++}
++
++interface McpToolItem {
++  name: string;
++  displayName?: string;
++  description?: string;
++  pluginId?: string;
++  [key: string]: string | number | boolean | undefined | null;
++}
++
+ interface PluginsManagementPanelProps {
+   onBack: () => void;
+-  installedPlugins: any[];
+-  installedSkills: any[];
+-  installedTools: any[];
+-  installedMcpTools: any[];
++  installedPlugins: PluginItem[];
++  installedSkills: SkillItem[];
++  installedTools: ToolItem[];
++  installedMcpTools: McpToolItem[];
+   simulatedInstalledIds: string[];
+   onUninstallMockAsset: (id: string) => void;
+   onUninstallSkill: (name: string) => void;
+@@ -51,52 +91,57 @@ export default function PluginsManagementPanel({
+   // Actions for plugins
+   const handleTogglePlugin = async (id: string, currentlyActive: boolean) => {
+     try {
+-      await (window as any).electronAPI.plugins.toggle(id, !currentlyActive);
+-      if (!currentlyActive && (window as any).electronAPI?.plugins?.reload) {
+-        await (window as any).electronAPI.plugins.reload(id);
++      if (window.electronAPI?.plugins?.toggle) {
++        await window.electronAPI.plugins.toggle(id, !currentlyActive);
++      }
++      if (!currentlyActive && window.electronAPI?.plugins?.reload) {
++        await window.electronAPI.plugins.reload(id);
+       }
+       await loadLocalData();
+-    } catch (err: any) {
+-      alert(err.message || '切换插件状态失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '切换插件状态失败');
+     }
+   };
+ 
+   const handleUninstallPlugin = async (id: string) => {
+     if (!confirm('确定要卸载该插件并删除其所有本地文件吗？')) return;
+     try {
+-      const success = await (window as any).electronAPI.plugins.uninstall(id);
+-      if (success) {
+-        await loadLocalData();
+-      } else {
+-        alert('卸载插件失败');
++      if (window.electronAPI?.plugins?.uninstall) {
++        const success = await window.electronAPI.plugins.uninstall(id);
++        if (success) {
++          await loadLocalData();
++        } else {
++          alert('卸载插件失败');
++        }
+       }
+-    } catch (err: any) {
+-      alert(err.message || '卸载插件失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '卸载插件失败');
+     }
+   };
+ 
+   const handleReloadPlugin = async (id: string) => {
+     try {
+-      const success = await (window as any).electronAPI.plugins.reload(id);
+-      if (success) {
+-        await loadLocalData();
+-      } else {
+-        alert('重载插件失败');
++      if (window.electronAPI?.plugins?.reload) {
++        const success = await window.electronAPI.plugins.reload(id);
++        if (success) {
++          await loadLocalData();
++        } else {
++          alert('重载插件失败');
++        }
+       }
+-    } catch (err: any) {
+-      alert(err.message || '重载插件失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '重载插件失败');
+     }
+   };
+ 
+   const handleCheckUpdateSingle = async (id: string) => {
+-    const win = window as any;
+-    if (!win.electronAPI?.plugins?.checkUpdateSingle) {
++    if (!window.electronAPI?.plugins?.checkUpdateSingle) {
+       alert('当前版本不支持检查单个插件更新');
+       return;
+     }
+     try {
+       setUpdatingPluginIds(prev => [...prev, id]);
+-      const res = await win.electronAPI.plugins.checkUpdateSingle(id);
++      const res = await window.electronAPI.plugins.checkUpdateSingle(id);
+       if (res.success) {
+         if (res.updated) {
+           alert(`插件更新成功: ${res.message}`);
+@@ -107,79 +152,78 @@ export default function PluginsManagementPanel({
+       } else {
+         alert(res.message || '检查更新失败');
+       }
+-    } catch (err: any) {
+-      alert(err.message || '检查更新失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '检查更新失败');
+     } finally {
+       setUpdatingPluginIds(prev => prev.filter(x => x !== id));
+     }
+   };
+ 
+   const handleCheckUpdatesAll = async () => {
+-    const win = window as any;
+-    if (!win.electronAPI?.plugins?.checkUpdatesAll) {
++    if (!window.electronAPI?.plugins?.checkUpdatesAll) {
+       alert('当前版本不支持检查更新');
+       return;
+     }
+     try {
+       setIsCheckingAll(true);
+-      const res = await win.electronAPI.plugins.checkUpdatesAll();
++      const res = await window.electronAPI.plugins.checkUpdatesAll();
+       if (res.success) {
+         alert('检查更新和静默安装完成');
+         await loadLocalData();
+       } else {
+         alert(res.error || '检查更新失败');
+       }
+-    } catch (err: any) {
+-      alert(err.message || '检查更新失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '检查更新失败');
+     } finally {
+       setIsCheckingAll(false);
+     }
+   };
+ 
+   const handleUpdatePlugin = async (id: string, url: string) => {
+-    const win = window as any;
+-    if (!win.electronAPI?.plugins?.installFromUrl) return;
++    if (!window.electronAPI?.plugins?.installFromUrl) return;
+     try {
+       setUpdatingPluginIds(prev => [...prev, id]);
+-      const success = await win.electronAPI.plugins.installFromUrl(url);
++      const success = await window.electronAPI.plugins.installFromUrl(url);
+       if (!success) {
+         alert('触发插件更新失败');
+         setUpdatingPluginIds(prev => prev.filter(x => x !== id));
+       } else {
+         await loadLocalData();
+       }
+-    } catch (err: any) {
+-      alert(err.message || '触发插件更新失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '触发插件更新失败');
+       setUpdatingPluginIds(prev => prev.filter(x => x !== id));
+     }
+   };
+ 
+   const handleLoadUnpacked = async () => {
+     try {
+-      const res = await (window as any).electronAPI.plugins.loadUnpacked();
+-      if (res.success) {
+-        await loadLocalData();
+-      } else if (res.reason !== 'canceled') {
+-        alert(res.reason || '加载解压插件失败');
++      if (window.electronAPI?.plugins?.loadUnpacked) {
++        const res = await window.electronAPI.plugins.loadUnpacked();
++        if (res.success) {
++          await loadLocalData();
++        } else if (res.reason !== 'canceled') {
++          alert(res.reason || '加载解压插件失败');
++        }
+       }
+-    } catch (err: any) {
+-      alert(err.message || '加载解压插件失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '加载解压插件失败');
+     }
+   };
+ 
+   const handleInstallPkgDialog = async () => {
+-    const win = window as any;
+-    if (!win.electronAPI?.plugins?.selectPkgFile) return;
++    if (!window.electronAPI?.plugins?.selectPkgFile || !window.electronAPI?.plugins?.verifyPkg || !window.electronAPI?.plugins?.confirmInstall) return;
+     try {
+-      const res = await win.electronAPI.plugins.selectPkgFile();
++      const res = await window.electronAPI.plugins.selectPkgFile();
+       if (res.success && res.filePath) {
+-        const verifyRes = await win.electronAPI.plugins.verifyPkg(res.filePath);
++        const verifyRes = await window.electronAPI.plugins.verifyPkg(res.filePath);
+         if (verifyRes.success && verifyRes.tempDir && verifyRes.packagePath && verifyRes.manifest) {
+-          const ok = await win.electronAPI.plugins.confirmInstall(
++          const ok = await window.electronAPI.plugins.confirmInstall(
+             verifyRes.tempDir,
+             verifyRes.packagePath,
+-            verifyRes.manifest.id,
+-            verifyRes.signature
++            (verifyRes.manifest as { id: string }).id,
++            verifyRes.signature as string | undefined
+           );
+           if (ok) {
+             await loadLocalData();
+@@ -189,8 +233,8 @@ export default function PluginsManagementPanel({
+           }
+         }
+       }
+-    } catch (err: any) {
+-      alert(err.message || '选择插件包失败');
++    } catch (err: unknown) {
++      alert(err instanceof Error ? err.message : '选择插件包失败');
+     }
+   };
+ 
+@@ -340,7 +384,7 @@ export default function PluginsManagementPanel({
+                               </button>
+                             )}
+ 
+-                            {p.isDevFolder && (
++
+                               <button
+                                 onClick={(e) => {
+                                   e.stopPropagation();
+@@ -354,7 +398,7 @@ export default function PluginsManagementPanel({
+                                 </svg>
+                                 <span>重载插件</span>
+                               </button>
+-                            )}
++
+ 
+                             <div className="h-px bg-[var(--border-light)] my-1" />

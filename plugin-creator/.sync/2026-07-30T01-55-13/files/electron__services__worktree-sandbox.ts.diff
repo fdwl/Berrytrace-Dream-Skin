@@ -1,0 +1,15 @@
+diff --git a/electron/services/worktree-sandbox.ts b/electron/services/worktree-sandbox.ts
+index a3f9cb3..739d677 100644
+--- a/electron/services/worktree-sandbox.ts
++++ b/electron/services/worktree-sandbox.ts
+@@ -109,7 +109,9 @@ export class GitWorktreeSandboxManager {
+   public static async pruneOrphanSandboxes(repoPath: string): Promise<void> {
+     try {
+       await execFileAsync('git', ['worktree', 'prune'], { cwd: repoPath });
+-    } catch {}
++    } catch {
++      // ignore git worktree prune failure
++    }
+   }
+ 
+   public static getSandbox(sessionId: string): SandboxSession | undefined {

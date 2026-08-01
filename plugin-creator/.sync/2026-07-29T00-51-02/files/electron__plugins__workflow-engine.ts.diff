@@ -1,0 +1,238 @@
+diff --git a/electron/plugins/workflow-engine.ts b/electron/plugins/workflow-engine.ts
+index f7daa8c..eea1e39 100644
+--- a/electron/plugins/workflow-engine.ts
++++ b/electron/plugins/workflow-engine.ts
+@@ -1,17 +1,19 @@
+ import { EventEmitter } from 'events';
+ import { McpHost } from './mcp-host';
+-import {
++import type {
+   WorkflowDefinition,
+   WorkflowStep,
+   WorkflowExecutionContext,
+   WorkflowExecutionResult,
+   StepExecutionResult,
+ } from './workflow-types';
+-import { WorkflowDagBuilder, ExecutionLayer } from './workflow-dag-builder';
+-import { WorkflowStateStore, PersistentRunState } from './workflow-state-store';
++import { WorkflowDagBuilder } from './workflow-dag-builder';
++import type { PersistentRunState } from './workflow-state-store';
++import { WorkflowStateStore } from './workflow-state-store';
+ import { WorkflowCredentialStore } from './workflow-credential-store';
+ import * as fs from 'fs';
+ import * as path from 'path';
++import { BrowserWindow, ipcMain } from 'electron';
+ 
+ export interface RunStatus {
+   runId: string;
+@@ -300,9 +302,9 @@ export class WorkflowEngine extends EventEmitter {
+ 
+         if (!overallSuccess) break;
+       }
+-    } catch (err: any) {
++    } catch (err: unknown) {
+       overallSuccess = false;
+-      finalError = err?.message || String(err);
++      finalError = err instanceof Error ? err.message : String(err);
+     } finally {
+       clearTimeout(timeoutTimer);
+       this.activeExecutions.delete(runId);
+@@ -397,7 +399,7 @@ export class WorkflowEngine extends EventEmitter {
+     step: WorkflowStep,
+     stepOutputs: Map<string, unknown>,
+     ctx: WorkflowExecutionContext,
+-    abortSignal: AbortSignal
++    _abortSignal: AbortSignal
+   ): Promise<StepExecutionResult> {
+     const startMs = Date.now();
+     const subId = step.subWorkflowId!;
+@@ -429,11 +431,11 @@ export class WorkflowEngine extends EventEmitter {
+         durationMs: Date.now() - startMs,
+         retriesUsed: 0,
+       };
+-    } catch (err: any) {
++    } catch (err: unknown) {
+       return {
+         stepId: step.id,
+         success: false,
+-        error: `Sub-workflow "${subId}" execution failed: ${err?.message || err}`,
++        error: `Sub-workflow "${subId}" execution failed: ${err instanceof Error ? err.message : String(err)}`,
+         durationMs: Date.now() - startMs,
+         retriesUsed: 0,
+       };
+@@ -487,7 +489,9 @@ export class WorkflowEngine extends EventEmitter {
+           const run = JSON.parse(content) as WorkflowExecutionResult;
+           if (!workflowId || run.workflowId === workflowId) results.push(run);
+           if (results.length >= limit) break;
+-        } catch {}
++        } catch {
++          // ignore
++        }
+       }
+       return results;
+     } catch {
+@@ -503,7 +507,9 @@ export class WorkflowEngine extends EventEmitter {
+         fs.unlinkSync(filePath);
+         return true;
+       }
+-    } catch {}
++    } catch {
++      // ignore
++    }
+     return false;
+   }
+ 
+@@ -518,10 +524,14 @@ export class WorkflowEngine extends EventEmitter {
+           const content = fs.readFileSync(filePath, 'utf-8');
+           const run = JSON.parse(content) as WorkflowExecutionResult;
+           if (run.workflowId === workflowId) fs.unlinkSync(filePath);
+-        } catch {}
++        } catch {
++          // ignore
++        }
+       }
+       return true;
+-    } catch {}
++    } catch {
++      // ignore
++    }
+     return false;
+   }
+ 
+@@ -533,14 +543,15 @@ export class WorkflowEngine extends EventEmitter {
+ 
+   private sendIpcProgress(runId: string, workflowId: string, event: string, stepId: string | null, data: Record<string, unknown>): void {
+     try {
+-      const { BrowserWindow } = require('electron');
+       const wins = BrowserWindow.getAllWindows();
+       const payload = { runId, workflowId, event, stepId, timestamp: Date.now(), ...data };
+       this.emit('step-progress', payload);
+       for (const win of wins) {
+         if (!win.isDestroyed()) win.webContents.send('workflow:step-progress', payload);
+       }
+-    } catch {}
++    } catch {
++      // ignore
++    }
+   }
+ 
+   public cancel(runId: string): boolean {
+@@ -591,11 +602,11 @@ export class WorkflowEngine extends EventEmitter {
+       }
+     }
+ 
+-    const isHumanInTheLoop = step.humanInTheLoop || (step as any).type === 'human_in_the_loop';
++    const isHumanInTheLoop = step.humanInTheLoop || (step as unknown as Record<string, unknown>).type === 'human_in_the_loop';
+     if (isHumanInTheLoop) {
+-      const rawMessage = step.humanInTheLoop?.message || (step as any).message || '请确认当前步骤是否完成';
++      const rawMessage = step.humanInTheLoop?.message || (step as unknown as Record<string, unknown>).message || '请确认当前步骤是否完成';
+       const resolvedMessage = String(this.resolveValue(rawMessage, stepOutputs) || rawMessage);
+-      const timeoutMs = step.humanInTheLoop?.timeoutMs || (step as any).timeoutMs || 300000;
++      const timeoutMs = (step.humanInTheLoop?.timeoutMs || (step as unknown as Record<string, unknown>).timeoutMs || 300000) as number;
+ 
+       const approved = await this.promptHumanInTheLoop(step.id, resolvedMessage, timeoutMs);
+       if (!approved) {
+@@ -619,15 +630,31 @@ export class WorkflowEngine extends EventEmitter {
+         const stepTimeoutMs = step.timeout || 60000;
+         const toolPromise = McpHost.getInstance().callTool(step.tool!, resolvedParams);
+         const output = await this.withTimeout(toolPromise, stepTimeoutMs, `Step "${step.id}" timeout`);
++
++        if (output && typeof output === 'object') {
++          const obj = output as Record<string, unknown>;
++          if (obj.isError === true) {
++            const errText = Array.isArray(obj.content) && obj.content[0] && typeof obj.content[0] === 'object'
++              ? (obj.content[0] as Record<string, unknown>).text || JSON.stringify(output)
++              : JSON.stringify(output);
++            throw new Error(String(errText));
++          }
++          if (obj.success === false) {
++            throw new Error(String(obj.error || JSON.stringify(output)));
++          }
++        }
++
+         return { stepId: step.id, success: true, output, input: resolvedParams, durationMs: Date.now() - startMs, retriesUsed: attempt };
+-      } catch (err: any) {
+-        lastError = err as Error;
++      } catch (err: unknown) {
++        lastError = err instanceof Error ? err : new Error(String(err));
+         if (step.aiFallback && attempt === maxAttempts - 1) {
+           try {
+             const fallbackPrompt = (this.resolveValue(step.aiFallback.prompt, stepOutputs) as string) || step.aiFallback.prompt;
+             const fallbackOutput = await this.executeAiFallback(fallbackPrompt, step.aiFallback.model);
+             return { stepId: step.id, success: true, output: fallbackOutput, input: fallbackPrompt, durationMs: Date.now() - startMs, retriesUsed: maxAttempts, aiFallbackUsed: true };
+-          } catch {}
++          } catch {
++            // ignore
++          }
+         }
+       }
+     }
+@@ -640,7 +667,7 @@ export class WorkflowEngine extends EventEmitter {
+    */
+   private resolveValue(value: unknown, stepOutputs: Map<string, unknown>): unknown {
+     if (typeof value === 'string') {
+-      let resolvedStr = value;
++      const resolvedStr = value;
+       // 反解加密凭证表达式如 "$credential.my_api_key"
+       if (resolvedStr.includes('$credential.')) {
+         return WorkflowCredentialStore.getInstance().resolveCredentialExpression(resolvedStr);
+@@ -686,12 +713,12 @@ export class WorkflowEngine extends EventEmitter {
+ 
+   private evaluateCondition(condition: string, stepOutputs: Map<string, unknown>): boolean {
+     try {
+-      const resolved = condition.replace(/\$([a-zA-Z0-9_.\[\]]+)/g, (_, refPath) => {
++      const resolved = condition.replace(/\$([a-zA-Z0-9_.[\]]+)/g, (_, refPath) => {
+         const val = this.evaluateRefPath(refPath, stepOutputs);
+         return JSON.stringify(val ?? null);
+       });
+ 
+-      if (!/^[a-zA-Z0-9_\s.\+\-*\/%\=!\<>\&|"'`[\]{\}:\,(\)]+$/.test(resolved)) {
++      if (!/^[a-zA-Z0-9_\s.+\-*/%=!<>&|"'`[\]{}:,()]+$/.test(resolved)) {
+         return false;
+       }
+       return Boolean(Function(`"use strict"; return (${resolved})`)());
+@@ -713,7 +740,9 @@ export class WorkflowEngine extends EventEmitter {
+       const runsDir = path.resolve(process.cwd(), '.berrytrace', 'runs');
+       if (!fs.existsSync(runsDir)) fs.mkdirSync(runsDir, { recursive: true });
+       fs.writeFileSync(path.join(runsDir, `${result.runId}.json`), JSON.stringify(result, null, 2), 'utf-8');
+-    } catch {}
++    } catch {
++      // ignore
++    }
+   }
+ 
+   private writeOutputToWorkspace(targetPath: string, data: unknown): void {
+@@ -731,7 +760,9 @@ export class WorkflowEngine extends EventEmitter {
+ 
+       const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+       fs.writeFileSync(absolutePath, content, 'utf-8');
+-    } catch {}
++    } catch {
++      // ignore
++    }
+   }
+ 
+   private async executeAiFallback(prompt: string, model?: string): Promise<unknown> {
+@@ -751,20 +782,18 @@ export class WorkflowEngine extends EventEmitter {
+     if (!mainWindow || mainWindow.isDestroyed()) return true;
+ 
+     return new Promise<boolean>((resolve) => {
+-      let timer: NodeJS.Timeout;
+       mainWindow.webContents.send('workflow:human-approval-request', { stepId, message, timeoutMs });
+ 
+       const channel = `workflow:human-approval-response:${stepId}`;
+-      const { ipcMain } = require('electron');
+ 
+-      const handler = (_event: any, response: { approved: boolean }) => {
++      const handler = (_event: unknown, response: { approved: boolean }) => {
+         clearTimeout(timer);
+         ipcMain.removeListener(channel, handler);
+         resolve(Boolean(response?.approved));
+       };
+ 
+       ipcMain.once(channel, handler);
+-      timer = setTimeout(() => {
++      const timer = setTimeout(() => {
+         ipcMain.removeListener(channel, handler);
+         resolve(false);
+       }, timeoutMs);

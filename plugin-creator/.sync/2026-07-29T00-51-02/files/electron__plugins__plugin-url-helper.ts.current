@@ -1,0 +1,65 @@
+import { nativeTheme } from 'electron';
+import type { PluginManager } from './plugin-manager';
+import type { ScannedPlugin } from './plugin-scanner';
+import { cache } from '../config/index';
+import { CacheAttribute } from '../../src/config/CacheAttribute';
+import { ElectronFloatBall } from '../windows/float-ball';
+
+export function getPluginsByExtension(pm: PluginManager, ext: string): ScannedPlugin[] {
+  const extLower = ext.toLowerCase().replace(/^\./, '');
+  return pm.getPluginsList().filter(p => {
+    if (!pm.isPluginEnabled(p.manifest.id)) return false;
+    const assocs = p.manifest.fileAssociations || [];
+    return assocs.map(a => a.toLowerCase().replace(/^\./, '')).includes(extLower);
+  });
+}
+
+export async function getResolvedUrl(pm: PluginManager, pluginId: string, queryParams?: string): Promise<string> {
+  const plugin = pm.getPlugin(pluginId);
+  if (!plugin) return '';
+
+  const viewFile = plugin.manifest.view || 'index.html';
+  let viewUrl = plugin.status === 'APPROVED'
+    ? `berrytrace-plugin://system/plugins/${pluginId}/${viewFile}`
+    : `berrytrace-plugin://${pluginId}/${viewFile}`;
+
+  let hasTheme = false;
+  let finalQuery = queryParams || '';
+
+  if (queryParams) {
+    const parsed = new URLSearchParams(queryParams.startsWith('?') ? queryParams : '?' + queryParams);
+    if (parsed.has('theme')) {
+      hasTheme = true;
+    }
+    const serialized = parsed.toString();
+    finalQuery = serialized ? '?' + serialized : '';
+  }
+  if (!hasTheme) {
+    const themePref = (cache.get(CacheAttribute.prefTheme) as 'light' | 'dark' | 'system') || 'system';
+    const actualTheme = themePref === 'system'
+      ? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light')
+      : themePref;
+
+    const themeParam = `theme=${actualTheme}`;
+    if (finalQuery) {
+      const separator = finalQuery.includes('?') ? '&' : '?';
+      finalQuery += separator + themeParam;
+    } else {
+      finalQuery = '?' + themeParam;
+    }
+  }
+
+  if (finalQuery) {
+    viewUrl += finalQuery;
+  }
+
+  return viewUrl;
+}
+
+export async function openPluginWindow(pm: PluginManager, pluginId: string, queryParams?: string): Promise<boolean> {
+  await pm.ensurePluginLoaded(pluginId);
+  const viewUrl = await getResolvedUrl(pm, pluginId, queryParams);
+  if (!viewUrl) return false;
+  ElectronFloatBall.getInstance().openFloatWebWindow(viewUrl, false);
+  return true;
+}

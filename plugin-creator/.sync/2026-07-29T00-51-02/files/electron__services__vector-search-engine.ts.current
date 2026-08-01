@@ -1,0 +1,248 @@
+import type { DatabaseSync } from 'node:sqlite';
+import { LocalAIService } from './local-ai-service.js';
+
+export class VectorSearchEngine {
+  private static instances = new Map<string, VectorSearchEngine>();
+
+  private db: DatabaseSync;
+  private isInitialized = false;
+  private currentDimension = 0;
+
+  private constructor(db: DatabaseSync) {
+    this.db = db;
+  }
+
+  public static getEngine(db: DatabaseSync, dbPath: string): VectorSearchEngine {
+    if (!this.instances.has(dbPath)) {
+      this.instances.set(dbPath, new VectorSearchEngine(db));
+    }
+    return this.instances.get(dbPath)!;
+  }
+
+  /**
+   * Helper to ensure FtsVectorIndex_${dimension} exists and is bootstrapped.
+   */
+  private ensureVirtualTable(dimension: number): void {
+    const tableName = `FtsVectorIndex_${dimension}`;
+    
+    // Check if table exists in sqlite_master
+    const tableExists = this.db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
+    ).get(tableName);
+
+    if (!tableExists) {
+      console.log(`[VectorSearchEngine] Creating virtual table ${tableName}...`);
+      this.db.prepare(`
+        CREATE VIRTUAL TABLE ${tableName} USING vec0(
+          embedding float[${dimension}] distance_metric=cosine,
+          +entity_id TEXT,
+          +entity_type TEXT
+        )
+      `).run();
+
+      // Bootstrap from persistent FtsVectorIndex table
+      console.log(`[VectorSearchEngine] Bootstrapping ${tableName} from metadata index...`);
+      const rows = this.db.prepare(
+        'SELECT entity_id, entity_type, embedding FROM FtsVectorIndex WHERE dimension = ?'
+      ).all(dimension) as Array<{ entity_id: string; entity_type: string; embedding: Buffer }>;
+
+      if (rows.length > 0) {
+        this.db.prepare('BEGIN TRANSACTION').run();
+        try {
+          const insertStmt = this.db.prepare(
+            `INSERT INTO ${tableName} (embedding, entity_id, entity_type) VALUES (?, ?, ?)`
+          );
+          for (const row of rows) {
+            insertStmt.run(row.embedding, row.entity_id, row.entity_type);
+          }
+          this.db.prepare('COMMIT').run();
+          console.log(`[VectorSearchEngine] Successfully bootstrapped ${rows.length} vectors into ${tableName}.`);
+        } catch (err) {
+          this.db.prepare('ROLLBACK').run();
+          console.error(`[VectorSearchEngine] Failed to bootstrap virtual table ${tableName}:`, err);
+        }
+      }
+    }
+  }
+
+  /**
+   * Initializes the vector engine.
+   */
+  public async initialize(): Promise<void> {
+    try {
+      const dimension = this.getActiveDimension();
+      this.currentDimension = dimension;
+      console.log(`[VectorSearchEngine] Initializing sqlite-vec for dimension ${dimension}...`);
+      this.ensureVirtualTable(dimension);
+      this.isInitialized = true;
+    } catch (err) {
+      console.error('[VectorSearchEngine] Failed to initialize vector search engine:', err);
+    }
+  }
+
+  private getActiveDimension(): number {
+    try {
+      const localAI = LocalAIService.getInstance();
+      const model = localAI.getActiveEmbeddingModel();
+      return model.dimension || 768; // Default to 768 matching our default model
+    } catch (e) {
+      console.warn('[VectorSearchEngine] Failed to get dimension from LocalAIService, defaulting to 768:', e);
+      return 768;
+    }
+  }
+
+  private getExistingDimensions(): number[] {
+    try {
+      const rows = this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'FtsVectorIndex_%'"
+      ).all() as Array<{ name: string }>;
+      
+      const dims: number[] = [];
+      for (const row of rows) {
+        const parts = row.name.split('_');
+        const dim = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(dim)) {
+          dims.push(dim);
+        }
+      }
+      return dims;
+    } catch (err) {
+      console.error('[VectorSearchEngine] Failed to query existing dimensions:', err);
+      return [];
+    }
+  }
+
+  public getCacheSize(): number {
+    const dim = this.currentDimension || this.getActiveDimension();
+    try {
+      this.ensureVirtualTable(dim);
+      const row = this.db.prepare(`SELECT count(*) as count FROM FtsVectorIndex_${dim}`).get() as { count: number };
+      return row.count;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /**
+   * Insert or update a vector in the metadata DB and sqlite-vec virtual table.
+   */
+  public addOrUpdate(
+    entityId: string,
+    entityType: string,
+    vector: number[],
+    dimension: number,
+    modelId: string
+  ): void {
+    const floatArray = new Float32Array(vector);
+    const buffer = Buffer.from(floatArray.buffer, floatArray.byteOffset, floatArray.byteLength);
+    const modifiedAt = new Date().toISOString();
+
+    // 1. Update metadata table
+    try {
+      this.db.prepare(
+        `INSERT OR REPLACE INTO FtsVectorIndex (entity_id, entity_type, embedding, dimension, model_id, modified_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(entityId, entityType, buffer, dimension, modelId, modifiedAt);
+    } catch (err) {
+      console.error(`[VectorSearchEngine] Failed to write metadata to database:`, err);
+    }
+
+    // 2. Update virtual table
+    try {
+      this.ensureVirtualTable(dimension);
+      const tableName = `FtsVectorIndex_${dimension}`;
+
+      // Delete if existing
+      this.db.prepare(`DELETE FROM ${tableName} WHERE entity_id = ? AND entity_type = ?`).run(entityId, entityType);
+
+      // Insert new
+      this.db.prepare(
+        `INSERT INTO ${tableName} (embedding, entity_id, entity_type) VALUES (?, ?, ?)`
+      ).run(buffer, entityId, entityType);
+    } catch (err) {
+      console.error(`[VectorSearchEngine] Failed to write vector to virtual table FtsVectorIndex_${dimension}:`, err);
+    }
+  }
+
+  /**
+   * Delete vector from metadata DB and all existing virtual tables.
+   */
+  public delete(entityId: string, entityType: string): void {
+    try {
+      this.db.prepare('DELETE FROM FtsVectorIndex WHERE entity_id = ? AND entity_type = ?').run(entityId, entityType);
+    } catch (err) {
+      console.error(`[VectorSearchEngine] Failed to delete metadata for ${entityId} from database:`, err);
+    }
+
+    const dims = this.getExistingDimensions();
+    for (const dim of dims) {
+      try {
+        this.db.prepare(`DELETE FROM FtsVectorIndex_${dim} WHERE entity_id = ? AND entity_type = ?`).run(entityId, entityType);
+      } catch (err) {
+        console.error(`[VectorSearchEngine] Failed to delete vector from FtsVectorIndex_${dim}:`, err);
+      }
+    }
+  }
+
+  /**
+   * Clear all vectors from metadata DB and all virtual tables.
+   */
+  public clear(): void {
+    try {
+      this.db.prepare('DELETE FROM FtsVectorIndex').run();
+      console.log('[VectorSearchEngine] Cleared metadata vector table.');
+    } catch (err) {
+      console.error('[VectorSearchEngine] Failed to clear metadata from database:', err);
+    }
+
+    const dims = this.getExistingDimensions();
+    for (const dim of dims) {
+      try {
+        this.db.prepare(`DELETE FROM FtsVectorIndex_${dim}`).run();
+        console.log(`[VectorSearchEngine] Cleared virtual table FtsVectorIndex_${dim}.`);
+      } catch (err) {
+        console.error(`[VectorSearchEngine] Failed to clear virtual table FtsVectorIndex_${dim}:`, err);
+      }
+    }
+  }
+
+  /**
+   * Performs KNN search using sqlite-vec MATCH query on FtsVectorIndex_${dimension}
+   */
+  public search(queryVector: number[], topK: number = 25): Array<{ entityId: string; entityType: string; score: number }> {
+    const dimension = queryVector.length;
+    if (dimension <= 0) return [];
+
+    // Dynamically align current table if dimension changes or is uninitialized
+    if (!this.isInitialized || dimension !== this.currentDimension) {
+      console.log(`[VectorSearchEngine] Dynamically switching search dimension from ${this.currentDimension} to ${dimension}...`);
+      this.ensureVirtualTable(dimension);
+      this.currentDimension = dimension;
+      this.isInitialized = true;
+    }
+
+    const qv = new Float32Array(queryVector);
+    const buffer = Buffer.from(qv.buffer, qv.byteOffset, qv.byteLength);
+    const tableName = `FtsVectorIndex_${this.currentDimension}`;
+
+    try {
+      // KNN query using MATCH
+      // Distance is cosine distance (1 - cosine_similarity)
+      const rows = this.db.prepare(`
+        SELECT entity_id, entity_type, distance
+        FROM ${tableName}
+        WHERE embedding MATCH ? AND k = ?
+      `).all(buffer, topK) as Array<{ entity_id: string; entity_type: string; distance: number }>;
+
+      return rows.map(row => ({
+        entityId: row.entity_id,
+        entityType: row.entity_type,
+        // Convert cosine distance (0 to 2) back to cosine similarity (1.0 to -1.0)
+        score: 1.0 - row.distance
+      }));
+    } catch (err) {
+      console.error(`[VectorSearchEngine] Failed to perform KNN search on ${tableName}:`, err);
+      return [];
+    }
+  }
+}

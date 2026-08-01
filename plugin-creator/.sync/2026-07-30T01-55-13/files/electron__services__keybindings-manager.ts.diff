@@ -1,0 +1,283 @@
+diff --git a/electron/services/keybindings-manager.ts b/electron/services/keybindings-manager.ts
+new file mode 100644
+index 0000000..df5e51c
+--- /dev/null
++++ b/electron/services/keybindings-manager.ts
+@@ -0,0 +1,277 @@
++import { app } from 'electron'
++import { join } from 'path'
++import { existsSync, readFileSync, writeFileSync } from 'fs'
++import { ShortcutActivationDispatcher } from './shortcut-activation-dispatcher'
++
++export interface KeybindingRule {
++  command: string
++  title: string
++  key?: string
++  mac?: string
++  win?: string
++  gesture?: string
++  when?: string
++  scope?: 'global' | 'in-app' | 'editor'
++  source?: 'system' | 'plugin' | 'user'
++  pluginId?: string
++  hasConflict?: boolean
++  conflictsWith?: Array<{ command: string; title: string; key?: string; gesture?: string }>
++}
++
++export const SYSTEM_DEFAULT_KEYBINDINGS: KeybindingRule[] = [
++  {
++    command: 'system:show-main-window',
++    title: '显示/隐藏主窗口',
++    key: process.platform === 'darwin' ? 'Ctrl+Cmd+O' : 'Ctrl+Alt+O',
++    scope: 'global',
++    source: 'system',
++  },
++  {
++    command: 'system:trigger-screenshot',
++    title: '全局划屏截图',
++    key: process.platform === 'darwin' ? 'Ctrl+Cmd+Shift+A' : 'Ctrl+Alt+Shift+A',
++    scope: 'global',
++    source: 'system',
++  },
++  {
++    command: 'system:toggle-quick-panel',
++    title: '唤醒快捷搜索面板',
++    key: 'Alt+Space',
++    gesture: 'double_tap:cmd',
++    scope: 'global',
++    source: 'system',
++  },
++  {
++    command: 'system:lock-app',
++    title: '锁定应用界面',
++    key: process.platform === 'darwin' ? 'Ctrl+Cmd+L' : 'Ctrl+Alt+L',
++    scope: 'global',
++    source: 'system',
++  },
++  {
++    command: 'system:toggle-zen',
++    title: '切换禅模式写作',
++    key: 'F10',
++    scope: 'in-app',
++    source: 'system',
++  },
++  {
++    command: 'system:toggle-pin',
++    title: '切换窗口置顶',
++    key: 'Ctrl+`',
++    scope: 'in-app',
++    source: 'system',
++  },
++  // {
++  //   command: 'system:editor-bold',
++  //   title: '文字加粗 (Markdown)',
++  //   key: process.platform === 'darwin' ? 'Cmd+B' : 'Ctrl+B',
++  //   scope: 'editor',
++  //   when: 'editorTextFocus',
++  //   source: 'system',
++  // },
++]
++
++/**
++ * KeybindingsManager — 宿主 VSCode 风格全局快捷键与手势绑定管理器
++ *
++ * 管理全局快捷键与硬件手势。
++ * 实现最高优先级 SSOT 逻辑：user_keybindings.json 覆盖 plugin.json 的默认配置。
++ */
++export class KeybindingsManager {
++  private static instance: KeybindingsManager | null = null
++  private defaultKeybindings = new Map<string, KeybindingRule>()
++  private userOverrides = new Map<string, Partial<KeybindingRule>>()
++  private disabledCommands = new Set<string>()
++  private registeredGestureKeys: string[] = []
++
++  private constructor() {
++    for (const rule of SYSTEM_DEFAULT_KEYBINDINGS) {
++      this.defaultKeybindings.set(rule.command, rule)
++    }
++    this.loadUserOverrides()
++  }
++
++  public static getInstance(): KeybindingsManager {
++    if (!KeybindingsManager.instance) {
++      KeybindingsManager.instance = new KeybindingsManager()
++    }
++    return KeybindingsManager.instance
++  }
++
++  private getUserKeybindingsPath(): string {
++    const userData = app.getPath('userData')
++    return join(userData, 'user_keybindings.json')
++  }
++
++  /**
++   * 从 ~/.berrytrace/user_keybindings.json 读取用户自定义覆盖配置
++   */
++  public loadUserOverrides(): void {
++    const filePath = this.getUserKeybindingsPath()
++    try {
++      if (existsSync(filePath)) {
++        const content = readFileSync(filePath, 'utf-8')
++        const rules = JSON.parse(content) as Array<{ command: string; key?: string; gesture?: string }>
++        this.userOverrides.clear()
++        this.disabledCommands.clear()
++        for (const r of rules) {
++          if (!r.command) continue
++          // VSCode 约定：以 '-' 前缀的 command 表示禁用该默认绑定
++          if (r.command.startsWith('-')) {
++            this.disabledCommands.add(r.command.slice(1))
++            continue
++          }
++          this.userOverrides.set(r.command, r)
++        }
++        console.log(`[KeybindingsManager] Loaded ${this.userOverrides.size} user custom keybinding overrides`)
++      }
++    } catch (err) {
++      console.error('[KeybindingsManager] Failed to load user keybindings file:', err)
++    }
++  }
++
++  /**
++   * 保存用户自定义快捷键覆盖到 user_keybindings.json
++   */
++  public saveUserOverride(command: string, custom: { key?: string; gesture?: string }): void {
++    this.userOverrides.set(command, { command, ...custom })
++    const rules = Array.from(this.userOverrides.values())
++    try {
++      writeFileSync(this.getUserKeybindingsPath(), JSON.stringify(rules, null, 2), 'utf-8')
++      console.log(`[KeybindingsManager] Saved user keybinding override for command: "${command}"`)
++      this.reapplyBindings()
++    } catch (err) {
++      console.error('[KeybindingsManager] Failed to save user keybindings file:', err)
++    }
++  }
++
++  /**
++   * 重置用户快捷键覆盖
++   */
++  public resetUserOverride(command: string): void {
++    this.userOverrides.delete(command)
++    const rules = Array.from(this.userOverrides.values())
++    try {
++      writeFileSync(this.getUserKeybindingsPath(), JSON.stringify(rules, null, 2), 'utf-8')
++      console.log(`[KeybindingsManager] Reset user keybinding override for command: "${command}"`)
++      this.reapplyBindings()
++    } catch (err) {
++      console.error('[KeybindingsManager] Failed to reset user keybindings file:', err)
++    }
++  }
++
++  /**
++   * 注册插件声明的默认 Keybindings（来自 plugin.json contributes.keybindings）
++   */
++  public registerDefaultKeybindings(pluginId: string, rules: KeybindingRule[]): void {
++    for (const r of rules) {
++      const scope = r.scope || (r.when === 'global' ? 'global' : r.gesture ? 'global' : (r.when && r.when !== 'in-app' ? 'editor' : 'in-app'))
++      const fullRule = { ...r, scope, pluginId, source: 'plugin' as const }
++      this.defaultKeybindings.set(r.command, fullRule)
++    }
++    this.reapplyBindings()
++  }
++
++  /**
++   * 计算有效 Keybindings（User Override > Default），包含热键/手势冲突检测与元数据计算
++   */
++  public getEffectiveKeybindings(): KeybindingRule[] {
++    const effective: KeybindingRule[] = []
++    for (const [cmd, defRule] of this.defaultKeybindings.entries()) {
++      if (this.disabledCommands.has(cmd)) {
++        // 该命令已被用户在 user_keybindings.json 中显式禁用，从有效绑定中剔除
++        continue
++      }
++      const override = this.userOverrides.get(cmd)
++      if (override) {
++        effective.push({
++          ...defRule,
++          key: override.key !== undefined ? override.key : defRule.key,
++          gesture: override.gesture !== undefined ? override.gesture : defRule.gesture,
++          source: 'user',
++        })
++      } else {
++        effective.push({ ...defRule })
++      }
++    }
++
++    // 冲突检测计算引擎 (Conflict Detection Engine)
++    const keyMap = new Map<string, KeybindingRule[]>()
++    const gestureMap = new Map<string, KeybindingRule[]>()
++
++    for (const rule of effective) {
++      if (rule.key && rule.key.trim()) {
++        const k = rule.key.trim().toLowerCase()
++        if (!keyMap.has(k)) keyMap.set(k, [])
++        keyMap.get(k)!.push(rule)
++      }
++      if (rule.gesture && rule.gesture.trim()) {
++        const g = rule.gesture.trim().toLowerCase()
++        if (!gestureMap.has(g)) gestureMap.set(g, [])
++        gestureMap.get(g)!.push(rule)
++      }
++    }
++
++    for (const rule of effective) {
++      const conflicts: Array<{ command: string; title: string; key?: string; gesture?: string }> = []
++      if (rule.key && rule.key.trim()) {
++        const k = rule.key.trim().toLowerCase()
++        const keyCollisions = keyMap.get(k) || []
++        for (const other of keyCollisions) {
++          if (other.command !== rule.command) {
++            conflicts.push({ command: other.command, title: other.title, key: other.key })
++          }
++        }
++      }
++      if (rule.gesture && rule.gesture.trim()) {
++        const g = rule.gesture.trim().toLowerCase()
++        const gestureCollisions = gestureMap.get(g) || []
++        for (const other of gestureCollisions) {
++          if (other.command !== rule.command) {
++            conflicts.push({ command: other.command, title: other.title, gesture: other.gesture })
++          }
++        }
++      }
++
++      if (conflicts.length > 0) {
++        rule.hasConflict = true
++        rule.conflictsWith = conflicts
++      } else {
++        rule.hasConflict = false
++        rule.conflictsWith = []
++      }
++    }
++
++    return effective
++  }
++
++  /**
++   * 重新生效应用所有有效绑定
++   */
++  public reapplyBindings(): void {
++    const dispatcher = ShortcutActivationDispatcher.getInstance()
++    // 先清除上一轮由本管理器注册的绑定，避免用户改绑后旧手势残留（stale binding）
++    if (this.registeredGestureKeys.length > 0) {
++      for (const key of this.registeredGestureKeys) {
++        dispatcher.unregisterBinding(key)
++      }
++      this.registeredGestureKeys = []
++    }
++    // 同步禁用命令集合，使调度器也能在处理手势时拦截被禁用的命令
++    dispatcher.setDisabledCommands(new Set(this.disabledCommands))
++
++    const effective = this.getEffectiveKeybindings()
++    for (const rule of effective) {
++      if (rule.gesture && rule.pluginId) {
++        dispatcher.registerBinding(rule.gesture, rule.pluginId, rule.command)
++        this.registeredGestureKeys.push(rule.gesture)
++      }
++      if (rule.key && rule.pluginId) {
++        dispatcher.registerBinding(rule.key, rule.pluginId, rule.command)
++        this.registeredGestureKeys.push(rule.key)
++      }
++    }
++    console.log(`[KeybindingsManager] Reapplied ${effective.length} keybinding rules to dispatcher`)
++  }
++}

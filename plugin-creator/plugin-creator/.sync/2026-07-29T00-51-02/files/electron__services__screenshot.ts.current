@@ -1,0 +1,937 @@
+import type { Display} from 'electron';
+import { app, BrowserWindow, systemPreferences, desktopCapturer, screen, ipcMain } from 'electron'
+import { join, dirname } from 'path'
+import { promises as fsPromises } from 'fs'
+import { execFile } from 'child_process'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+
+export interface ScreenshotDependencies {
+  getPublishWindow: () => BrowserWindow | null
+  getPublishController: () => { isCollapsed(): boolean; requestExpand(): void } | null
+  getMainWindow: () => BrowserWindow | null
+  bringWindowToFront: (win: BrowserWindow) => void
+  getLastActiveWindow: () => 'main' | 'publish'
+}
+
+export interface WindowInfo {
+  id: string
+  name: string
+  thumbnail: string
+  bounds: { x: number; y: number; width: number; height: number }
+}
+
+export interface SelectionRegion {
+  x: number
+  y: number
+  width: number
+  height: number
+  scaleFactor: number
+  displayId: number
+}
+
+export interface AnnotationTool {
+  type: 'arrow' | 'rectangle' | 'circle' | 'line' | 'text'
+  color: string
+  strokeWidth: number
+}
+
+export type SelectionMode = 'window' | 'region' | 'adjusting'
+export type AnnotationMode = 'none' | 'drawing' | 'selected'
+
+export class ElectronScreenshot {
+  private static instance: ElectronScreenshot
+  private deps: ScreenshotDependencies | null = null
+  private overlayWindows: Map<string, BrowserWindow> = new Map()
+  private controlWindow: BrowserWindow | null = null
+
+  private windowsInfo: WindowInfo[] = []
+  private hoveredWindowId: string | null = null
+  private currentSelection: SelectionRegion | null = null
+  private selectionMode: SelectionMode = 'window'
+  private annotationMode: AnnotationMode = 'none'
+  private annotationTools: AnnotationTool[] = []
+
+  private onCaptureStart: (() => void) | null = null
+  private onCaptureEnd: ((filePath: string) => void) | null = null
+  private onCaptureCancel: (() => void) | null = null
+  private onAnnotationAdd?: ((tool: AnnotationTool, position: { x: number; y: number; width?: number; height?: number }) => void) | null = null
+
+  private constructor() {}
+
+  public static getInstance(): ElectronScreenshot {
+    if (!ElectronScreenshot.instance) {
+      ElectronScreenshot.instance = new ElectronScreenshot()
+    }
+    return ElectronScreenshot.instance
+  }
+
+  public setDependencies(deps: ScreenshotDependencies): void {
+    this.deps = deps
+  }
+
+  public setOnCaptureStart(callback: () => void): void {
+    this.onCaptureStart = callback
+  }
+
+  public setOnCaptureEnd(callback: (filePath: string) => void): void {
+    this.onCaptureEnd = callback
+  }
+
+  public setOnCaptureCancel(callback: () => void): void {
+    this.onCaptureCancel = callback
+  }
+
+  public setOnAnnotationAdd(callback: ((tool: AnnotationTool, position: { x: number; y: number; width?: number; height?: number }) => void) | null): void {
+    this.onAnnotationAdd = callback
+  }
+
+  public triggerScreenshot(): void {
+    if (process.platform !== 'darwin') {
+      console.warn('[Screenshot] 截屏功能目前仅支持 macOS')
+      return
+    }
+
+    this.onCaptureStart?.()
+
+    let status = 'unknown'
+    try {
+      status = systemPreferences.getMediaAccessStatus('screen')
+      console.log('[Screenshot] 当前屏幕录制权限状态:', status)
+    } catch (err) {
+      console.error('[Screenshot] 获取权限状态失败:', err)
+    }
+
+    const proceedWithScreenshot = () => {
+      this.selectionMode = 'window'
+      this.showFullScreenOverlay()
+    }
+
+    if (status === 'not determined' || status === 'denied') {
+      console.log('[Screenshot] 权限状态为', status, '，使用 desktopCapturer 触发权限请求...')
+      desktopCapturer.getSources({ types: ['screen'] }).then((sources) => {
+        console.log('[Screenshot] desktopCapturer 调用成功，获取到', sources.length, '个源')
+        let newStatus = 'unknown'
+        try {
+          newStatus = systemPreferences.getMediaAccessStatus('screen')
+          console.log('[Screenshot] 权限请求后的状态:', newStatus)
+        } catch {
+          // ignore
+        }
+
+        if (newStatus === 'granted') {
+          proceedWithScreenshot()
+        } else {
+          this.notifyPermissionDenied()
+        }
+      }).catch((err: unknown) => {
+        console.error('[Screenshot] desktopCapturer 请求失败:', err)
+        this.notifyPermissionDenied()
+      })
+      return
+    }
+
+    console.log('[Screenshot] 权限已授予或状态未知，直接执行截图')
+    proceedWithScreenshot()
+  }
+
+  public handleRegionCapture(regionData: { x: number; y: number; width: number; height: number; scaleFactor: number; displayId?: number }): void {
+    this.currentSelection = regionData as SelectionRegion
+    this.selectionMode = 'adjusting'
+    this.updateControlWindow(true)
+  }
+
+  public handleSelectionAdjust(regionData: { x: number; y: number; width?: number; height?: number; scaleFactor?: number; displayId?: number }): void {
+    if (this.currentSelection) {
+      this.currentSelection.x = regionData.x
+      this.currentSelection.y = regionData.y
+      if (regionData.width !== undefined) this.currentSelection.width = regionData.width
+      if (regionData.height !== undefined) this.currentSelection.height = regionData.height
+      this.broadcastSelectionUpdate(this.currentSelection)
+    }
+  }
+
+  public handleScreenshotConfirm(): void {
+    if (this.currentSelection) {
+      this.captureRegion(this.currentSelection)
+    } else {
+      this.cancelScreenshot()
+    }
+  }
+
+  public handleScreenshotCancel(): void {
+    this.cancelScreenshot()
+  }
+
+  public handleAnnotationAdd(tool: AnnotationTool, position: { x: number; y: number; width?: number; height?: number }): void {
+    this.onAnnotationAdd?.(tool, position)
+  }
+
+  private cancelScreenshot(): void {
+    this.closeAllOverlays()
+    this.currentSelection = null
+    this.hoveredWindowId = null
+    this.selectionMode = 'window'
+    this.annotationMode = 'none'
+    this.onCaptureCancel?.()
+  }
+
+  private showFullScreenOverlay(): void {
+    this.closeAllOverlays()
+    this.windowsInfo = []
+
+    desktopCapturer.getSources({ types: ['window'], thumbnailSize: { width: 150, height: 100 } }).then((sources) => {
+      this.windowsInfo = sources
+        .filter((source) => source.name && !source.name.includes('Notification'))
+        .map((source) => ({
+          id: source.id,
+          name: source.name,
+          thumbnail: source.thumbnail.toDataURL(),
+          bounds: (source as unknown as { bounds: { x: number; y: number; width: number; height: number } }).bounds,
+        }))
+      console.log('[Screenshot] 检测到', this.windowsInfo.length, '个窗口')
+      this.broadcastWindowsInfo()
+    }).catch((err) => {
+      console.error('[Screenshot] 获取窗口列表失败:', err)
+    })
+
+    const displays = screen.getAllDisplays()
+    console.log('[Screenshot] 检测到', displays.length, '个显示器')
+
+    for (const display of displays) {
+      this.createOverlayForDisplay(display)
+    }
+  }
+
+  private createOverlayForDisplay(display: Display): void {
+    const { x, y, width, height } = display.bounds
+    const scaleFactor = display.scaleFactor
+    const displayId = display.id
+
+    const overlayWindow = new BrowserWindow({
+      width: Math.round(width * scaleFactor),
+      height: Math.round(height * scaleFactor),
+      x: Math.round(x * scaleFactor),
+      y: Math.round(y * scaleFactor),
+      frame: false,
+      transparent: true,
+      hasShadow: false,
+      backgroundColor: '#00000000',
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      movable: false,
+      focusable: true,
+      webPreferences: {
+        preload: join(__dirname, 'preload.cjs'),
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: false,
+      },
+    })
+
+    overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+    overlayWindow.setAlwaysOnTop(true, 'screen-saver', 1)
+
+    const overlayHtml = this.generateOverlayHtml(width, height, scaleFactor, displayId)
+    overlayWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(overlayHtml)}`)
+
+    overlayWindow.once('ready-to-show', () => {
+      overlayWindow.show()
+      overlayWindow.focus()
+    })
+
+    this.setupOverlayListeners(overlayWindow)
+    this.overlayWindows.set(`display-${displayId}`, overlayWindow)
+  }
+
+  private generateOverlayHtml(width: number, height: number, scaleFactor: number, displayId: number): string {
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: ${width}px;
+      height: ${height}px;
+      overflow: hidden;
+      cursor: crosshair;
+      background: transparent;
+      position: relative;
+    }
+    #mask {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.3);
+    }
+    #selection {
+      position: fixed;
+      border: 2px solid #007AFF;
+      background: rgba(0, 122, 255, 0.08);
+      display: none;
+      z-index: 10;
+    }
+    #selection.adjusting {
+      border-color: #007AFF;
+      cursor: move;
+    }
+    #dimensions {
+      position: fixed;
+      background: rgba(0, 0, 0, 0.8);
+      color: white;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      pointer-events: none;
+      display: none;
+      z-index: 20;
+      white-space: nowrap;
+    }
+    #hint {
+      position: fixed;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.75);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      text-align: center;
+      z-index: 20;
+      user-select: none;
+    }
+    #hint kbd {
+      background: rgba(255,255,255,0.2);
+      padding: 3px 8px;
+      border-radius: 5px;
+      margin: 0 5px;
+      font-family: inherit;
+    }
+    .resize-handle {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      background: #007AFF;
+      border: 2px solid white;
+      border-radius: 50%;
+      z-index: 15;
+    }
+    .resize-handle.nw { top: -6px; left: -6px; cursor: nw-resize; }
+    .resize-handle.ne { top: -6px; right: -6px; cursor: ne-resize; }
+    .resize-handle.sw { bottom: -6px; left: -6px; cursor: sw-resize; }
+    .resize-handle.se { bottom: -6px; right: -6px; cursor: se-resize; }
+    .resize-handle.n { top: -6px; left: 50%; transform: translateX(-50%); cursor: n-resize; }
+    .resize-handle.s { bottom: -6px; left: 50%; transform: translateX(-50%); cursor: s-resize; }
+    .resize-handle.w { top: 50%; left: -6px; transform: translateY(-50%); cursor: w-resize; }
+    .resize-handle.e { top: 50%; right: -6px; transform: translateY(-50%); cursor: e-resize; }
+  </style>
+</head>
+<body>
+  <div id="mask"></div>
+  <div id="selection"></div>
+  <div id="dimensions"></div>
+  <div id="hint">移动鼠标选择窗口 | 拖动选择区域 | 按 <kbd>ESC</kbd> 取消</div>
+  <script>
+    const selection = document.getElementById('selection')
+    const dimensions = document.getElementById('dimensions')
+    const hint = document.getElementById('hint')
+    const mask = document.getElementById('mask')
+
+    let isSelecting = false
+    let isDragging = false
+    let isResizing = false
+    let resizeHandle = null
+    let startX = 0, startY = 0
+    let selectionStartX = 0, selectionStartY = 0
+    let mode = 'window'
+    let windowsInfo = []
+    let hoveredWindow = null
+    let selectionData = null
+    let isMouseDown = false
+    let mouseDownTimer = null
+
+    window.setWindowsInfo = function(info) {
+      windowsInfo = info
+    }
+
+    window.setMode = function(newMode) {
+      mode = newMode
+      if (mode === 'adjusting' && selectionData) {
+        updateSelectionUI(selectionData.x, selectionData.y, selectionData.width, selectionData.height)
+        selection.classList.add('adjusting')
+        hint.innerHTML = '拖动移动选区 | 拖动边缘调整大小 | <kbd>ESC</kbd> 取消 | <kbd>Enter</kbd> 确认'
+        addResizeHandles()
+      }
+    }
+
+    window.updateSelectionData = function(data) {
+      selectionData = data
+      if (mode === 'adjusting') {
+        updateSelectionUI(data.x, data.y, data.width, data.height)
+      }
+    }
+
+    function addResizeHandles() {
+      const handles = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se']
+      handles.forEach(dir => {
+        const handle = document.createElement('div')
+        handle.className = 'resize-handle ' + dir
+        handle.dataset.handle = dir
+        selection.appendChild(handle)
+      })
+    }
+
+    function removeResizeHandles() {
+      selection.querySelectorAll('.resize-handle').forEach(h => h.remove())
+    }
+
+    function updateSelectionUI(x, y, w, h) {
+      selection.style.display = 'block'
+      selection.style.left = x + 'px'
+      selection.style.top = y + 'px'
+      selection.style.width = w + 'px'
+      selection.style.height = h + 'px'
+      dimensions.style.display = 'block'
+      dimensions.style.left = Math.min(x + w + 15, window.innerWidth - 120) + 'px'
+      dimensions.style.top = (y + h / 2) + 'px'
+      dimensions.textContent = Math.round(w) + ' × ' + Math.round(h)
+    }
+
+    function findWindowAtPoint(x, y) {
+      for (const win of windowsInfo) {
+        const b = win.bounds
+        if (x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height) {
+          return win
+        }
+      }
+      return null
+    }
+
+    function showWindowSelection(win) {
+      if (win) {
+        hoveredWindow = win
+        const scale = ${scaleFactor}
+        const x = win.bounds.x * scale
+        const y = win.bounds.y * scale
+        const w = win.bounds.width * scale
+        const h = win.bounds.height * scale
+        updateSelectionUI(x, y, w, h)
+        selection.classList.remove('adjusting')
+        document.body.style.cursor = 'pointer'
+      } else {
+        hoveredWindow = null
+        selection.style.display = 'none'
+        dimensions.style.display = 'none'
+        document.body.style.cursor = 'crosshair'
+      }
+    }
+
+    document.addEventListener('mousedown', (e) => {
+      isMouseDown = true
+      startX = e.clientX
+      startY = e.clientY
+
+      if (mode === 'adjusting') {
+        const handle = e.target.classList.contains('resize-handle') ? e.target.dataset.handle : null
+        if (handle) {
+          isResizing = true
+          resizeHandle = handle
+          selectionStartX = parseInt(selection.style.left)
+          selectionStartY = parseInt(selection.style.top)
+          const selWidth = parseInt(selection.style.width)
+          const selHeight = parseInt(selection.style.height)
+          window.resizingData = { handle, selWidth, selHeight }
+          return
+        }
+
+        const selX = parseInt(selection.style.left)
+        const selY = parseInt(selection.style.top)
+        const selWidth = parseInt(selection.style.width)
+        const selHeight = parseInt(selection.style.height)
+
+        if (e.clientX >= selX && e.clientX <= selX + selWidth &&
+            e.clientY >= selY && e.clientY <= selY + selHeight) {
+          isDragging = true
+          selectionStartX = selX
+          selectionStartY = selY
+        }
+        return
+      }
+
+      mouseDownTimer = setTimeout(() => {
+        if (isMouseDown) {
+          isSelecting = true
+          selection.style.display = 'block'
+          selection.style.left = startX + 'px'
+          selection.style.top = startY + 'px'
+          selection.style.width = '0'
+          selection.style.height = '0'
+          hint.style.display = 'none'
+          hoveredWindow = null
+        }
+      }, 200)
+    })
+
+    document.addEventListener('mousemove', (e) => {
+      if (mode === 'adjusting') {
+        if (isDragging) {
+          const deltaX = e.clientX - startX
+          const deltaY = e.clientY - startY
+          const newX = selectionStartX + deltaX
+          const newY = selectionStartY + deltaY
+          updateSelectionUI(newX, newY, parseInt(selection.style.width), parseInt(selection.style.height))
+          window.electronAPI.screenshotAction('adjust-selection', { type: 'selection-drag', x: newX, y: newY })
+        } else if (isResizing) {
+          const deltaX = e.clientX - startX
+          const deltaY = e.clientY - startY
+          const handle = window.resizingData.handle
+          let newX = selectionStartX
+          let newY = selectionStartY
+          let newW = window.resizingData.selWidth
+          let newH = window.resizingData.selHeight
+
+          if (handle.includes('w')) { newX = selectionStartX + deltaX; newW = window.resizingData.selWidth - deltaX }
+          if (handle.includes('e')) { newW = window.resizingData.selWidth + deltaX }
+          if (handle.includes('n')) { newY = selectionStartY + deltaY; newH = window.resizingData.selHeight - deltaY }
+          if (handle.includes('s')) { newH = window.resizingData.selHeight + deltaY }
+
+          if (newW > 20 && newH > 20) {
+            updateSelectionUI(newX, newY, newW, newH)
+            window.electronAPI.screenshotAction('adjust-selection', { type: 'selection-resize', x: newX, y: newY, width: newW, height: newH })
+          }
+        }
+        return
+      }
+
+      if (isMouseDown && !isSelecting) {
+        const deltaX = Math.abs(e.clientX - startX)
+        const deltaY = Math.abs(e.clientY - startY)
+        if (deltaX > 5 || deltaY > 5) {
+          clearTimeout(mouseDownTimer)
+          isSelecting = true
+          selection.style.display = 'block'
+          selection.style.left = startX + 'px'
+          selection.style.top = startY + 'px'
+          selection.style.width = '0'
+          selection.style.height = '0'
+          hint.style.display = 'none'
+          hoveredWindow = null
+        }
+      }
+
+      if (!isSelecting && !isMouseDown) {
+        const win = findWindowAtPoint(e.screenX, e.screenY)
+        showWindowSelection(win)
+        return
+      }
+
+      if (!isSelecting) return
+
+      const currentX = e.clientX
+      const currentY = e.clientY
+
+      const left = Math.min(startX, currentX)
+      const top = Math.min(startY, currentY)
+      const selWidth = Math.abs(currentX - startX)
+      const selHeight = Math.abs(currentY - startY)
+
+      selection.style.left = left + 'px'
+      selection.style.top = top + 'px'
+      selection.style.width = selWidth + 'px'
+      selection.style.height = selHeight + 'px'
+
+      dimensions.style.display = 'block'
+      dimensions.style.left = Math.min(left + selWidth + 15, window.innerWidth - 120) + 'px'
+      dimensions.style.top = (top + selHeight / 2) + 'px'
+      dimensions.textContent = Math.round(selWidth) + ' × ' + Math.round(selHeight)
+    })
+
+    document.addEventListener('mouseup', () => {
+      isMouseDown = false
+
+      if (mode === 'adjusting') {
+        isDragging = false
+        isResizing = false
+        resizeHandle = null
+        return
+      }
+
+      if (mouseDownTimer) {
+        clearTimeout(mouseDownTimer)
+        mouseDownTimer = null
+      }
+
+      if (isSelecting) {
+        isSelecting = false
+
+        const left = parseInt(selection.style.left)
+        const top = parseInt(selection.style.top)
+        const width = parseInt(selection.style.width)
+        const height = parseInt(selection.style.height)
+
+        if (width > 10 && height > 10) {
+          const data = { x: left, y: top, width, height, scaleFactor: ${scaleFactor}, displayId: ${displayId} }
+          window.electronAPI.screenshotAction('region-selected', data)
+        } else {
+          selection.style.display = 'none'
+          dimensions.style.display = 'none'
+          hint.style.display = 'block'
+        }
+      } else {
+        if (hoveredWindow) {
+          const scale = ${scaleFactor}
+          const data = {
+            x: hoveredWindow.bounds.x * scale,
+            y: hoveredWindow.bounds.y * scale,
+            width: hoveredWindow.bounds.width * scale,
+            height: hoveredWindow.bounds.height * scale,
+            scaleFactor: ${scaleFactor},
+            displayId: ${displayId}
+          }
+          window.electronAPI.screenshotAction('region-selected', data)
+        }
+      }
+    })
+
+    document.addEventListener('dblclick', (e) => {
+      if (mode === 'adjusting') {
+        window.electronAPI.screenshotAction('confirm')
+      }
+    })
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        window.electronAPI.screenshotAction('cancel')
+      } else if (e.key === 'Enter' && mode === 'adjusting') {
+        window.electronAPI.screenshotAction('confirm')
+      }
+    })
+
+    window.addEventListener('message', (e) => {
+      const { type, data } = e.data
+      if (type === 'region-selected') {
+        window.electronAPI.screenshotAction('region-selected', data)
+      } else if (type === 'cancel') {
+        window.electronAPI.screenshotAction('cancel')
+      } else if (type === 'confirm') {
+        window.electronAPI.screenshotAction('confirm')
+      } else if (type === 'selection-drag' || type === 'selection-resize') {
+        window.electronAPI.screenshotAction('adjust-selection', e.data)
+      }
+    })
+  </script>
+</body>
+</html>`
+  }
+
+  private setupOverlayListeners(overlayWindow: BrowserWindow): void {
+    overlayWindow.webContents.on('did-finish-load', () => {
+      overlayWindow.webContents.executeJavaScript(`window.setWindowsInfo(${JSON.stringify(this.windowsInfo)})`)
+    })
+  }
+
+  private broadcastWindowsInfo(): void {
+    for (const [, overlayWindow] of this.overlayWindows) {
+      if (!overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.executeJavaScript(`window.setWindowsInfo(${JSON.stringify(this.windowsInfo)})`)
+      }
+    }
+  }
+
+  private broadcastSelectionUpdate(selection: SelectionRegion): void {
+    for (const [, overlayWindow] of this.overlayWindows) {
+      if (!overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.executeJavaScript(`window.updateSelectionData(${JSON.stringify(selection)})`)
+      }
+    }
+  }
+
+  private createControlWindow(): void {
+    if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+      this.controlWindow.close()
+    }
+
+    const primaryDisplay = screen.getPrimaryDisplay()
+    const { width: screenWidth, height: screenHeight } = primaryDisplay.workAreaSize
+
+    const windowWidth = 320
+    const windowHeight = 80
+
+    this.controlWindow = new BrowserWindow({
+      width: windowWidth,
+      height: windowHeight,
+      x: Math.round((screenWidth - windowWidth) / 2),
+      y: Math.round(screenHeight - windowHeight - 50),
+      frame: false,
+      transparent: true,
+      hasShadow: false,
+      backgroundColor: '#00000000',
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      focusable: true,
+      webPreferences: {
+        preload: join(__dirname, 'preload.cjs'),
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: false,
+      },
+    })
+
+    const controlHtml = this.generateControlHtml()
+    this.controlWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(controlHtml)}`)
+
+    this.controlWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+
+    this.controlWindow.once('ready-to-show', () => {
+      this.controlWindow?.show()
+      this.controlWindow?.webContents.executeJavaScript('window.setVisible(false)')
+    })
+
+    this.setupControlListeners()
+  }
+
+  private generateControlHtml(): string {
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 320px;
+      height: 80px;
+      background: rgba(30, 30, 30, 0.95);
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    }
+    .btn {
+      padding: 10px 28px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn-cancel {
+      background: rgba(255, 255, 255, 0.1);
+      color: white;
+    }
+    .btn-cancel:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    .btn-confirm {
+      background: #007AFF;
+      color: white;
+    }
+    .btn-confirm:hover {
+      background: #0056CC;
+    }
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <button class="btn btn-cancel" id="btnCancel">取消</button>
+  <button class="btn btn-confirm" id="btnConfirm">确定</button>
+  <script>
+    const btnCancel = document.getElementById('btnCancel')
+    const btnConfirm = document.getElementById('btnConfirm')
+
+    btnCancel.addEventListener('click', () => {
+      window.electronAPI.screenshotAction('cancel')
+    })
+
+    btnConfirm.addEventListener('click', () => {
+      window.electronAPI.screenshotAction('confirm')
+    })
+
+    window.setVisible = function(visible) {
+      document.body.style.display = visible ? 'flex' : 'none'
+    }
+  </script>
+</body>
+</html>`
+  }
+
+  private setupControlListeners(): void {
+    if (!this.controlWindow) return
+
+    this.controlWindow.on('closed', () => {
+      this.controlWindow = null
+    })
+  }
+
+  private updateControlWindow(visible: boolean): void {
+    if (!this.controlWindow || this.controlWindow.isDestroyed()) {
+      this.createControlWindow()
+    }
+    if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+      setTimeout(() => {
+        this.controlWindow?.webContents.executeJavaScript(`window.setVisible(${visible})`)
+      }, 100)
+    }
+  }
+
+  private captureRegion(region: SelectionRegion): void {
+    this.closeAllOverlays()
+
+    const tempPath = join(app.getPath('temp'), `screenshot_${Date.now()}.png`)
+    const scaledX = Math.round(region.x * region.scaleFactor)
+    const scaledY = Math.round(region.y * region.scaleFactor)
+    const scaledWidth = Math.round(region.width * region.scaleFactor)
+    const scaledHeight = Math.round(region.height * region.scaleFactor)
+
+    execFile('screencapture', ['-x', '-R', `${scaledX},${scaledY},${scaledWidth},${scaledHeight}`, tempPath], async (error: Error | null) => {
+      if (error) {
+        console.log('[Screenshot] 区域截取失败:', error.message || error)
+        this.notifyScreenshotCancelled()
+        return
+      }
+
+      try {
+        const stats = await fsPromises.stat(tempPath)
+        if (stats && stats.size > 0) {
+          console.log('[Screenshot] 区域截图已保存:', tempPath)
+          this.notifyScreenshotSuccess(tempPath)
+        } else {
+          console.log('[Screenshot] 区域截图文件无效或为空')
+          this.notifyScreenshotCancelled()
+        }
+      } catch (e) {
+        console.warn('[Screenshot] 区域截图文件检查失败:', e)
+        this.notifyScreenshotCancelled()
+      }
+    })
+  }
+
+  private closeAllOverlays(): void {
+    for (const [, win] of this.overlayWindows) {
+      if (!win.isDestroyed()) {
+        win.close()
+      }
+    }
+    this.overlayWindows.clear()
+
+    if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+      this.controlWindow.close()
+      this.controlWindow = null
+    }
+
+    this.windowsInfo = []
+    this.currentSelection = null
+  }
+
+  private notifyScreenshotSuccess(tempPath: string): void {
+    this.onCaptureEnd?.(tempPath)
+
+    let targetWin = BrowserWindow.getFocusedWindow()
+    if (!targetWin) {
+      const publishWindow = this.deps?.getPublishWindow()
+      const isPublishActive = this.deps?.getLastActiveWindow() === 'publish'
+      const publishAvailable = publishWindow && !publishWindow.isDestroyed() && publishWindow.isVisible()
+      targetWin = (isPublishActive && publishAvailable)
+        ? publishWindow
+        : this.deps?.getMainWindow() ?? null
+    }
+
+    if (targetWin && !targetWin.isDestroyed()) {
+      const publishController = this.deps?.getPublishController()
+      const publishWindow = this.deps?.getPublishWindow()
+      if (targetWin === publishWindow && publishController?.isCollapsed()) {
+        publishController.requestExpand()
+      }
+      targetWin.webContents.send('screenshot:captured', tempPath)
+    }
+  }
+
+  private notifyScreenshotCancelled(): void {
+    this.onCaptureCancel?.()
+
+    let targetWin = BrowserWindow.getFocusedWindow()
+    if (!targetWin) {
+      const publishWindow = this.deps?.getPublishWindow()
+      const isPublishActive = this.deps?.getLastActiveWindow() === 'publish'
+      const publishAvailable = publishWindow && !publishWindow.isDestroyed() && publishWindow.isVisible()
+      targetWin = (isPublishActive && publishAvailable)
+        ? publishWindow
+        : this.deps?.getMainWindow() ?? null
+    }
+
+    if (targetWin && !targetWin.isDestroyed()) {
+      targetWin.webContents.send('screenshot:failed', 'Cancelled')
+    }
+  }
+
+  private notifyPermissionDenied(): void {
+    let targetWin = BrowserWindow.getFocusedWindow()
+    if (!targetWin) {
+      const publishWindow = this.deps?.getPublishWindow()
+      const isPublishActive = this.deps?.getLastActiveWindow() === 'publish'
+      const publishAvailable = publishWindow && !publishWindow.isDestroyed() && publishWindow.isVisible()
+      targetWin = (isPublishActive && publishAvailable)
+        ? publishWindow
+        : this.deps?.getMainWindow() ?? null
+    }
+    if (targetWin && !targetWin.isDestroyed()) {
+      if (targetWin.isMinimized()) {
+        targetWin.restore()
+      }
+      targetWin.show()
+      targetWin.focus()
+      targetWin.webContents.send('screenshot:failed', 'PermissionDenied')
+    }
+  }
+
+  public getAnnotationTools(): AnnotationTool[] {
+    return this.annotationTools
+  }
+
+  public addAnnotationTool(tool: AnnotationTool): void {
+    this.annotationTools.push(tool)
+  }
+
+  public clearAnnotationTools(): void {
+    this.annotationTools = []
+  }
+
+  public registerIpcHandlers(): void {
+    ipcMain.handle('screenshot:trigger', () => {
+      this.triggerScreenshot()
+    })
+
+    ipcMain.on('screenshot:capture-region', (_event, regionData: SelectionRegion) => {
+      this.handleRegionCapture(regionData)
+    })
+
+    ipcMain.on('screenshot:cancel', () => {
+      this.handleScreenshotCancel()
+    })
+
+    ipcMain.on('screenshot:region-selected', (_event, regionData: SelectionRegion) => {
+      this.handleRegionCapture(regionData)
+    })
+
+    ipcMain.on('screenshot:confirm', () => {
+      this.handleScreenshotConfirm()
+    })
+
+    ipcMain.on('screenshot:adjust-selection', (_event, data: { type: string; x: number; y: number; width?: number; height?: number }) => {
+      this.handleSelectionAdjust(data)
+    })
+  }
+}
+
+export const electronScreenshot = ElectronScreenshot.getInstance()

@@ -1,0 +1,21 @@
+diff --git a/electron/services/onboarding-service.ts b/electron/services/onboarding-service.ts
+index aaaeb48..a47fbb9 100644
+--- a/electron/services/onboarding-service.ts
++++ b/electron/services/onboarding-service.ts
+@@ -25,9 +25,13 @@ export interface OnboardingConfig {
+ }
+ 
+ export function registerOnboardingIpcHandlers(): void {
+-  // Initialize onboarding completed flag if not set
+-  if (cache.get(CacheAttribute.prefOnboardingCompleted) === undefined) {
+-    cache.set(CacheAttribute.prefOnboardingCompleted, true)
++  // 开发模式下每次启动自动清除引导完成标记，方便联调
++  if (!app.isPackaged) {
++    cache.set(CacheAttribute.prefOnboardingCompleted, false)
++    console.log('[OnboardingService] Dev mode detected — cleared onboarding completed flag')
++  } else if (cache.get(CacheAttribute.prefOnboardingCompleted) === undefined) {
++    // 生产环境下首次启动若未设置，默认为 false 以触发引导
++    cache.set(CacheAttribute.prefOnboardingCompleted, false)
+   }
+ 
+   console.log('[OnboardingService] Registering onboarding IPC handlers...')

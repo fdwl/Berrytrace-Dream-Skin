@@ -1,0 +1,33 @@
+diff --git a/src/views/plugins/workspace/FlexWorkspace.tsx b/src/views/plugins/workspace/FlexWorkspace.tsx
+index 70fb55f..065b02b 100644
+--- a/src/views/plugins/workspace/FlexWorkspace.tsx
++++ b/src/views/plugins/workspace/FlexWorkspace.tsx
+@@ -166,17 +166,6 @@ function FlexWorkspace() {
+     }
+   };
+ 
+-  // Tab 右键菜单开/关时通知主进程临时移除 WebContentsView（避免菜单被遮挡）
+-  useEffect(() => {
+-    const ipc = window.electronAPI?.ipc;
+-    if (!ipc) return;
+-    if (contextMenu) {
+-      ipc.send('browser-view:overlay-opened', {});
+-    } else {
+-      ipc.send('browser-view:overlay-closed', {});
+-    }
+-  }, [contextMenu]);
+-
+   useEffect(() => {
+     const handleCloseMenu = () => setContextMenu(null);
+     window.addEventListener('click', handleCloseMenu);
+@@ -530,7 +519,9 @@ function FlexWorkspace() {
+       },
+       onDrop: (node: { getId: () => string } | null) => {
+         if (node) {
+-          useWorkspaceStore.setState({ activeTabId: node.getId() });
++          queueMicrotask(() => {
++            useWorkspaceStore.setState({ activeTabId: node.getId() });
++          });
+         }
+       }
+     };

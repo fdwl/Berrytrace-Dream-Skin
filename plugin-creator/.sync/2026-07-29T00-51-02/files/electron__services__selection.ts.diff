@@ -1,0 +1,194 @@
+diff --git a/electron/services/selection.ts b/electron/services/selection.ts
+index 8fa0948..a166d46 100644
+--- a/electron/services/selection.ts
++++ b/electron/services/selection.ts
+@@ -62,7 +62,7 @@ export class ElectronSelection {
+     let x: number = 0
+     let y: number = 0
+ 
+-    console.log('[SelectionMenu] 原始坐标数据:', {
++    console.debug('[SelectionMenu] 原始坐标数据:', {
+       mousePosEnd: data?.mousePosEnd,
+       endBottom: data?.endBottom,
+       posLevel: data?.posLevel,
+@@ -84,18 +84,18 @@ export class ElectronSelection {
+ 
+     if (hasMousePosEnd && (data.mousePosEnd.x > 0 || data.mousePosEnd.y > 0)) {
+       const dip = this.screenToDip(data.mousePosEnd)
+-      console.log('[SelectionMenu] screenToDip 转换:', { original: data.mousePosEnd, dip })
++      console.debug('[SelectionMenu] screenToDip 转换:', { original: data.mousePosEnd, dip })
+       x = Math.round(dip.x - width / 2)
+       y = Math.round(dip.y + 15)
+     } else if (hasEndBottom && (data.endBottom.x > 0 || data.endBottom.y > 0)) {
+       const dip = this.screenToDip(data.endBottom)
+-      console.log('[SelectionMenu] screenToDip 转换:', { original: data.endBottom, dip })
++      console.debug('[SelectionMenu] screenToDip 转换:', { original: data.endBottom, dip })
+       x = Math.round(dip.x - width / 2)
+       y = Math.round(dip.y + 15)
+     } else {
+       const cursor = screen.getCursorScreenPoint()
+       const dip = this.screenToDip(cursor)
+-      console.log('[SelectionMenu] screenToDip 转换:', { original: cursor, dip })
++      console.debug('[SelectionMenu] screenToDip 转换:', { original: cursor, dip })
+       x = Math.round(dip.x - width / 2)
+       y = Math.round(dip.y + 15)
+     }
+@@ -113,30 +113,30 @@ export class ElectronSelection {
+       // 限制在屏幕工作区内，防止窗口移出屏幕
+       const activeDisplay = screen.getDisplayMatching({ x, y, width: 1, height: 1 })
+       const workArea = activeDisplay?.workArea || screen.getPrimaryDisplay().workArea
+-      console.log('[SelectionMenu] 工作区:', workArea)
++      console.debug('[SelectionMenu] 工作区:', workArea)
+ 
+       if (x < workArea.x) {
+-        console.log(`[SelectionMenu] x ${x} 超出左边界 ${workArea.x}，调整为 ${workArea.x}`)
++        console.debug(`[SelectionMenu] x ${x} 超出左边界 ${workArea.x}，调整为 ${workArea.x}`)
+         x = workArea.x
+       }
+       if (x + width > workArea.x + workArea.width) {
+         const newX = workArea.x + workArea.width - width
+-        console.log(`[SelectionMenu] x+width ${x + width} 超出右边界 ${workArea.x + workArea.width}，调整为 ${newX}`)
++        console.debug(`[SelectionMenu] x+width ${x + width} 超出右边界 ${workArea.x + workArea.width}，调整为 ${newX}`)
+         x = newX
+       }
+       if (y < workArea.y) {
+-        console.log(`[SelectionMenu] y ${y} 超出上边界 ${workArea.y}，调整为 ${workArea.y}`)
++        console.debug(`[SelectionMenu] y ${y} 超出上边界 ${workArea.y}，调整为 ${workArea.y}`)
+         y = workArea.y
+       }
+       if (y + height > workArea.y + workArea.height) {
+-        console.log(`[SelectionMenu] y+height ${y + height} 超出下边界 ${workArea.y + workArea.height}`)
++        console.debug(`[SelectionMenu] y+height ${y + height} 超出下边界 ${workArea.y + workArea.height}`)
+         if (hasMousePosEnd && (data.mousePosEnd.x > 0 || data.mousePosEnd.y > 0)) {
+           const dip = this.screenToDip(data.mousePosEnd)
+           y = Math.round(dip.y - height - 15)
+-          console.log(`[SelectionMenu] 使用 mousePosEnd 向上调整 y 为 ${y}`)
++          console.debug(`[SelectionMenu] 使用 mousePosEnd 向上调整 y 为 ${y}`)
+         } else {
+           y = Math.round(workArea.y + workArea.height - height)
+-          console.log(`[SelectionMenu] 使用 workArea 调整 y 为 ${y}`)
++          console.debug(`[SelectionMenu] 使用 workArea 调整 y 为 ${y}`)
+         }
+       }
+     } catch (e) {
+@@ -174,7 +174,7 @@ export class ElectronSelection {
+     }
+ 
+     const preloadPath = join(__dirname, 'preload.cjs')
+-    console.log('[SelectionMenu] preload 文件路径:', preloadPath)
++    console.debug('[SelectionMenu] preload 文件路径:', preloadPath)
+ 
+     try {
+       this.selectionMenuWindow = new BrowserWindow({
+@@ -209,23 +209,23 @@ export class ElectronSelection {
+         this.selectionMenuWindow.setAlwaysOnTop(true, 'screen-saver')
+       }
+ 
+-      console.log('[SelectionMenu] 窗口对象创建成功')
++      console.debug('[SelectionMenu] 窗口对象创建成功')
+     } catch (error) {
+       console.error('[SelectionMenu] 窗口创建失败:', error)
+       return
+     }
+-    console.log('[SelectionMenu] 窗口初始 bounds:', this.selectionMenuWindow.getBounds())
+-    console.log('[SelectionMenu] 窗口 isVisible:', this.selectionMenuWindow.isVisible())
++    console.debug('[SelectionMenu] 窗口初始 bounds:', this.selectionMenuWindow.getBounds())
++    console.debug('[SelectionMenu] 窗口 isVisible:', this.selectionMenuWindow.isVisible())
+ 
+     const wc = this.selectionMenuWindow.webContents
+ 
+     wc.on('did-start-loading', () => {
+-      console.log('[SelectionMenu] 页面开始加载')
++        console.debug('[SelectionMenu] 页面开始加载')
+     })
+ 
+     wc.on('did-finish-load', () => {
+-      console.log('[SelectionMenu] 页面加载完成')
+-      console.log('[SelectionMenu] 页面 URL:', wc.getURL())
++        console.debug('[SelectionMenu] 页面加载完成')
++      console.debug('[SelectionMenu] 页面 URL:', wc.getURL())
+       // 首次加载完成后发送初始数据
+       wc.send('selection:update', data)
+     })
+@@ -235,11 +235,11 @@ export class ElectronSelection {
+     })
+ 
+     if (process.env.VITE_DEV_SERVER_URL) {
+-      console.log('[SelectionMenu] 加载开发服务器:', `${process.env.VITE_DEV_SERVER_URL}?window=selection-menu#/selection-menu`)
++      console.debug('[SelectionMenu] 加载开发服务器:', `${process.env.VITE_DEV_SERVER_URL}?window=selection-menu#/selection-menu`)
+       this.selectionMenuWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}?window=selection-menu#/selection-menu`)
+     } else {
+       const filePath = join(__dirname, '../dist/index.html')
+-      console.log('[SelectionMenu] 加载本地文件:', filePath)
++      console.debug('[SelectionMenu] 加载本地文件:', filePath)
+       this.selectionMenuWindow.loadFile(filePath, {
+         query: { window: 'selection-menu' },
+         hash: 'selection-menu'
+@@ -278,21 +278,21 @@ export class ElectronSelection {
+     })
+ 
+     this.selectionMenuWindow.on('blur', () => {
+-      console.log('[SelectionMenu] blur 事件触发, ignoreBlur:', ignoreBlur)
++      console.debug('[SelectionMenu] blur 事件触发, ignoreBlur:', ignoreBlur)
+       if (ignoreBlur) {
+-        console.log('[SelectionMenu] 忽略 blur 事件（用户正在交互）')
++        console.debug('[SelectionMenu] 忽略 blur 事件（用户正在交互）')
+         return
+       }
+       setTimeout(() => {
+         if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed() && !this.selectionMenuWindow.isFocused()) {
+           this.selectionMenuWindow.hide()
+-          console.log('[SelectionMenu] 窗口已隐藏（复用模式）')
++          console.debug('[SelectionMenu] 窗口已隐藏（复用模式）')
+         }
+       }, 150)
+     })
+ 
+     this.selectionMenuWindow.on('closed', () => {
+-      console.log('[SelectionMenu] closed 事件触发')
++      console.debug('[SelectionMenu] closed 事件触发')
+       this.selectionMenuWindow = null
+     })
+   }
+@@ -355,7 +355,7 @@ export class ElectronSelection {
+ 
+       this.selectionHook.on('text-selection', (data: TextSelectionData) => {
+         if (!ElectronMainWindow.getInstance().hasEnteredDashboard()) {
+-          console.log('[SelectionMenu] 用户尚未进入主界面，忽略划词事件')
++          console.debug('[SelectionMenu] 用户尚未进入主界面，忽略划词事件')
+           return
+         }
+ 
+@@ -364,7 +364,7 @@ export class ElectronSelection {
+ 
+         // 检查桌面是否被锁定
+         if (ElectronDesktopLock.getInstance().isDesktopLocked()) {
+-          console.log('[SelectionMenu] 桌面已锁定，忽略划词事件')
++          console.debug('[SelectionMenu] 桌面已锁定，忽略划词事件')
+           return
+         }
+ 
+@@ -392,12 +392,12 @@ export class ElectronSelection {
+ 
+           const currentSel = this.selectionHook.getCurrentSelection()
+           if (!currentSel) {
+-            console.log('[SelectionMenu] 延迟验证失败：当前已无选中文本')
++            console.debug('[SelectionMenu] 延迟验证失败：当前已无选中文本')
+             return
+           }
+           const currentText = currentSel.text?.trim()
+           if (!currentText || currentText.length < 2) {
+-            console.log('[SelectionMenu] 延迟验证失败：当前已无选中文本或文本长度小于2')
++            console.debug('[SelectionMenu] 延迟验证失败：当前已无选中文本或文本长度小于2')
+             return
+           }
+ 
+@@ -471,7 +471,7 @@ export class ElectronSelection {
+       } else if (type === 'plugin-action') {
+         // 插件划词菜单 action - 由插件自行处理
+         // 这里只是一个中转点，实际的 action 处理在插件侧
+-        console.log(`[SelectionMenu] Plugin action: ${text}`)
++        console.debug(`[SelectionMenu] Plugin action: ${text}`)
+       }
+ 
+       if (this.selectionMenuWindow && !this.selectionMenuWindow.isDestroyed()) {

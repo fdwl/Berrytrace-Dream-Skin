@@ -1,0 +1,13 @@
+diff --git a/electron/plugins/scheduler.ts b/electron/plugins/scheduler.ts
+index 905d2ab..f448196 100644
+--- a/electron/plugins/scheduler.ts
++++ b/electron/plugins/scheduler.ts
+@@ -180,7 +180,7 @@ export class PluginScheduler {
+     }
+   }
+ 
+-  private tick() {
++  private async tick() {
+     const now = Date.now();
+     const date = new Date(now);
+     let changed = false;

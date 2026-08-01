@@ -1,0 +1,23 @@
+diff --git a/electron/services/db-ipc.ts b/electron/services/db-ipc.ts
+index ad6c1eb..eb4d3ed 100644
+--- a/electron/services/db-ipc.ts
++++ b/electron/services/db-ipc.ts
+@@ -3,8 +3,10 @@ import { DatabaseManager, type SQLInputValue } from './db-manager.js'
+ import { WorkspaceManager } from './workspace-manager.js'
+ import { DocumentLinkService } from './document-link-service.js'
+ import { DatabaseWriter } from './db-writer.js'
++import { setupDocumentCenterIPC } from './document-center.js'
+ 
+ const WORKSPACE_TABLES = [
++  'dbagentsession',
+   'dbchatsession',
+   'dbchatlogs',
+   'ftsfileindex',
+@@ -58,6 +60,7 @@ function getTargetDatabasePath(event: Electron.IpcMainInvokeEvent, sql: string,
+ }
+ 
+ export function registerDatabaseIpcHandlers() {
++  setupDocumentCenterIPC()
+   ipcMain.handle('document:listAll', async (event) => {
+     await awaitDbReady()
+     const workspacePath = WorkspaceManager.getInstance().getPathForWebContents(event.sender)

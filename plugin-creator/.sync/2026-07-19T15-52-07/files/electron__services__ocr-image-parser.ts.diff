@@ -1,0 +1,191 @@
+diff --git a/electron/services/ocr-image-parser.ts b/electron/services/ocr-image-parser.ts
+new file mode 100644
+index 0000000..d9b9551
+--- /dev/null
++++ b/electron/services/ocr-image-parser.ts
+@@ -0,0 +1,185 @@
++/**
++ * 图片 OCR 文本提取服务
++ * 基于 PaddleOCR ONNX (ppu-paddle-ocr + onnxruntime-node)
++ * 统一管理模型路径至 ~/.berrytrace/models/ocr/
++ * 模型下载镜像源：https://getdear.cn/mstatic/models/paddleocr-v4-onnx/
++ */
++
++import * as fs from 'fs'
++import * as path from 'path'
++import sharp from 'sharp'
++import { getOcrModelDir } from '../config/paths'
++
++// OCR 单例及缓存定义
++let ocrServiceInstance: any = null
++let isInitializing = false
++let initPromise: Promise<void> | null = null
++
++// 结果缓存: key 为 `${filePath}:${mtimeMs}:${size}`
++const ocrCache = new Map<string, string>()
++const MAX_CACHE_SIZE = 500
++
++/** 官方 CDN / 静态服务器模型基础路径 */
++const OCR_MODEL_BASE_URL = 'https://getdear.cn/mstatic/models/paddleocr-v4-onnx'
++
++/**
++ * 确保指定的模型资源文件下载并存放在统一的模型目录 ~/.berrytrace/models/ocr/ 中
++ */
++async function ensureModelFile(url: string, localPath: string): Promise<void> {
++  if (fs.existsSync(localPath)) {
++    try {
++      const stats = await fs.promises.stat(localPath)
++      if (stats.size > 0) {
++        return
++      }
++    } catch (e) {
++      // 文件无效，重新下载
++    }
++  }
++
++  console.log(`[OcrImageParser] Downloading OCR model file to ${localPath}...`)
++  const response = await fetch(url)
++  if (!response.ok) {
++    throw new Error(`Failed to download model file from ${url}, status: ${response.status}`)
++  }
++
++  const arrayBuffer = await response.arrayBuffer()
++  const dir = path.dirname(localPath)
++  if (!fs.existsSync(dir)) {
++    await fs.promises.mkdir(dir, { recursive: true })
++  }
++  await fs.promises.writeFile(localPath, Buffer.from(arrayBuffer))
++  console.log(`[OcrImageParser] Saved OCR model file to ${localPath}`)
++}
++
++/**
++ * 延迟获取并初始化 PaddleOCR 实例
++ * 运行期统一使用 ~/.berrytrace/models/ocr/ (getOcrModelDir())
++ */
++async function getOcrService(): Promise<any> {
++  if (ocrServiceInstance && ocrServiceInstance.isInitialized()) {
++    return ocrServiceInstance
++  }
++
++  if (isInitializing && initPromise) {
++    await initPromise
++    return ocrServiceInstance
++  }
++
++  isInitializing = true
++  initPromise = (async () => {
++    try {
++      const ocrDir = getOcrModelDir()
++      if (!fs.existsSync(ocrDir)) {
++        await fs.promises.mkdir(ocrDir, { recursive: true })
++      }
++
++      console.log(`[OcrImageParser] Using unified OCR model directory: ${ocrDir}`)
++
++      const mod = await import('ppu-paddle-ocr')
++      const PaddleOcrService = mod.PaddleOcrService || (mod as any).default
++
++      // 使用官方 getdear.cn/mstatic 静态服务下载路径
++      const detUrl = `${OCR_MODEL_BASE_URL}/PP-OCRv4_mobile_det_infer.onnx`
++      const recUrl = `${OCR_MODEL_BASE_URL}/PP-OCRv4_mobile_rec_infer.onnx`
++      const dictUrl = `${OCR_MODEL_BASE_URL}/ppocrv4_dict.txt`
++
++      const detPath = path.join(ocrDir, 'PP-OCRv4_mobile_det_infer.onnx')
++      const recPath = path.join(ocrDir, 'PP-OCRv4_mobile_rec_infer.onnx')
++      const dictPath = path.join(ocrDir, 'ppocrv4_dict.txt')
++
++      // 确保模型与字典文件位于 ~/.berrytrace/models/ocr/
++      await Promise.all([
++        ensureModelFile(detUrl, detPath),
++        ensureModelFile(recUrl, recPath),
++        ensureModelFile(dictUrl, dictPath),
++      ])
++
++      const ocr = new PaddleOcrService({
++        model: {
++          detection: detPath,
++          recognition: recPath,
++          charactersDictionary: dictPath,
++        },
++      })
++
++      await ocr.initialize()
++      ocrServiceInstance = ocr
++      console.log('[OcrImageParser] PaddleOCR Service initialized successfully.')
++    } catch (err) {
++      console.error('[OcrImageParser] Failed to initialize PaddleOCR:', err)
++      ocrServiceInstance = null
++      throw err
++    } finally {
++      isInitializing = false
++    }
++  })()
++
++  await initPromise
++  return ocrServiceInstance
++}
++
++/**
++ * 提取图片中的文字内容 (OCR)
++ * @param filePath 图片完整绝对路径
++ * @returns 识别出的纯文本字符串
++ */
++export async function parseImageOcr(filePath: string): Promise<string> {
++  try {
++    const stats = await fs.promises.stat(filePath)
++    const cacheKey = `${filePath}:${stats.mtimeMs}:${stats.size}`
++
++    if (ocrCache.has(cacheKey)) {
++      return ocrCache.get(cacheKey)!
++    }
++
++    const ocr = await getOcrService()
++    if (!ocr) {
++      return ''
++    }
++
++    // 图片预处理：转灰度 + 超过 2000px 的限制尺寸，保持宽高比
++    const imagePipeline = sharp(filePath).grayscale()
++    const metadata = await imagePipeline.metadata()
++
++    let processedBuffer: Buffer
++    if (metadata.width && metadata.height && (metadata.width > 2000 || metadata.height > 2000)) {
++      processedBuffer = await imagePipeline
++        .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
++        .toBuffer()
++    } else {
++      processedBuffer = await imagePipeline.toBuffer()
++    }
++
++    // 转换为 ArrayBuffer (Node.js Buffer -> ArrayBuffer)
++    const arrayBuf = processedBuffer.buffer.slice(
++      processedBuffer.byteOffset,
++      processedBuffer.byteOffset + processedBuffer.byteLength
++    )
++
++    const result = await ocr.recognize(arrayBuf)
++    const text = (result && typeof result.text === 'string') ? result.text.trim() : ''
++
++    // 维护 LRU 缓存
++    if (ocrCache.size >= MAX_CACHE_SIZE) {
++      const firstKey = ocrCache.keys().next().value
++      if (firstKey) {
++        ocrCache.delete(firstKey)
++      }
++    }
++    ocrCache.set(cacheKey, text)
++
++    return text
++  } catch (err) {
++    console.error(`[OcrImageParser] Error parsing image OCR for ${filePath}:`, err)
++    return ''
++  }
++}
++
++/**
++ * 判断文件扩展名是否为受支持的图片格式
++ */
++export function isImageExtension(ext: string): boolean {
++  const lower = ext.toLowerCase()
++  return ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.gif'].includes(lower)
++}

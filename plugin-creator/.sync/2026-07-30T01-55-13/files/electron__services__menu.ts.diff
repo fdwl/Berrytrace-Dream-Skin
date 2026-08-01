@@ -1,0 +1,21 @@
+diff --git a/electron/services/menu.ts b/electron/services/menu.ts
+index 49b3ff5..6c64db8 100644
+--- a/electron/services/menu.ts
++++ b/electron/services/menu.ts
+@@ -6,7 +6,7 @@ import { oemManager } from './oem-manager'
+ 
+ export interface MenuDependencies {
+   openPreferences: () => void
+-  togglePublishWindow: () => void
++  togglePublishWindow?: () => void
+   triggerLock: () => void
+   toggleAlwaysOnTop: () => void
+ }
+@@ -55,7 +55,6 @@ export class ElectronMenu {
+       {
+         label: '文件',
+         submenu: [
+-          { label: '快速记录 (浮记)', accelerator: isMac ? 'Ctrl+Cmd+N' : 'Ctrl+Alt+N', click: () => this.deps?.togglePublishWindow() },
+           { label: '锁定桌面', accelerator: lockShortcut, click: () => this.deps?.triggerLock() },
+           { type: 'separator' },
+           ...(!isMac

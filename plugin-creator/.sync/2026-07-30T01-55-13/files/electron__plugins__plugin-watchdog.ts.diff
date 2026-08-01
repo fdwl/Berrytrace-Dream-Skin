@@ -1,0 +1,299 @@
+diff --git a/electron/plugins/plugin-watchdog.ts b/electron/plugins/plugin-watchdog.ts
+index 55a5501..47e6060 100644
+--- a/electron/plugins/plugin-watchdog.ts
++++ b/electron/plugins/plugin-watchdog.ts
+@@ -36,6 +36,8 @@ interface HeartbeatRecord {
+ 
+ export type RestartCallback = (pluginId: string) => Promise<void>;
+ 
++import { pluginStateRegistry } from './plugin-state-registry';
++
+ export class PluginWatchdog {
+   private static instance: PluginWatchdog;
+ 
+@@ -45,8 +47,6 @@ export class PluginWatchdog {
+   private restartCount = new Map<string, number>();
+   /** 被永久禁用的插件（crash loop 超限） */
+   private disabledPlugins = new Set<string>();
+-  /** 正在重启流程中的插件（防止 exit 与心跳超时双重触发重启） */
+-  private restartingPlugins = new Set<string>();
+ 
+   /** 心跳超时：15s（5s 间隔 × 3 次） */
+   private readonly HEARTBEAT_TIMEOUT_MS = 15_000;
+@@ -61,6 +61,9 @@ export class PluginWatchdog {
+   private readonly MEM_OOM_CONSECUTIVE_THRESHOLD = 6;
+   /** 记录每个插件的连续高内存心跳次数 */
+   private memOomCounters = new Map<string, number>();
++  /** 记录每个插件的连续高 CPU 心跳次数 */
++  private cpuHighCounters = new Map<string, number>();
++  private readonly CPU_KILL_CONSECUTIVE_THRESHOLD = 6;
+   /** 池级 OOM 连续心跳计数（poolId -> count） */
+   private poolOomCounters = new Map<string, number>();
+   /** 上次重启时间戳（用于冷却期检测） */
+@@ -72,7 +75,9 @@ export class PluginWatchdog {
+   /** 稳定运行超过此时长后重置重启计数 */
+   private readonly STABLE_RESET_MS = 60_000;
+ 
++  private isStopped = false;
+   private checkInterval: NodeJS.Timeout | null = null;
++  private restartTimers = new Map<string, NodeJS.Timeout>();
+   private restartCallback: RestartCallback | null = null;
+   private killCallback: ((pluginId: string) => void) | null = null;
+   /** 崩溃回调（由 PluginManager 绑定，用于通知隔离策略记录崩溃） */
+@@ -83,6 +88,12 @@ export class PluginWatchdog {
+    */
+   private isPluginBusyFn: ((pluginId: string) => boolean) | null = null;
+   private getLastErrorLogsFn: ((pluginId: string) => string) | null = null;
++  /**
++   * 永久禁用回调（由 PluginManager 绑定）。
++   * 触发时机：崩溃循环超过 MAX_RESTARTS 次，或 3 分钟冷却期内频繁重启熔断。
++   * 由 PluginManager 决定是否将禁用状态持久化（开发插件仅内存禁用，生产插件写缓存）。
++   */
++  private permanentDisableCallback: ((pluginId: string, reason: string) => void) | null = null;
+ 
+   private constructor() {}
+ 
+@@ -99,6 +110,7 @@ export class PluginWatchdog {
+    * @param killCallback kill 插件进程的回调（由 PluginLauncher 提供）
+    */
+   public start(restartCallback: RestartCallback, killCallback: (pluginId: string) => void): void {
++    this.isStopped = false;
+     this.restartCallback = restartCallback;
+     this.killCallback = killCallback;
+ 
+@@ -120,11 +132,25 @@ export class PluginWatchdog {
+     this.getLastErrorLogsFn = fn;
+   }
+ 
++  /** 注册永久禁用通知回调（由 PluginManager 绑定） */
++  public setPermanentDisableCallback(cb: (pluginId: string, reason: string) => void): void {
++    this.permanentDisableCallback = cb;
++  }
++
+   public stop(): void {
++    this.isStopped = true;
++    const clearedCount = this.restartTimers.size;
+     if (this.checkInterval) {
+       clearInterval(this.checkInterval);
+       this.checkInterval = null;
+     }
++    // 清除所有已调度的延迟重启定时器，防止退出期间复活插件进程
++    for (const timer of this.restartTimers.values()) {
++      clearTimeout(timer);
++    }
++    this.restartTimers.clear();
++    // restartingPlugins cleared via PluginStateRegistry phase resets
++    console.log(`[PluginWatchdog:stop] Stopped watchdog. Cleared ${clearedCount} pending restart timers.`);
+   }
+ 
+   /**
+@@ -132,6 +158,7 @@ export class PluginWatchdog {
+    * 由 PluginLauncher.startBackgroundPlugin 在进程 spawn 后调用。
+    */
+   public registerPlugin(pluginId: string): void {
++    if (this.isStopped) return;
+     const now = Date.now();
+     this.heartbeats.set(pluginId, {
+       timestamp: now,
+@@ -140,9 +167,9 @@ export class PluginWatchdog {
+       // 避免用 0 基线导致首心跳 CPU 误判（初始化阶段 CPU 占用高会被误杀）。
+       metrics: null,
+     });
+-    this.restartingPlugins.delete(pluginId);
++    pluginStateRegistry.setPhase(pluginId, 'registered');
+     this.disabledPlugins.delete(pluginId);
+-    console.log(`[PluginWatchdog] Registered plugin "${pluginId}"`);
++    console.debug(`[PluginWatchdog] Registered plugin "${pluginId}"`);
+   }
+ 
+   /**
+@@ -206,15 +233,28 @@ export class PluginWatchdog {
+       const deltaMs = metrics.timestamp - prev.metrics.timestamp;
+       if (deltaMs > 0) {
+         const cpuRatio = deltaUs / (deltaMs * 1000); // 微秒 / 微秒 = 单核占用比
+-        if (cpuRatio > this.CPU_KILL_THRESHOLD) {
+-          console.error(`[PluginWatchdog] Plugin "${pluginId}" CPU ${(cpuRatio * 100).toFixed(1)}% > ${this.CPU_KILL_THRESHOLD * 100}%, killing...`);
+-          this.killAndRestart(pluginId, `CPU 持续超过 ${this.CPU_KILL_THRESHOLD * 100}%`);
+-          return;
+-        }
+         if (cpuRatio > this.CPU_WARN_THRESHOLD) {
+           console.warn(`[PluginWatchdog] Plugin "${pluginId}" CPU high: ${(cpuRatio * 100).toFixed(1)}%`);
+           this.notifyRenderer('watchdog:cpu-warn', { pluginId, cpuRatio });
+         }
++
++        if (cpuRatio > this.CPU_KILL_THRESHOLD) {
++          // 物理防线：处于忙碌状态（如 Agent 任务执行、上下文压缩、模型推理）的插件，100% 豁免 CPU 强制杀进程
++          if (this.isPluginBusyFn?.(pluginId)) {
++            console.log(`[PluginWatchdog:Diag] Plugin "${pluginId}" CPU is ${(cpuRatio * 100).toFixed(1)}%, but plugin is active with task (isBusy=true). Exemption from kill.`);
++            this.cpuHighCounters.set(pluginId, 0);
++          } else {
++            const count = (this.cpuHighCounters.get(pluginId) || 0) + 1;
++            this.cpuHighCounters.set(pluginId, count);
++            if (count >= this.CPU_KILL_CONSECUTIVE_THRESHOLD) {
++              console.error(`[PluginWatchdog] Idle plugin "${pluginId}" CPU ${(cpuRatio * 100).toFixed(1)}% > ${this.CPU_KILL_THRESHOLD * 100}% for ${count} consecutive beats. Killing...`);
++              this.killAndRestart(pluginId, `闲置插件 CPU 持续超过 ${this.CPU_KILL_THRESHOLD * 100}% (${count} 次心跳)`);
++              return;
++            }
++          }
++        } else {
++          this.cpuHighCounters.set(pluginId, 0);
++        }
+       }
+     }
+   }
+@@ -225,8 +265,9 @@ export class PluginWatchdog {
+    */
+   public unregisterPlugin(pluginId: string): void {
+     this.heartbeats.delete(pluginId);
+-    this.restartingPlugins.delete(pluginId);
++    pluginStateRegistry.setPhase(pluginId, 'registered');
+     this.memOomCounters.delete(pluginId);
++    this.cpuHighCounters.delete(pluginId);
+     this.lastRestartTimestamps.delete(pluginId);
+     // 保留 restartCount，防止快速循环重启
+     console.log(`[PluginWatchdog] Unregistered plugin "${pluginId}"`);
+@@ -237,6 +278,12 @@ export class PluginWatchdog {
+     this.restartCount.delete(pluginId);
+   }
+ 
++  /** 手动解除禁用状态并重置计数 */
++  public enablePlugin(pluginId: string): void {
++    this.disabledPlugins.delete(pluginId);
++    this.restartCount.delete(pluginId);
++  }
++
+   /**
+    * 设置崩溃回调（由 PluginManager 绑定，通知隔离策略记录崩溃用于提升决策）。
+    */
+@@ -250,8 +297,12 @@ export class PluginWatchdog {
+    * 避免等待 15s 心跳超时才恢复（满足文档 6.1.3 崩溃即时恢复要求）。
+    */
+   public handleCrash(pluginId: string, code: number | null): void {
++    if (this.isStopped) {
++      console.log(`[PluginWatchdog:handleCrash] Watchdog is stopped (app quitting). Ignoring crash/exit event for plugin "${pluginId}" (code=${code}).`);
++      return;
++    }
+     if (this.disabledPlugins.has(pluginId)) return;
+-    if (this.restartingPlugins.has(pluginId)) return; // 已在重启流程中，忽略重复 exit
++    if (pluginStateRegistry.isRestarting(pluginId)) return; // 已在重启流程中，忽略重复 exit
+     this.heartbeats.delete(pluginId);
+ 
+     // 通知隔离策略记录崩溃（用于 optional 插件不稳定时提升到独立进程）
+@@ -265,10 +316,11 @@ export class PluginWatchdog {
+ 
+   /** 定时检查所有已注册插件的心跳 */
+   private checkAll(): void {
++    if (this.isStopped) return;
+     const now = Date.now();
+     for (const [pluginId, record] of this.heartbeats.entries()) {
+       if (this.disabledPlugins.has(pluginId)) continue;
+-      if (this.restartingPlugins.has(pluginId)) continue;
++      if (pluginStateRegistry.isRestarting(pluginId)) continue;
+       // 忙碌插件（如下载模型期间）豁免心跳超时：IPC 管道被 progress 消息占满时
+       // 心跳会被队列延迟，不应误判为进程挂死。
+       if (this.isPluginBusyFn?.(pluginId)) {
+@@ -288,7 +340,8 @@ export class PluginWatchdog {
+    * 进程已退出（crash）时改用 {@link handleCrash}，跳过 kill 步骤。
+    */
+   private killAndRestart(pluginId: string, reason: string): void {
+-    if (this.restartingPlugins.has(pluginId)) return; // 已在重启流程中
++    if (this.isStopped) return;
++    if (pluginStateRegistry.isRestarting(pluginId)) return; // 已在重启流程中
+     if (this.killCallback) {
+       try {
+         this.killCallback(pluginId);
+@@ -307,61 +360,73 @@ export class PluginWatchdog {
+    * 完成后自动清除 restartingPlugins 标记。
+    */
+   private scheduleRestart(pluginId: string, reason: string): void {
+-    if (this.restartingPlugins.has(pluginId)) return;
++    if (this.isStopped) return;
++    if (pluginStateRegistry.isRestarting(pluginId)) return;
+     if (this.disabledPlugins.has(pluginId)) return;
+ 
+     const stderr = this.getLastErrorLogsFn ? this.getLastErrorLogsFn(pluginId) : '';
+     const fullReason = stderr ? `${reason}\n\n\`\`\`\n${stderr}\n\`\`\`` : reason;
+ 
+-    // 冷却期检测：3 分钟内连续重启则熔断禁用，防止重启风暴
++    const count = this.restartCount.get(pluginId) ?? 0;
+     const now = Date.now();
+     const lastRestart = this.lastRestartTimestamps.get(pluginId) || 0;
+-    if (now - lastRestart < this.COOLDOWN_WINDOW_MS) {
+-      console.error(
+-        `[PluginWatchdog] Plugin "${pluginId}" restarted too frequently ` +
+-        `(${Math.round((now - lastRestart) / 1000)}s ago < ${this.COOLDOWN_WINDOW_MS / 1000}s cooldown). ` +
+-        `Permanently disabled to prevent restart storm. Reason: ${reason}`
+-      );
+-      this.disabledPlugins.add(pluginId);
+-      this.restartingPlugins.delete(pluginId);
+-      this.notifyRenderer('watchdog:disabled', { pluginId, reason: `冷却期熔断: ${fullReason}`, cooldownViolation: true });
+-      return;
+-    }
+ 
+-    const count = this.restartCount.get(pluginId) ?? 0;
++    // 只有当连续重启次数已达最大尝试上限 (MAX_RESTARTS) 时，检查冷却熔断
+     if (count >= this.MAX_RESTARTS) {
++      if (now - lastRestart < this.COOLDOWN_WINDOW_MS) {
++        console.error(
++          `[PluginWatchdog] Plugin "${pluginId}" restarted too frequently ` +
++          `(${Math.round((now - lastRestart) / 1000)}s ago < ${this.COOLDOWN_WINDOW_MS / 1000}s cooldown). ` +
++          `Permanently disabled to prevent restart storm. Reason: ${reason}`
++        );
++        this.disabledPlugins.add(pluginId);
++        pluginStateRegistry.setPhase(pluginId, 'registered');
++        try { this.permanentDisableCallback?.(pluginId, `冷却期熔断: ${fullReason}`); } catch { /* 忽略 */ }
++        this.notifyRenderer('watchdog:disabled', { pluginId, reason: `冷却期熔断: ${fullReason}`, cooldownViolation: true });
++        return;
++      }
++
+       console.error(`[PluginWatchdog] Plugin "${pluginId}" crash loop (${count} restarts), permanently disabled`);
+       this.disabledPlugins.add(pluginId);
+-      this.restartingPlugins.delete(pluginId);
++      pluginStateRegistry.setPhase(pluginId, 'registered');
++      try { this.permanentDisableCallback?.(pluginId, fullReason); } catch { /* 忽略 */ }
+       this.notifyRenderer('watchdog:disabled', { pluginId, reason: fullReason, restartCount: count });
+       return;
+     }
+ 
+-    this.restartingPlugins.add(pluginId);
++    pluginStateRegistry.setPhase(pluginId, 'restarting');
+     this.restartCount.set(pluginId, count + 1);
+     this.lastRestartTimestamps.set(pluginId, now);
+     this.notifyRenderer('watchdog:restarting', { pluginId, reason: fullReason, attempt: count + 1, maxRestarts: this.MAX_RESTARTS });
+ 
+     // 延迟 1s 后重启，避免立即重启死锁
+-    setTimeout(async () => {
++    const timer = setTimeout(async () => {
++      this.restartTimers.delete(pluginId);
++      if (this.isStopped) return;
+       if (this.disabledPlugins.has(pluginId)) {
+-        this.restartingPlugins.delete(pluginId);
++        pluginStateRegistry.setPhase(pluginId, 'registered');
+         return;
+       }
+       if (this.restartCallback) {
+         try {
+           console.log(`[PluginWatchdog] Restarting plugin "${pluginId}" (attempt ${count + 1}/${this.MAX_RESTARTS})`);
+           await this.restartCallback(pluginId);
+-          // startBackgroundPlugin 内部会调用 registerPlugin，自动清除 restartingPlugins 标记
++          // startBackgroundPlugin 内部会调用 registerPlugin，自动清除 restartingPlugins 标记。
++          // 若 restartCallback 提前返回（如用户已禁用插件），registerPlugin 不会被调用，
++          // 此处兜底清除，防止 restartingPlugins 泄漏。
++          if (pluginStateRegistry.isRestarting(pluginId)) {
++            pluginStateRegistry.setPhase(pluginId, 'registered');
++          }
+         } catch (err) {
+           console.error(`[PluginWatchdog] Restart failed for "${pluginId}":`, err);
+-          this.restartingPlugins.delete(pluginId);
++          pluginStateRegistry.setPhase(pluginId, 'registered');
+           this.notifyRenderer('watchdog:restart-failed', { pluginId, reason: fullReason, attempt: count + 1, error: String(err) });
+         }
+       } else {
+-        this.restartingPlugins.delete(pluginId);
++        pluginStateRegistry.setPhase(pluginId, 'registered');
+       }
+     }, 1000);
++    this.restartTimers.set(pluginId, timer);
+   }
+ 
+   /**

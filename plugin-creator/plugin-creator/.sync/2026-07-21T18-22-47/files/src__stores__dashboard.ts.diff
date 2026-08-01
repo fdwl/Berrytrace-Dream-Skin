@@ -1,0 +1,30 @@
+diff --git a/src/stores/dashboard.ts b/src/stores/dashboard.ts
+index 79d347a..65724e8 100644
+--- a/src/stores/dashboard.ts
++++ b/src/stores/dashboard.ts
+@@ -5,11 +5,12 @@ import { create } from 'zustand';
+  * - 'chat'    默认 Agent Chat（包括无会话的空状态）
+  * - 'plans'   已安排（定时任务管理），替代 AgentChat 占据内容区
+  * - 'plugins' 插件管理，替代 AgentChat 占据内容区
++ * - 'automation' 自动化（工作流中心），替代 plans + 工作流
+  *
+  * 切换到 'plans' 或 'plugins' 时，Workspace 自动关闭，
+  * 因为 Workspace 必须依附于会话（AgentChat），不能独立显示。
+  */
+-export type ContentView = 'chat' | 'plans' | 'plugins';
++export type ContentView = 'chat' | 'plans' | 'plugins' | 'automation';
+ 
+ interface DashboardState {
+   /** Workspace 面板是否可见（仅在 contentView === 'chat' 时有效） */
+@@ -75,11 +76,9 @@ export const useDashboardStore = create<DashboardState>((set) => ({
+   }),
+ 
+   setContentView: (view) => set((s) => {
+-    const nextWorkspaceVisible = view === 'chat' ? s.workspaceVisible : false;
+-    console.log(`[DashboardStore:setContentView] changing contentView to ${view}, workspaceVisible will be ${nextWorkspaceVisible}`);
++    console.log(`[DashboardStore:setContentView] changing contentView to ${view}`);
+     return {
+       contentView: view,
+-      workspaceVisible: nextWorkspaceVisible,
+     };
+   }),

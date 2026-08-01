@@ -1,0 +1,128 @@
+diff --git a/electron/services/fts-hybrid-searcher.ts b/electron/services/fts-hybrid-searcher.ts
+index 1904d7f..1ff033f 100644
+--- a/electron/services/fts-hybrid-searcher.ts
++++ b/electron/services/fts-hybrid-searcher.ts
+@@ -210,6 +210,27 @@ export class FtsHybridSearcher {
+     return sorted;
+   }
+ 
++  /**
++   * Hybrid search for agent capabilities (skills and tools) combining FTS and Vector search using RRF
++   */
++  /**
++   * 清洗与转义 FTS 查询文本，剥除双引号及特殊 FTS5 匹配符
++   */
++  public static sanitizeFtsQuery(query: string): string {
++    if (!query) return '';
++    let cleaned = query
++      .replace(/["'“”‘’]/g, ' ') // 剥除各类全半角单双引号
++      .replace(/[:*^{}()+~]/g, ' ') // 剥除 FTS5 特殊语法符号
++      .replace(/\s+/g, ' ')
++      .trim();
++
++    // 如果查询文本极长（例如整段 System/User Prompt 被当作 query 传入），截取前 150 字符
++    if (cleaned.length > 150) {
++      cleaned = cleaned.slice(0, 150).trim();
++    }
++    return cleaned;
++  }
++
+   /**
+    * Hybrid search for agent capabilities (skills and tools) combining FTS and Vector search using RRF
+    */
+@@ -220,49 +241,59 @@ export class FtsHybridSearcher {
+       : DatabaseManager.getInstance().getGlobalDB();
+     const _dbKey = workspacePath || 'global';
+     
++    const cleanQuery = FtsHybridSearcher.sanitizeFtsQuery(query);
++
+     // 1. Run FTS Search
+     const hasAdvancedSyntax = /( AND | OR | NOT |"-|"[^"]+")/.test(query);
+-    let ftsSql: string;
+-    let ftsParams: string[];
+-
+-    if (hasAdvancedSyntax) {
+-      const { QueryParser } = await import('./fulltext-query-parser.js');
+-      const parser = new QueryParser();
+-      const parsed = parser.parse(query);
+-      const ftsQuery = parser.toFtsQuery(parsed);
+-      ftsSql = `
+-        SELECT entity_id, entity_type, title, content, meta, rank
+-        FROM FtsAgentIndex
+-        WHERE FtsAgentIndex MATCH ?
+-        ORDER BY rank
+-        LIMIT 100
+-      `;
+-      ftsParams = [ftsQuery];
++    let ftsResults: Array<AgentSearchResult & { rank: number }> = [];
++
++    if (!cleanQuery) {
++      try {
++        ftsResults = db.prepare(`SELECT entity_id, entity_type, title, content, meta, 0 as rank FROM FtsAgentIndex LIMIT 100`).all() as unknown as Array<AgentSearchResult & { rank: number }>;
++      } catch (err) {
++        console.warn('[FtsHybridSearcher] Failed to query default FtsAgentIndex:', err);
++      }
+     } else {
+-      // 方案一：REPLACE 把 jieba_query 输出的空格替换为 OR，实现 OR 语义
+-      // 先打印原始输出看格式
+       try {
+-        const rawJieba = (db.prepare(`SELECT jieba_query(?) as q`).get(query) as { q: string })?.q || '';
+-        console.log(`[FtsHybridSearcher] jieba_query raw output: "${rawJieba}"`);
+-      } catch (e) { /* ignore */ }
+-
+-      ftsSql = `SELECT entity_id, entity_type, title, content, meta, rank FROM FtsAgentIndex WHERE FtsAgentIndex MATCH replace(jieba_query(?), ' AND ', ' OR ') ORDER BY rank LIMIT 100`;
+-      ftsParams = [query];
+-    }
+-
+-    let ftsResults: Array<AgentSearchResult & { rank: number }> = [];
+-    try {
+-      if (query.trim()) {
+-        ftsResults = db.prepare(ftsSql).all(...ftsParams) as unknown as Array<AgentSearchResult & { rank: number }>;
+-        // 打印 FTS 查询详情：原始查询、FTS 查询、命中数、Top3
++        if (hasAdvancedSyntax) {
++          const { QueryParser } = await import('./fulltext-query-parser.js');
++          const parser = new QueryParser();
++          const parsed = parser.parse(query);
++          const ftsQuery = parser.toFtsQuery(parsed);
++          const ftsSql = `
++            SELECT entity_id, entity_type, title, content, meta, rank
++            FROM FtsAgentIndex
++            WHERE FtsAgentIndex MATCH ?
++            ORDER BY rank
++            LIMIT 100
++          `;
++          ftsResults = db.prepare(ftsSql).all(ftsQuery) as unknown as Array<AgentSearchResult & { rank: number }>;
++        } else {
++          // 方案一：使用清洗后的 cleanQuery 经过 jieba_query 分词，并将 AND 替换为 OR
++          const ftsSql = `SELECT entity_id, entity_type, title, content, meta, rank FROM FtsAgentIndex WHERE FtsAgentIndex MATCH replace(jieba_query(?), ' AND ', ' OR ') ORDER BY rank LIMIT 100`;
++          ftsResults = db.prepare(ftsSql).all(cleanQuery) as unknown as Array<AgentSearchResult & { rank: number }>;
++        }
++        
+         const ftsDuration = (performance.now() - startTime).toFixed(1);
+         const topIds = ftsResults.slice(0, 3).map(r => `${r.entity_id}(${r.entity_type},rank:${r.rank},contentLen:${(r.content||'').length})`).join(', ') || '(none)';
+-        console.log(`[FtsHybridSearcher] FTS query: "${ftsParams[0]}" | hits: ${ftsResults.length} | top3: ${topIds} | ${ftsDuration}ms`);
+-      } else {
+-        ftsResults = db.prepare(`SELECT entity_id, entity_type, title, content, meta, 0 as rank FROM FtsAgentIndex LIMIT 100`).all() as unknown as Array<AgentSearchResult & { rank: number }>;
++        console.log(`[FtsHybridSearcher] FTS query for "${cleanQuery.slice(0, 30)}" | hits: ${ftsResults.length} | top3: ${topIds} | ${ftsDuration}ms`);
++      } catch (primaryErr) {
++        console.warn('[FtsHybridSearcher] Primary jieba MATCH search failed, attempting safe token fallback:', primaryErr);
++        try {
++          // 降级策略：提取词项并用 OR 拼接安全词查询
++          const terms = cleanQuery.split(/\s+/).filter(t => t.length > 0).slice(0, 8);
++          if (terms.length > 0) {
++            const fallbackMatch = terms.map(t => `"${t}"`).join(' OR ');
++            const fallbackSql = `SELECT entity_id, entity_type, title, content, meta, rank FROM FtsAgentIndex WHERE FtsAgentIndex MATCH ? ORDER BY rank LIMIT 100`;
++            ftsResults = db.prepare(fallbackSql).all(fallbackMatch) as unknown as Array<AgentSearchResult & { rank: number }>;
++            console.log(`[FtsHybridSearcher] Fallback FTS query hit ${ftsResults.length} items`);
++          } else {
++            ftsResults = db.prepare(`SELECT entity_id, entity_type, title, content, meta, 0 as rank FROM FtsAgentIndex LIMIT 100`).all() as unknown as Array<AgentSearchResult & { rank: number }>;
++          }
++        } catch (fallbackErr) {
++          console.error('[FtsHybridSearcher] Agent FTS search fallback failed:', fallbackErr);
++        }
+       }
+-    } catch (err) {
+-      console.error('[FtsHybridSearcher] Agent FTS search failed:', err);
+     }
+ 
+     // 2. 工具/技能搜索：只用 FTS5 BM25，不用向量

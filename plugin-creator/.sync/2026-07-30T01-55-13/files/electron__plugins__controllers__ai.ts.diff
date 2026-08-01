@@ -1,0 +1,404 @@
+diff --git a/electron/plugins/controllers/ai.ts b/electron/plugins/controllers/ai.ts
+index f26686a..c30f096 100644
+--- a/electron/plugins/controllers/ai.ts
++++ b/electron/plugins/controllers/ai.ts
+@@ -1,9 +1,35 @@
+-import { BrowserWindow } from 'electron';
+-import { ApiContext, BaseApiController } from './api-context';
++import { BrowserWindow, ipcMain } from 'electron';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { ElectronMainWindow } from '../../windows/main-window';
+ import { McpHost } from '../mcp-host';
+ import { PluginManager } from '../plugin-manager';
+ import { PluginLauncher } from '../plugin-launcher';
++import { cache } from '../../config/index';
++import { CacheAttribute } from '../../../src/config/CacheAttribute';
++
++// ── IPC: 渲染进程主动推送 AI 配置到主进程 cache（voice-only 模式保障）──
++// 在模块首次加载时注册（幂等：检查避免重复注册）
++let _aiConfigSyncRegistered = false;
++export function registerAiConfigSyncIpc(): void {
++  if (_aiConfigSyncRegistered) return;
++  _aiConfigSyncRegistered = true;
++  ipcMain.on('ai:sync-config-to-main', (_event, payload: {
++    llmConfig?: { provider: string; model: string; apiKey?: string; baseUrl?: string };
++    aiServers?: unknown[];
++    capabilityModels?: Record<string, unknown>;
++    voiceSettings?: Record<string, unknown>;
++  }) => {
++    try {
++      if (payload.llmConfig) cache.set(CacheAttribute.agentLlmConfig, payload.llmConfig);
++      if (payload.aiServers) cache.set(CacheAttribute.agentAiServers, payload.aiServers);
++      if (payload.capabilityModels) cache.set(CacheAttribute.agentCapabilityModels, payload.capabilityModels);
++      console.log('[AiController:sync] AI config synced to main process cache from renderer');
++    } catch (err) {
++      console.error('[AiController:sync] Failed to sync AI config to main cache:', err);
++    }
++  });
++}
+ 
+ // Active AI Call registries to route answers back to the sandbox process
+ export const activeAiCalls = new Map<number, {
+@@ -37,6 +63,14 @@ export function handleProxyAiResponse(payload: { token: number; type: 'response'
+ }
+ 
+ export class AiController extends BaseApiController {
++  /**
++   * 读取 LLM 默认配置。
++   *
++   * 双层 fallback 策略（支持无主窗口/voice-only 模式）：
++   *  1. mainWindow 存在 → executeJavaScript 读 localStorage → 同步写入 cache → 返回
++   *  2. mainWindow 不存在 → 从主进程 cache 读取（由上次运行或渲染进程推送写入）
++   *  3. cache 也为空 → 降级 berrytrace 默认配置
++   */
+   private async retrieveLlmConfig(): Promise<{ provider: string; model: string; apiKey?: string; baseUrl?: string }> {
+     const mainWindow = ElectronMainWindow.getInstance().getWindow();
+     let llmConfig: any = null;
+@@ -69,18 +103,27 @@ export class AiController extends BaseApiController {
+               apiKey: parsed.provider === 'berrytrace' ? userToken : (parsed.apiKey || undefined),
+               baseUrl: parsed.baseUrl || undefined,
+             };
++            // 同步写入主进程 cache，供 voice-only 模式 / 主窗口不存在时使用
++            cache.set(CacheAttribute.agentLlmConfig, { provider: parsed.provider, model: parsed.model || '', baseUrl: parsed.baseUrl || undefined });
+           }
+         }
+       } catch (err) {
+         console.warn('[AiController] Failed to retrieve LLM settings from main window:', err);
+       }
++    } else {
++      // 主窗口不存在（voice-only 模式）→ 从主进程 cache fallback 读取
++      const cached = cache.get(CacheAttribute.agentLlmConfig) as { provider: string; model: string; apiKey?: string; baseUrl?: string } | undefined;
++      if (cached?.provider) {
++        console.log('[AiController] No mainWindow — reading LLM config from main process cache (voice-only fallback)');
++        llmConfig = { ...cached };
++      }
+     }
+ 
+     if (!llmConfig) {
+       llmConfig = { provider: 'berrytrace', model: (import.meta as any).env.VITE_BERRYTRACE_MODEL };
+     }
+ 
+-    if (llmConfig.provider === 'berrytrace') {
++    if (llmConfig.provider === 'berrytrace' && !llmConfig.apiKey) {
+       try {
+         const { ElectronAuthManager } = await import('../../services/auth-manager');
+         const token = ElectronAuthManager.getInstance().getToken();
+@@ -107,6 +150,8 @@ export class AiController extends BaseApiController {
+       console.warn('[AiController] Failed to retrieve default LLM config:', e);
+     }
+ 
++    let aiServersRaw: unknown[] | null = null;
++
+     if (mainWindow && !mainWindow.isDestroyed()) {
+       try {
+         const aiServersJson = await mainWindow.webContents.executeJavaScript(`
+@@ -120,26 +165,38 @@ export class AiController extends BaseApiController {
+         `);
+ 
+         if (aiServersJson) {
+-          const aiServers = JSON.parse(aiServersJson);
+-          if (Array.isArray(aiServers)) {
+-            const { ElectronAuthManager } = await import('../../services/auth-manager');
+-            const userToken = ElectronAuthManager.getInstance().getToken() || undefined;
+-
+-            for (const s of aiServers) {
+-              if (s.provider) {
+-                configs.push({
+-                  provider: s.provider,
+-                  model: s.model || '',
+-                  apiKey: s.provider === 'berrytrace' ? userToken : (s.apiKey || undefined),
+-                  baseUrl: s.baseUrl || undefined,
+-                });
+-              }
+-            }
++          const parsed = JSON.parse(aiServersJson);
++          if (Array.isArray(parsed)) {
++            aiServersRaw = parsed;
++            // 同步写入主进程 cache
++            cache.set(CacheAttribute.agentAiServers, parsed);
+           }
+         }
+       } catch (err) {
+         console.warn('[AiController] Failed to retrieve all LLM settings from main window:', err);
+       }
++    } else {
++      // voice-only fallback
++      const cached = cache.get(CacheAttribute.agentAiServers) as unknown[] | undefined;
++      if (Array.isArray(cached)) {
++        console.log('[AiController] No mainWindow — reading AI servers from cache (voice-only fallback)');
++        aiServersRaw = cached;
++      }
++    }
++
++    if (aiServersRaw) {
++      const { ElectronAuthManager } = await import('../../services/auth-manager');
++      const userToken = ElectronAuthManager.getInstance().getToken() || undefined;
++      for (const s of aiServersRaw as any[]) {
++        if (s.provider) {
++          configs.push({
++            provider: s.provider,
++            model: s.model || '',
++            apiKey: s.provider === 'berrytrace' ? userToken : (s.apiKey || undefined),
++            baseUrl: s.baseUrl || undefined,
++          });
++        }
++      }
+     }
+ 
+     return configs;
+@@ -272,6 +329,8 @@ export class AiController extends BaseApiController {
+       }
+     }
+ 
++    console.log(`[AiController] Received — [Trace:Main:ai_runAgentTask] llmConfig:`, JSON.stringify(llmConfig));
++
+     const sessionId = options.sessionId || `plugin_agent_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+     const payload = {
+       sessionId,
+@@ -305,6 +364,37 @@ export class AiController extends BaseApiController {
+     return null;
+   }
+ 
++  /**
++   * 预热 Agent 内核会话进程。
++   */
++  async ai_prewarmAgentSession(options: { agentId: string; model?: string; sessionId?: string }): Promise<null> {
++    if (!options || !options.agentId) return null;
++
++    const pm = PluginManager.getInstance();
++    const kernelPluginId = pm.getAgentKernelPluginId();
++    if (!kernelPluginId) return null;
++
++    pm.emitToBackgroundPlugin(kernelPluginId, 'agent:prewarm_session', options);
++    console.log(`[AiController] Forwarded agent:prewarm_session to kernel plugin: ${kernelPluginId}`);
++    return null;
++  }
++
++  /**
++   * 离开 Agent 内核会话。
++   */
++  async ai_leaveAgentSession(options: { sessionId: string } | string): Promise<null> {
++    const sessionId = typeof options === 'string' ? options : options?.sessionId;
++    if (!sessionId) return null;
++
++    const pm = PluginManager.getInstance();
++    const kernelPluginId = pm.getAgentKernelPluginId();
++    if (!kernelPluginId) return null;
++
++    pm.emitToBackgroundPlugin(kernelPluginId, 'agent:session_leave', { sessionId });
++    console.log(`[AiController] Forwarded agent:session_leave to kernel plugin: ${kernelPluginId}`);
++    return null;
++  }
++
+   /**
+    * 查询 Agent 内核状态。
+    * @returns { isRunning, pluginId, activeSessions }
+@@ -421,6 +511,118 @@ export class AiController extends BaseApiController {
+     return this.retrieveLlmConfig();
+   }
+ 
++  /**
++   * 获取所有已注册的 AI 服务商及其模型列表。
++   */
++  async ai_getAiServers(): Promise<unknown> {
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      try {
++        const serversJson = await mainWindow.webContents.executeJavaScript(`localStorage.getItem('agent-ai-servers')`);
++        if (serversJson) {
++          const parsed = JSON.parse(serversJson);
++          cache.set(CacheAttribute.agentAiServers, parsed); // 回写 cache
++          return parsed;
++        }
++      } catch (err) {
++        console.warn('[AiController] Failed to retrieve AI servers from main window:', err);
++      }
++    }
++    // voice-only fallback
++    const cached = cache.get(CacheAttribute.agentAiServers);
++    if (cached) return cached;
++    return [];
++  }
++
++  /**
++   * 获取按能力分配的服务商与模型映射（供 cline-agent 等插件读取当前 capability→{serverId, model} 配置）
++   */
++  async ai_getCapabilityModels(): Promise<unknown> {
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      try {
++        // capability 映射存储在 agentStore 的 capabilityModels 字段，通过 localStorage 的 agent-store 读取
++        const storeJson = await mainWindow.webContents.executeJavaScript(`localStorage.getItem('agent-store')`);
++        if (storeJson) {
++          const state = JSON.parse(storeJson);
++          const models = state?.state?.capabilityModels || {};
++          cache.set(CacheAttribute.agentCapabilityModels, models); // 回写 cache
++          return models;
++        }
++      } catch (err) {
++        console.warn('[AiController] Failed to retrieve capability models:', err);
++      }
++    }
++    // voice-only fallback
++    const cached = cache.get(CacheAttribute.agentCapabilityModels);
++    if (cached) return cached;
++    return {};
++  }
++
++  async ai_getServerLlmConfig(options: string | { serverId: string }): Promise<unknown> {
++    const serverId = typeof options === 'string' ? options : options?.serverId;
++    if (!serverId) throw new Error('serverId parameter is required');
++
++    // 优先从主窗口读，fallback 到 cache（voice-only 模式）
++    let aiServersRaw: any[] | null = null;
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      try {
++        const serversJson = await mainWindow.webContents.executeJavaScript(`localStorage.getItem('agent-ai-servers')`);
++        if (serversJson) {
++          const parsed = JSON.parse(serversJson);
++          if (Array.isArray(parsed)) {
++            aiServersRaw = parsed;
++            cache.set(CacheAttribute.agentAiServers, parsed);
++          }
++        }
++      } catch (err) {
++        console.warn('[AiController] Failed to retrieve server config from main window:', err);
++      }
++    } else {
++      const cached = cache.get(CacheAttribute.agentAiServers) as any[] | undefined;
++      if (Array.isArray(cached)) aiServersRaw = cached;
++    }
++
++    if (aiServersRaw) {
++      const server = aiServersRaw.find((s: any) => s.id === serverId || s.provider === serverId);
++      if (server) {
++        const { ElectronAuthManager } = await import('../../services/auth-manager');
++        const userToken = ElectronAuthManager.getInstance().getToken() || undefined;
++        return {
++          provider: server.provider,
++          model: server.model,
++          apiKey: server.provider === 'berrytrace' ? userToken : (server.apiKey || undefined),
++          baseUrl: server.baseUrl || (server.provider === 'berrytrace' ? 'https://ai.getdear.cn/v1' : undefined),
++        };
++      }
++    }
++    // Fallback to active default config
++    return this.retrieveLlmConfig();
++  }
++
++  /**
++   * 获取渲染进程中的 Voice Settings
++   */
++  async ai_getVoiceSettings(): Promise<unknown> {
++    const mainWindow = ElectronMainWindow.getInstance().getWindow();
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      try {
++        const settingsJson = await mainWindow.webContents.executeJavaScript(`localStorage.getItem('berrytrace-voice-settings')`);
++        if (settingsJson) {
++          const parsed = JSON.parse(settingsJson);
++          const settings = parsed?.state?.settings || {};
++          // voice-only 模式下，voice-agents 插件自身持有 settings，无需 cache 兜底
++          return settings;
++        }
++      } catch (err) {
++        console.warn('[AiController] Failed to retrieve voice settings from main window:', err);
++      }
++    }
++    // voice-only 模式：voice settings 由 voice-agents 插件直接管理，返回空让插件侧处理
++    return {};
++  }
++
+   // ── mcp namespace ──
+ 
+   async ["mcp_tool-response"](options: { token: number; success: boolean; result: unknown; error?: string }): Promise<null> {
+@@ -449,13 +651,6 @@ export class AiController extends BaseApiController {
+     return null;
+   }
+ 
+-  /**
+-   * 列出所有已注册的 MCP 工具。
+-   */
+-  async mcp_listTools(): Promise<unknown> {
+-    return McpHost.getInstance().listTools();
+-  }
+-
+   /**
+    * 注册系统提示词（注入到 AI Agent 的 system prompt 中）。
+    * @param callerPluginId 调用插件 ID
+@@ -504,4 +699,74 @@ export class AiController extends BaseApiController {
+       return { isError: true, content: [{ type: 'text', text: errMsg }] };
+     }
+   }
++
++  async mcp_updateScopeToken(params: { token: string; allowedTools?: string[]; allowedPlugins?: string[] }): Promise<boolean> {
++    try {
++      const { McpGateway } = require('../mcp-gateway');
++      McpGateway.getInstance().updateScopeToken(params.token, {
++        allowedTools: params.allowedTools,
++        allowedPlugins: params.allowedPlugins,
++      });
++      return true;
++    } catch (err) {
++      console.error('[AiController] mcp_updateScopeToken failed:', err);
++      return false;
++    }
++  }
++
++  async mcp_listProfiles(): Promise<unknown[]> {
++    try {
++      const { McpGateway } = require('../mcp-gateway');
++      return McpGateway.getInstance().listProfiles();
++    } catch (err) {
++      console.error('[AiController] mcp_listProfiles failed:', err);
++      return [];
++    }
++  }
++
++  async mcp_saveProfile(profile: any): Promise<unknown> {
++    try {
++      const { McpGateway } = require('../mcp-gateway');
++      return McpGateway.getInstance().saveProfile(profile);
++    } catch (err) {
++      console.error('[AiController] mcp_saveProfile failed:', err);
++      throw err;
++    }
++  }
++
++  async mcp_deleteProfile(id: string): Promise<boolean> {
++    try {
++      const { McpGateway } = require('../mcp-gateway');
++      return McpGateway.getInstance().deleteProfile(id);
++    } catch (err) {
++      console.error('[AiController] mcp_deleteProfile failed:', err);
++      return false;
++    }
++  }
++
++  async mcp_listTools(): Promise<unknown[]> {
++    try {
++      const { McpHost } = require('../mcp-host');
++      const REDUNDANT = new Set([
++        'read_file', 'read_files', 'view_file', 'write_file', 'edit_file',
++        'execute_command', 'run_command', 'run_commands', 'bash', 'sh', 'shell',
++        'editor', 'apply_patch', 'execute_bash', 'execute_script'
++      ]);
++      const tools = McpHost.getInstance().listTools();
++      return tools
++        .filter((t: any) => !REDUNDANT.has(t.name.toLowerCase()))
++        .map((t: any) => ({
++          name: t.name,
++          pluginId: t.pluginId || 'system',
++          description: t.description,
++          inputSchema: t.inputSchema,
++          displayName: t.displayName,
++          userQueries: t.userQueries,
++          isDynamic: t.isDynamic,
++        }));
++    } catch (err) {
++      console.error('[AiController] mcp_listTools failed:', err);
++      return [];
++    }
++  }
+ }

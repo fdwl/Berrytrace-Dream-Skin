@@ -1,0 +1,135 @@
+import { join } from 'path'
+import * as os from 'os'
+import Store from 'electron-store'
+import { app, safeStorage } from 'electron'
+import type { ICache } from '../../src/config/ICache'
+
+// ── 在 electron-store 创建之前，锁死全英文路径 ──
+// 时机必须在 app.name 改为中文之前，否则 Chromium 的 session / crash 机制会
+// 自动派生中文目录。
+const isDev = !!process.env.VITE_DEV_SERVER_URL
+const folderName = isDev ? 'berrytrace-dev' : 'berrytrace'
+
+let appDataPath = ''
+try {
+  if (app && typeof app.getPath === 'function') {
+    appDataPath = app.getPath('appData')
+    const englishUserPath = join(appDataPath, folderName)
+    app.setPath('userData', englishUserPath)
+    app.setPath('sessionData', join(englishUserPath, 'Session Storage'))
+    app.setPath('crashDumps', join(englishUserPath, 'Crashpad'))
+  }
+} catch (e) {
+  // 非 Electron 主进程环境
+}
+
+if (!appDataPath) {
+  appDataPath = join(process.env.HOME || os.homedir(), '.config')
+}
+const englishUserPath = join(appDataPath, folderName)
+
+// Helper to encrypt a string using Electron's native safeStorage API
+function encryptValue(value: string | null | undefined): string | null | undefined {
+  if (!value) return value
+  try {
+    if (app && typeof app.isReady === 'function' && app.isReady() && safeStorage && typeof safeStorage.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+      const buffer = safeStorage.encryptString(value)
+      return `_enc_:${buffer.toString('base64')}`
+    }
+  } catch (e) {
+    console.error('[DbCache] Encryption failed:', e)
+  }
+  return value
+}
+
+// Helper to decrypt a string using Electron's native safeStorage API
+function decryptValue(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  if (!value.startsWith('_enc_:')) return value
+  try {
+    if (app && typeof app.isReady === 'function' && app.isReady() && safeStorage && typeof safeStorage.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+      const encryptedBase64 = value.substring(6)
+      const buffer = Buffer.from(encryptedBase64, 'base64')
+      return safeStorage.decryptString(buffer)
+    }
+  } catch (e) {
+    console.error('[DbCache] Decryption failed:', e)
+  }
+  return value
+}
+
+class ElectronCache implements ICache {
+  private store: Store
+  private cache: Map<string, unknown> = new Map()
+
+  constructor() {
+    this.store = new Store({
+      cwd: englishUserPath,
+      name: folderName,
+    })
+  }
+
+  get<T = unknown>(key: string, defaultValue?: T): T {
+    const keyStr = String(key)
+    if (this.cache.has(keyStr)) {
+      return this.cache.get(keyStr) as T
+    }
+    let value = this.store.get(keyStr, defaultValue)
+    if (keyStr === 'authToken' || keyStr === 'respLogin') {
+      const decrypted = decryptValue(value)
+      // Only cache in memory if we successfully decrypted it (or it wasn't encrypted in store)
+      if (typeof decrypted !== 'string' || !decrypted.startsWith('_enc_:')) {
+        if (decrypted !== undefined) {
+          this.cache.set(keyStr, decrypted)
+        }
+      }
+      return decrypted as T
+    }
+    if (value !== undefined) {
+      this.cache.set(keyStr, value)
+    }
+    return value as T
+  }
+
+  set<T = unknown>(key: string, value: T): void {
+    const keyStr = String(key)
+    // Cache the decrypted plain value in memory for fast lookup
+    this.cache.set(keyStr, value)
+    
+    let storeValue: unknown = value
+    if ((keyStr === 'authToken' || keyStr === 'respLogin') && typeof value === 'string') {
+      storeValue = encryptValue(value)
+    }
+    this.store.set(keyStr, storeValue)
+  }
+
+  remove(key: string): void {
+    const keyStr = String(key)
+    this.cache.delete(keyStr)
+    this.store.delete(keyStr)
+  }
+
+  has(key: string): boolean {
+    const keyStr = String(key)
+    return this.cache.has(keyStr) || this.store.has(keyStr)
+  }
+}
+
+export { ElectronCache }
+export const cache: ICache = new ElectronCache()
+
+export function cacheGet<T = unknown>(key: string, defaultValue?: T): T {
+  return cache.get(key, defaultValue)
+}
+
+export function cacheSet<T = unknown>(key: string, value: T): void {
+  cache.set(key, value)
+}
+
+export function cacheDelete(key: string): void {
+  cache.remove(key)
+}
+
+export function cacheHas(key: string): boolean {
+  return cache.has(key)
+}

@@ -1,0 +1,300 @@
+diff --git a/plugins-dev/npx-tools/skills/plugin-creator/references/06-contributions.md b/plugins-dev/npx-tools/skills/plugin-creator/references/06-contributions.md
+index 3d55f61..7000463 100644
+--- a/plugins-dev/npx-tools/skills/plugin-creator/references/06-contributions.md
++++ b/plugins-dev/npx-tools/skills/plugin-creator/references/06-contributions.md
+@@ -4,8 +4,8 @@
+ 
+ ## 速查
+ 
+-| 在 `plugin.json` 声明 | 效果 | 状态 |
+-|-----------------------|------|:---:|
++| 在 `plugin.json` / 生成文件中声明 | 效果 | 状态 |
++|----------------------------------|------|:---:|
+ | `contributes.events` | 声明监听/发射事件，自动唤醒插件 | ✅ |
+ | `contributes.selectionMenuItems` | 添加划词菜单按钮 | ✅ |
+ | `contributes.shortcutActions` | 添加快捷动作 | ✅ |
+@@ -13,12 +13,106 @@
+ | `contributes.workspaceViews` | 添加工作区标签页 | ✅ |
+ | `contributes.commands` | 添加命令面板命令 | ✅ |
+ | `contributes.folderContextMenuItems` | 添加文件夹右键菜单 | ✅ |
++| `contributes.tabCreateMenuItems` | 添加 Tab「+」菜单项（支持生成式声明） | ✅ |
++| `contributes.subagents` | 声明子代理（支持生成式声明） | ✅ |
+ | `fileAssociations` | 绑定文件类型 | ✅ |
+ | `activationEvents` | 控制启动时机 | ✅ |
+ | `permissions` | 声明权限 | ✅ |
+-| `contributes.workspaceViews` | 添加工作区标签页 | 📋 |
+-| `contributes.commands` | 添加命令面板命令 | 📋 |
+-| `contributes.folderContextMenuItems` | 添加文件夹右键菜单 | 📋 |
++
++---
++
++## 🔑 核心概念：两种声明模式
++
++### 模式 A — 静态声明（plugin.json）
++
++适用于**编写插件时已知**的固定贡献项。写在 `plugin.json` 的 `contributes` 下，宿主扫描后直接注册。
++
++### 模式 B — 生成式声明（运行时缓存）
++
++适用于**需要运行时才能确定**的贡献项（例如：扫描用户系统 PATH 中安装了哪些 CLI 工具、探测本地服务端口、读取用户配置后动态生成菜单项）。
++
++**核心思路**：把运行时发现的结果"落盘"为一个 JSON 文件，宿主下次启动时像读 `plugin.json` 一样读取并合并它，从而让这些动态发现的贡献项在**插件渲染进程未加载时也能生效**。
++
++#### 通用开发步骤
++
++```
++┌─ 宿主/工具进程 activate() ──────────────────────────────────────────┐
++│  1. 执行运行时探测（扫描 PATH / 读取配置 / 请求网络 ...）             │
++│  2. 构建 contributions 对象（tabCreateMenuItems / subagents / ...）  │
++│  3. 写入 {pluginDataDir}/.berrytrace/declared-contributions.json    │
++└─────────────────────────────────────────────────────────────────────┘
++           ↓（下次应用启动）
++┌─ plugin-scanner.scanPluginFolder() ────────────────────────────────┐
++│  读取 plugin.json → 读取 declared-contributions.json → 深度合并     │
++└─────────────────────────────────────────────────────────────────────┘
++           ↓
++┌─ registerStaticContributions() ────────────────────────────────────┐
++│  tabCreateMenuItems → tabCreateMenuStore（Tab「+」菜单即时可见）     │
++│  subagents          → getDeclaredSubAgents（@ 提及列表）            │
++└─────────────────────────────────────────────────────────────────────┘
++```
++
++#### 最小实现模板
++
++```typescript
++// activate() — 宿主/工具进程，不依赖渲染进程
++export async function activate() {
++  // 1. 运行时探测
++  const discovered = await myRuntimeDetection();
++
++  // 2. 构建声明内容
++  const contributions = {
++    contributes: {
++      tabCreateMenuItems: discovered.map(item => ({
++        id: `my-plugin:${item.id}`,
++        label: item.name,
++        description: item.launchCmd,
++        category: 'agent',          // 或 'system' / 'ssh' / 自定义字符串
++        iconName: 'Bot',            // lucide-react 图标名
++        keywords: [item.id, 'cli'],
++        tabData: {
++          tabType: 'system.terminal',
++          title: `Agent: ${item.name}`,
++          cliBackend: item.id,
++          binaryPath: item.binaryPath,
++          launchCmd: item.launchCmd,
++        },
++      })),
++      subagents: discovered.map(item => ({
++        type: item.id,
++        name: item.name,
++        description: item.description,
++      })),
++    },
++  };
++
++  // 3. 写入生成式声明文件
++  const dataDir = await sdk.filesystem.getSafePath('pluginData');
++  await sdk.filesystem.mkdir(`${dataDir}/.berrytrace`);
++  await sdk.filesystem.writeFile(
++    `${dataDir}/.berrytrace/declared-contributions.json`,
++    JSON.stringify(contributions, null, 2),
++  );
++
++  // 4. 同时广播事件，让已加载的渲染进程即时刷新（双保险）
++  sdk.events.emit('my-plugin:discovered', { items: discovered });
++}
++```
++
++#### 运行时即时刷新（可选，双保险）
++
++在渲染进程监听广播事件，调用 `sdk.workspace.registerTabMenuItem` 即时更新当前会话的菜单，无需重启：
++
++```typescript
++// renderer.ts — onload()
++sdk.events.on('my-plugin:discovered', (data) => {
++  data.items.forEach(item => {
++    sdk.workspace.registerTabMenuItem({ id: `my-plugin:${item.id}`, ... });
++  });
++});
++```
++
++> **两者关系**：生成式声明文件 = "持久化 + 跨启动"；运行时注册 = "即时生效"。推荐两者并用。
+ 
+ ---
+ 
+@@ -105,6 +199,38 @@
+ 
+ ---
+ 
++## 3b. keybindings — 快捷键与硬件手势 ✅
++
++```json
++{
++  "contributes": {
++    "keybindings": [
++      {
++        "command": "com.berrytrace.plugin.voice-agents:start-listening",
++        "title": "Voice Agent 对话唤醒",
++        "key": "Option+Space",
++        "gesture": "combo:fn+space",
++        "scope": "global",
++        "when": "global"
++      }
++    ]
++  }
++}
++```
++
++| 字段 | 类型 | 说明 |
++|------|------|------|
++| `command` | `string` | 绑定的命令 ID |
++| `title` | `string` | 快捷键说明标题 |
++| `key` / `mac` / `win` | `string` | 默认快捷键 (如 `"Option+Space"`) |
++| `gesture` | `string` | 绑定的 C++ / 硬件手势 (如 `"combo:fn+space"`) |
++| `scope` | `"global"` \| `"in-app"` \| `"editor"` | **作用域分类**：`"global"` (OS 系统级全局热键)、`"in-app"` (仅应用聚焦时)、`"editor"` (特定视图上下文) |
++| `when` | `string` | 触发上下文条件表达式 (如 `"editorTextFocus"`, `"global"`) |
++
++宿主在启动与插件挂载时加载默认 `keybindings`，并通过用户本地缓存 (`user_keybindings.json`) 形成最高强度的 SSOT 覆盖机制。
++
++---
++
+ ## 4. ribbonIcons — 侧边栏图标 ✅
+ 
+ 在侧边栏添加图标按钮，支持左键和右键操作：
+@@ -252,3 +378,135 @@
+ ## 📋 计划中的贡献项
+ 
+ 无（所有声明式贡献项已实现）
++
++---
++
++## 10. tabCreateMenuItems — Tab「+」菜单项 ✅
++
++在 FlexWorkspace Tab 栏的「+」下拉菜单中注册条目，**无需插件渲染进程加载即可显示**。  
++同时支持两种注册路径：
++
++### 方式 A：静态写入 plugin.json（已知固定项）
++
++```json
++{
++  "contributes": {
++    "tabCreateMenuItems": [
++      {
++        "id": "my-plugin:open-panel",
++        "label": "我的面板",
++        "description": "打开我的工具面板",
++        "category": "agent",
++        "iconName": "Bot",
++        "keywords": ["panel", "tool"],
++        "tabData": {
++          "tabType": "system.terminal",
++          "title": "我的面板",
++          "cliBackend": "my-cli",
++          "binaryPath": "/usr/local/bin/my-cli",
++          "launchCmd": "my-cli --yolo"
++        }
++      }
++    ]
++  }
++}
++```
++
++| 字段 | 说明 |
++|------|------|
++| `id` | 菜单项唯一 ID |
++| `label` | 显示名称 |
++| `description` | 副标题（如启动命令） |
++| `category` | 分组：`'system' \| 'ssh' \| 'agent' \| string` |
++| `iconName` | lucide-react 图标名，如 `'Bot'` |
++| `keywords` | 搜索关键词数组 |
++| `enabled` | 是否启用（默认 `true`） |
++| `order` | 排序权重（数字越小越靠前） |
++| `tabData.tabType` | 打开的标签页类型（如 `system.terminal`） |
++| `tabData.title` | 标签页标题 |
++| `tabData.cliBackend` | CLI 后端标识符 |
++| `tabData.binaryPath` | 可执行文件完整路径 |
++| `tabData.launchCmd` | 启动命令（传给终端） |
++
++### 方式 B：生成式声明（运行时动态发现后写入）
++
++适用于**运行时才能确定**的条目（如 CLI 工具 PATH 扫描结果）。  
++插件在宿主进程（`activate()`）中检测完成后，将结果写入**生成式声明文件**：
++
++```typescript
++// 在 activate() 中（宿主/工具进程，不依赖渲染进程）
++const dataDir = await sdk.filesystem.getSafePath('pluginData');  // 插件数据目录
++await sdk.filesystem.mkdir(`${dataDir}/.berrytrace`);
++
++const contributions = {
++  contributes: {
++    tabCreateMenuItems: [
++      {
++        id: 'my-plugin:cli-tool',
++        label: 'My CLI Tool',
++        description: '$ my-tool --yolo',
++        category: 'agent',
++        iconName: 'Bot',
++        keywords: ['my-tool', 'agent', 'cli'],
++        tabData: {
++          tabType: 'system.terminal',
++          title: 'Agent: My CLI Tool',
++          cliBackend: 'my-tool',
++          binaryPath: '/usr/local/bin/my-tool',
++          launchCmd: 'my-tool --yolo',
++        },
++      }
++    ],
++    subagents: [
++      { type: 'my-tool', name: 'My CLI Tool', description: 'My AI Agent CLI', binaryPath: '/usr/local/bin/my-tool' }
++    ]
++  }
++};
++
++await sdk.filesystem.writeFile(
++  `${dataDir}/.berrytrace/declared-contributions.json`,
++  JSON.stringify(contributions, null, 2),
++);
++```
++
++**工作原理**：
++- `plugin-scanner` 在启动时读取 `plugin.json` 后，**额外读取** `{pluginDataDir}/.berrytrace/declared-contributions.json`，深度合并 `contributes` 字段
++- 合并后的 manifest 传给 `registerStaticContributions`，在渲染侧写入 `tabCreateMenuStore`
++- **即使插件渲染进程从未加载**，Tab「+」菜单也能在下次启动后显示这些项目
++- 同时仍保留原有的运行时注册通道（渲染进程 `sdk.workspace.registerTabMenuItem`）用于即时刷新
++
++---
++
++## 11. subagents — 声明子代理 ✅
++
++声明插件提供的子代理规格，供 `system.getSubagentsList` 返回，同时出现在 AgentChat @ 提及列表。
++
++### 静态声明（plugin.json）
++
++```json
++{
++  "contributes": {
++    "subagents": [
++      {
++        "type": "my-agent",
++        "name": "My AI Agent",
++        "description": "专注于代码审查的 AI 代理",
++        "systemPrompt": "You are a code review expert.",
++        "allowedTools": ["read_file", "list_dir"]
++      }
++    ]
++  }
++}
++```
++
++| 字段 | 说明 |
++|------|------|
++| `type` | 子代理唯一类型标识 |
++| `name` | 显示名称 |
++| `description` | 描述，出现在 @ 提及下拉 |
++| `systemPrompt` | 系统提示词（可选） |
++| `allowedTools` | 允许使用的工具列表（可选） |
++
++### 动态生成（生成式声明文件）
++
++与 `tabCreateMenuItems` 同理，写入 `.berrytrace/declared-contributions.json` 的 `contributes.subagents` 数组即可被宿主声明式读取。CLI 扫描类插件推荐此方式。

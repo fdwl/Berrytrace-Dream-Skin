@@ -1,0 +1,290 @@
+diff --git a/electron/services/fn-voice-input.ts b/electron/services/fn-voice-input.ts
+deleted file mode 100644
+index b57ba0a..0000000
+--- a/electron/services/fn-voice-input.ts
++++ /dev/null
+@@ -1,284 +0,0 @@
+-import { ipcMain, BrowserWindow } from 'electron'
+-import { getMouseHook } from './mouse-hook'
+-import { ElectronFnVoicePanelWindow } from '../windows/fn-voice-panel'
+-import { cache, CacheAttribute } from '../config/index'
+-import { PluginManager } from '../plugins/plugin-manager'
+-import { PluginLauncher } from '../plugins/plugin-launcher'
+-
+-let isRecording = false
+-let warningTimer: NodeJS.Timeout | null = null
+-let isInitialized = false
+-let currentPanelMode = 'idle'
+-
+-export function startFnVoiceInput() {
+-  if (isInitialized) {
+-    console.log('[FnVoiceInput] Service already initialized, skipping.')
+-    return
+-  }
+-  isInitialized = true
+-  console.log('[FnVoiceInput] Initializing Fn Voice Input service...')
+-
+-  // Register IPC handlers
+-  ipcMain.handle('fn-voice-panel:close', () => {
+-    console.log('[FnVoiceInput] Close panel requested by renderer')
+-    isRecording = false
+-    currentPanelMode = 'idle'
+-    const panelWin = ElectronFnVoicePanelWindow.getInstance()
+-    panelWin.hidePanel()
+-    stopVoiceAssistantSpeechServers()
+-  })
+-
+-  ipcMain.handle('fn-voice-panel:set-mode', (_event, mode: string) => {
+-    console.log(`[FnVoiceInput] Panel mode set to: ${mode}`)
+-    currentPanelMode = mode
+-  })
+-
+-  ipcMain.handle('fn-voice-panel:set-size', (_event, size: { width: number; height: number }) => {
+-    console.log(`[FnVoiceInput] Panel size requested: ${size.width}x${size.height}`)
+-    const panelWin = ElectronFnVoicePanelWindow.getInstance()
+-    panelWin.resizePanel(size.height)
+-  })
+-
+-  // voice 插件模型状态查询：转发到 voice 插件，插件会重新 emit voice:model-status
+-  ipcMain.handle('voice:get-model-status', async () => {
+-    try {
+-      const launcher = PluginLauncher.getInstance()
+-      launcher.emitToBackgroundPlugin('com.berrytrace.plugin.voice-assistant', 'voice:get-model-status', {})
+-      // 插件收到后会 emit voice:model-status → 主进程转发到 renderer 为 plugin:event:voice:model-status
+-      return { ok: true }
+-    } catch (err) {
+-      console.error('[FnVoiceInput] Failed to query voice model status:', err)
+-      return { ok: false, error: String(err) }
+-    }
+-  })
+-}
+-
+-export function stopFnVoiceInput() {
+-  console.log('[FnVoiceInput] Stopping Fn Voice Input service...')
+-  isRecording = false
+-  currentPanelMode = 'idle'
+-  if (warningTimer) {
+-    clearTimeout(warningTimer)
+-    warningTimer = null
+-  }
+-  try {
+-    const panelWin = ElectronFnVoicePanelWindow.getInstance()
+-    panelWin.hidePanel()
+-  } catch (err) {
+-    console.error('[FnVoiceInput] Failed to hide panel during stop:', err)
+-  }
+-  stopVoiceAssistantSpeechServers()
+-}
+-
+-function loadAndWarmVoiceAssistant() {
+-  console.log('[FnVoiceInput:loadAndWarmVoiceAssistant] Loading and warming up voice-assistant plugin...')
+-  PluginManager.getInstance().ensurePluginLoaded('com.berrytrace.plugin.voice-assistant')
+-    .then(() => {
+-      console.log('[FnVoiceInput:loadAndWarmVoiceAssistant] com.berrytrace.plugin.voice-assistant loaded.')
+-      // voice 插件 activate() 中已自检模型状态并自行处理下载，不再需要发送 voice:prewarm 事件
+-      const launcher = PluginLauncher.getInstance()
+-      launcher.emitToBackgroundPlugin('com.berrytrace.plugin.voice-assistant', 'voice:orb-state', { visible: true })
+-    })
+-    .catch((err) => {
+-      console.error('[FnVoiceInput:loadAndWarmVoiceAssistant] Failed to ensure voice-assistant is loaded:', err)
+-    })
+-}
+-
+-function stopVoiceAssistantSpeechServers() {
+-  console.log('[FnVoiceInput:stopVoiceAssistantSpeechServers] Notifying voice-assistant plugin to stop/idle speech servers...')
+-  try {
+-    const launcher = PluginLauncher.getInstance()
+-    launcher.emitToBackgroundPlugin('com.berrytrace.plugin.voice-assistant', 'voice:orb-state', { visible: false })
+-  } catch (err) {
+-    console.error('[FnVoiceInput:stopVoiceAssistantSpeechServers] Failed to emit voice:orb-state (visible: false) event:', err)
+-  }
+-}
+-
+-function stashActiveAppPid() {
+-  try {
+-    const hook = getMouseHook()
+-    if (hook) {
+-      const appId = hook.getFrontmostAppId ? hook.getFrontmostAppId() : '';
+-      const pid = hook.getFrontmostAppPid ? hook.getFrontmostAppPid() : '';
+-      console.log(`[FnVoiceInput:stashActiveAppPid] Stashing active application - BundleId: "${appId}", PID: "${pid}"`);
+-      if (pid) {
+-        cache.set('lastActiveAppPid', pid)
+-        return
+-      }
+-    }
+-  } catch (err) {
+-    console.error('[FnVoiceInput:stashActiveAppPid] Failed to stash active app PID:', err)
+-  }
+-  cache.set('lastActiveAppPid', null)
+-}
+-
+-export async function handleFnKeyEvent(event: string) {
+-  // If onboarding intercept mode is active, do not run the real global voice input
+-  const onboardingIntercept = (cache.get('_onboardingInterceptMode') as boolean) ?? false
+-  if (onboardingIntercept) {
+-    return
+-  }
+-
+-  const fnVoiceEnabled = (cache.get(CacheAttribute.prefFnVoiceEnabled) as boolean) ?? true
+-  if (!fnVoiceEnabled) {
+-    console.log('[FnVoiceInput] Fn Voice Input feature is disabled by settings.')
+-    return
+-  }
+-
+-  // Intercept Fn key press to copy and close in copy-fallback mode
+-  if (currentPanelMode === 'copy-fallback' && (event === 'short_press' || event === 'long_press_start')) {
+-    console.log('[FnVoiceInput] Fn pressed during copy-fallback. Triggering copy-and-close in renderer.')
+-    const panelWin = ElectronFnVoicePanelWindow.getInstance()
+-    const win = panelWin.getWindow()
+-    if (win && !win.isDestroyed()) {
+-      win.webContents.send('fn-voice-panel:action-copy-close')
+-    }
+-    return
+-  }
+-
+-  // Check if our own Electron window is focused
+-  let isInput = false
+-  const focusedWin = BrowserWindow.getFocusedWindow()
+-  if (focusedWin) {
+-    const winTitle = focusedWin.getTitle()
+-    const winUrl = focusedWin.webContents.getURL()
+-    console.log(`[FnVoiceInput:focus-debug] Focused Electron window - title="${winTitle}", url="${winUrl}"`)
+-    try {
+-      const jsResult = await focusedWin.webContents.executeJavaScript(`
+-        (() => {
+-          let el = document.activeElement;
+-          let shadowPath = false;
+-          while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+-            el = el.shadowRoot.activeElement;
+-            shadowPath = true;
+-          }
+-          if (!el) return JSON.stringify({ isInput: false, activeElement: null });
+-          const tagName = el.tagName.toLowerCase();
+-          const contentEditable = el.contentEditable || 'false';
+-          const role = el.getAttribute('role') || '';
+-          const elementId = el.id || '';
+-          const className = (el.className && typeof el.className === 'string') ? el.className.substring(0, 80) : '';
+-          let isInput = false;
+-          if (tagName === 'input' || tagName === 'textarea') isInput = true;
+-          else if (contentEditable === 'true' || contentEditable === 'plaintext-only') isInput = true;
+-          else if (role === 'textbox' || role === 'searchbox' || role === 'combobox') isInput = true;
+-          let parent = el;
+-          while (parent && parent !== document.body) {
+-            if (parent.contentEditable === 'true' || parent.contentEditable === 'plaintext-only') {
+-              isInput = true;
+-              break;
+-            }
+-            parent = parent.parentElement;
+-          }
+-          return JSON.stringify({ isInput, activeElement: { tagName, contentEditable, role, id: elementId, className, shadowPath } });
+-        })()
+-      `)
+-      const parsed = JSON.parse(jsResult)
+-      isInput = parsed.isInput
+-      console.log('[FnVoiceInput:focus-debug] JS input detection result:', JSON.stringify({ isInput, activeElement: parsed.activeElement }))
+-    } catch (err) {
+-      console.error('[FnVoiceInput:focus-debug] Failed to execute JS focus check:', err)
+-    }
+-  } else {
+-    // Fallback to native AX hook check for external windows
+-    const hook = getMouseHook()
+-    const focusInfo = hook && hook.isFocusedInInputArea
+-      ? hook.isFocusedInInputArea()
+-      : { isInput: false, isEditable: false, role: '' }
+-    isInput = focusInfo.isInput
+-    console.log('[FnVoiceInput:focus-debug] Focused outside Electron, native AX hook check:', JSON.stringify({
+-      isInput: focusInfo.isInput,
+-      isEditable: focusInfo.isEditable,
+-      role: focusInfo.role,
+-      frontmostApp: hook?.getFrontmostAppId?.() || 'N/A',
+-    }))
+-  }
+-
+-  const panelWin = ElectronFnVoicePanelWindow.getInstance()
+-  const win = panelWin.ensureWindow()
+-
+-  console.log(`[FnVoiceInput] handleFnKeyEvent: event=${event}, isInput=${isInput}, isRecording=${isRecording}`)
+-
+-  if (event === 'short_press') {
+-    if (isRecording) {
+-      // Toggle off: stop recording and start AI polish
+-      isRecording = false
+-      win.webContents.send('fn-voice-panel:set-state', { mode: 'process' })
+-    } else {
+-      if (isInput) {
+-        // Toggle on: start recording
+-        isRecording = true
+-        stashActiveAppPid()
+-        panelWin.showPanel()
+-        const sendStart = () => {
+-          win.webContents.send('fn-voice-panel:set-state', { mode: 'recording' })
+-        }
+-        if (!win.webContents.isLoading()) {
+-          sendStart()
+-        } else {
+-          win.webContents.once('did-finish-load', sendStart)
+-        }
+-
+-        // Lazy load voice-assistant in background asynchronously and prewarm servers
+-        loadAndWarmVoiceAssistant()
+-      } else {
+-        // Show no-input warning
+-        showNoInputWarning(panelWin, win)
+-      }
+-    }
+-  } else if (event === 'long_press_start') {
+-    if (!isRecording) {
+-      if (isInput) {
+-        isRecording = true
+-        stashActiveAppPid()
+-        panelWin.showPanel()
+-        const sendStart = () => {
+-          win.webContents.send('fn-voice-panel:set-state', { mode: 'recording' })
+-        }
+-        if (!win.webContents.isLoading()) {
+-          sendStart()
+-        } else {
+-          win.webContents.once('did-finish-load', sendStart)
+-        }
+-
+-        // Lazy load voice-assistant in background asynchronously and prewarm servers
+-        loadAndWarmVoiceAssistant()
+-      } else {
+-        showNoInputWarning(panelWin, win)
+-      }
+-    }
+-  } else if (event === 'long_press_end') {
+-    if (isRecording) {
+-      isRecording = false
+-      win.webContents.send('fn-voice-panel:set-state', { mode: 'process' })
+-    }
+-  }
+-}
+-
+-function showNoInputWarning(panelWin: ElectronFnVoicePanelWindow, win: any) {
+-  panelWin.showPanel()
+-  const sendWarning = () => {
+-    win.webContents.send('fn-voice-panel:set-state', { mode: 'no-input' })
+-  }
+-  if (!win.webContents.isLoading()) {
+-    sendWarning()
+-  } else {
+-    win.webContents.once('did-finish-load', sendWarning)
+-  }
+-
+-  if (warningTimer) clearTimeout(warningTimer)
+-  warningTimer = setTimeout(() => {
+-    if (!isRecording && fnVoiceWindowExists()) {
+-      panelWin.hidePanel()
+-    }
+-  }, 3000)
+-}
+-
+-function fnVoiceWindowExists(): boolean {
+-  try {
+-    const win = ElectronFnVoicePanelWindow.getInstance().getWindow()
+-    return !!win && !win.isDestroyed()
+-  } catch {
+-    return false
+-  }
+-}

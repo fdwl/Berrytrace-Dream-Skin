@@ -1,0 +1,34 @@
+diff --git a/electron/plugins/plugin-manager.ts b/electron/plugins/plugin-manager.ts
+index 3799988..8f8860a 100644
+--- a/electron/plugins/plugin-manager.ts
++++ b/electron/plugins/plugin-manager.ts
+@@ -859,6 +859,10 @@ export class PluginManager {
+     await this.stopMainPlugin(pluginId);
+     McpHost.getInstance().unregisterPluginMcp(pluginId);
+     EventSubscriptionRegistry.getInstance().unregisterPlugin(pluginId);
++    try {
++      const { WorkflowEngine } = require('./workflow-engine');
++      WorkflowEngine.getInstance().unregisterPlugin(pluginId);
++    } catch {}
+     ElectronFloatBall.getInstance().closePluginWindows(pluginId);
+     this.loadedPluginsSet.delete(pluginId);
+ 
+@@ -920,7 +924,17 @@ export class PluginManager {
+   }
+ 
+   private getDevPluginsFile(): string {
+-    return join(app.getPath('userData'), 'dev-plugins.json');
++    const sharedFile = join(BERRYTRACE_HOME, 'dev-plugins.json');
++    const legacyFile = join(app.getPath('userData'), 'dev-plugins.json');
++    if (!fsSync.existsSync(sharedFile) && fsSync.existsSync(legacyFile)) {
++      try {
++        fsSync.copyFileSync(legacyFile, sharedFile);
++        console.log('[PluginManager] Successfully migrated dev-plugins.json to shared BERRYTRACE_HOME');
++      } catch (e) {
++        console.warn('[PluginManager] Failed to migrate dev-plugins.json to shared home:', e);
++      }
++    }
++    return sharedFile;
+   }
+ 
+   public async loadPersistedDevPlugins(): Promise<void> {

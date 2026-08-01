@@ -1,0 +1,60 @@
+diff --git a/electron/config/DbCache.ts b/electron/config/DbCache.ts
+index fb5464f..1674ead 100644
+--- a/electron/config/DbCache.ts
++++ b/electron/config/DbCache.ts
+@@ -1,4 +1,5 @@
+ import { join } from 'path'
++import * as os from 'os'
+ import Store from 'electron-store'
+ import { app, safeStorage } from 'electron'
+ import type { ICache } from '../../src/config/ICache'
+@@ -8,16 +9,30 @@ import type { ICache } from '../../src/config/ICache'
+ // 自动派生中文目录。
+ const isDev = !!process.env.VITE_DEV_SERVER_URL
+ const folderName = isDev ? 'berrytrace-dev' : 'berrytrace'
+-const englishUserPath = join(app.getPath('appData'), folderName)
+-app.setPath('userData', englishUserPath)
+-app.setPath('sessionData', join(englishUserPath, 'Session Storage'))
+-app.setPath('crashDumps', join(englishUserPath, 'Crashpad'))
++
++let appDataPath = ''
++try {
++  if (app && typeof app.getPath === 'function') {
++    appDataPath = app.getPath('appData')
++    const englishUserPath = join(appDataPath, folderName)
++    app.setPath('userData', englishUserPath)
++    app.setPath('sessionData', join(englishUserPath, 'Session Storage'))
++    app.setPath('crashDumps', join(englishUserPath, 'Crashpad'))
++  }
++} catch (e) {
++  // 非 Electron 主进程环境
++}
++
++if (!appDataPath) {
++  appDataPath = join(process.env.HOME || os.homedir(), '.config')
++}
++const englishUserPath = join(appDataPath, folderName)
+ 
+ // Helper to encrypt a string using Electron's native safeStorage API
+ function encryptValue(value: string | null | undefined): string | null | undefined {
+   if (!value) return value
+   try {
+-    if (app.isReady() && safeStorage.isEncryptionAvailable()) {
++    if (app && typeof app.isReady === 'function' && app.isReady() && safeStorage && typeof safeStorage.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+       const buffer = safeStorage.encryptString(value)
+       return `_enc_:${buffer.toString('base64')}`
+     }
+@@ -32,7 +47,7 @@ function decryptValue(value: unknown): unknown {
+   if (typeof value !== 'string') return value
+   if (!value.startsWith('_enc_:')) return value
+   try {
+-    if (app.isReady() && safeStorage.isEncryptionAvailable()) {
++    if (app && typeof app.isReady === 'function' && app.isReady() && safeStorage && typeof safeStorage.isEncryptionAvailable === 'function' && safeStorage.isEncryptionAvailable()) {
+       const encryptedBase64 = value.substring(6)
+       const buffer = Buffer.from(encryptedBase64, 'base64')
+       return safeStorage.decryptString(buffer)
+@@ -118,4 +133,3 @@ export function cacheDelete(key: string): void {
+ export function cacheHas(key: string): boolean {
+   return cache.has(key)
+ }
+-

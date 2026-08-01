@@ -1,0 +1,83 @@
+diff --git a/electron/plugins/api-dispatcher.ts b/electron/plugins/api-dispatcher.ts
+index 9929005..5c8cfdb 100644
+--- a/electron/plugins/api-dispatcher.ts
++++ b/electron/plugins/api-dispatcher.ts
+@@ -1,5 +1,5 @@
+ import { dialog, BrowserWindow } from 'electron';
+-import { PluginApiController, ApiContext } from './controllers/api-context';
++import type { PluginApiController, ApiContext } from './controllers/api-context';
+ import { SystemController } from './controllers/system';
+ import { StorageController } from './controllers/storage';
+ import { AiController, handleProxyAiResponse } from './controllers/ai';
+@@ -9,6 +9,7 @@ import { LocalAiController } from './controllers/local-ai';
+ import { PublishController } from './controllers/publish';
+ import { HooksController } from './controllers/hooks';
+ import { PluginManager } from './plugin-manager';
++import * as PluginConfig from './plugin-config-repository';
+ import { TerminalController } from './controllers/terminal';
+ import { BrowserController } from './controllers/browser';
+ import { ComputerUseController } from './controllers/computer-use-controller';
+@@ -16,6 +17,7 @@ import { cache } from '../config/index';
+ import { CacheAttribute } from '../../src/config/CacheAttribute';
+ 
+ import { WorkflowController } from './controllers/workflow-controller';
++import { SecurityController } from './controllers/security';
+ 
+ export { handleProxyAiResponse };
+ 
+@@ -76,7 +78,7 @@ class ApiCallMonitor {
+     if (!SENSITIVE_APIS.has(key)) return;
+ 
+     // Check user trusted list in cache
+-    const userTrusted = (cache.get(CacheAttribute.prefUserTrustedPlugins) as string[]) || [];
++    const userTrusted = PluginConfig.getUserTrustedPlugins();
+     if (userTrusted.includes(pluginId)) {
+       // User has explicitly trusted this plugin, log and allow
+       this.logCall(pluginId, apiName, methodName);
+@@ -112,10 +114,10 @@ class ApiCallMonitor {
+ 
+           if (response === 0) {
+             // Option 0: Continue to trust and run
+-            const list = (cache.get(CacheAttribute.prefUserTrustedPlugins) as string[]) || [];
++            const list = PluginConfig.getUserTrustedPlugins();
+             if (!list.includes(pluginId)) {
+               list.push(pluginId);
+-              cache.set(CacheAttribute.prefUserTrustedPlugins, list);
++              PluginConfig.trustPlugin(pluginId);
+             }
+             console.log(`[安全警报] 用户已选择信任插件 "${pluginId}"，已解除安全观察期审查限制。`);
+             // Do NOT throw error! Log this call and allow execution.
+@@ -195,6 +197,9 @@ export class ApiDispatcher {
+ 
+     const computerUseCtrl = new ComputerUseController();
+     this.controllers.set('computerUse', computerUseCtrl);
++
++    const securityCtrl = new SecurityController();
++    this.controllers.set('security', securityCtrl);
+   }
+ 
+   public static getInstance(): ApiDispatcher {
+@@ -204,6 +209,10 @@ export class ApiDispatcher {
+     return ApiDispatcher.instance;
+   }
+ 
++  public getController(apiName: string): PluginApiController | undefined {
++    return this.controllers.get(apiName);
++  }
++
+   public async dispatch(
+     pluginId: string,
+     apiName: string,
+@@ -217,9 +226,10 @@ export class ApiDispatcher {
+ 
+     // Record plugin activity for idle unloading
+     try {
+-      const { PluginManager } = require('./plugin-manager');
+       PluginManager.getInstance().recordPluginActivity(pluginId);
+-    } catch {}
++    } catch {
++      // no-op
++    }
+ 
+     const controller = this.controllers.get(apiName);
+     if (!controller) {

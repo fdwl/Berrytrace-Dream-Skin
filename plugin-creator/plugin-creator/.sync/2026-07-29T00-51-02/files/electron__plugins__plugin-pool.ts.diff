@@ -1,0 +1,13 @@
+diff --git a/electron/plugins/plugin-pool.ts b/electron/plugins/plugin-pool.ts
+index 6f2d6d0..a9c0762 100644
+--- a/electron/plugins/plugin-pool.ts
++++ b/electron/plugins/plugin-pool.ts
+@@ -258,7 +258,7 @@ export class PluginPool {
+ 
+     // 将宿主 node_modules 注入 NODE_PATH，确保池内插件及其 spawn 的子进程
+     // (如 tts-server.cjs / stt-server.cjs) 能解析宿主依赖 (sherpa-onnx-node 等)
+-    const hostNodeModules = join(app.getAppPath(), 'node_modules');
++    const hostNodeModules = join(__dirname, '..', 'node_modules');
+     const existingNodePath = process.env.NODE_PATH || '';
+     const nodePath = existingNodePath
+       ? `${hostNodeModules}${delimiter}${existingNodePath}`

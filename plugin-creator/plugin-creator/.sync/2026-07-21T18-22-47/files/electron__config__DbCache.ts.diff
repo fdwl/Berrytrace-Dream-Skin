@@ -1,0 +1,14 @@
+diff --git a/electron/config/DbCache.ts b/electron/config/DbCache.ts
+index 1674ead..070c853 100644
+--- a/electron/config/DbCache.ts
++++ b/electron/config/DbCache.ts
+@@ -53,7 +53,8 @@ function decryptValue(value: unknown): unknown {
+       return safeStorage.decryptString(buffer)
+     }
+   } catch (e) {
+-    console.error('[DbCache] Decryption failed:', e)
++    console.error('[DbCache] Decryption failed (invalid key or environment change):', e)
++    return null
+   }
+   return value
+ }

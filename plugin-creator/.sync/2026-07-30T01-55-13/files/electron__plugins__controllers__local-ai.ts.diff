@@ -1,0 +1,11 @@
+diff --git a/electron/plugins/controllers/local-ai.ts b/electron/plugins/controllers/local-ai.ts
+index 9a2c5e9..33e2667 100644
+--- a/electron/plugins/controllers/local-ai.ts
++++ b/electron/plugins/controllers/local-ai.ts
+@@ -1,4 +1,5 @@
+-import { ApiContext, BaseApiController } from './api-context';
++import type { ApiContext} from './api-context';
++import { BaseApiController } from './api-context';
+ import { LocalAIService } from '../../services/local-ai-service';
+ 
+ /**

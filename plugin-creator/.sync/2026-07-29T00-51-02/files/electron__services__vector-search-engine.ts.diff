@@ -1,0 +1,10 @@
+diff --git a/electron/services/vector-search-engine.ts b/electron/services/vector-search-engine.ts
+index 7954cec..398e438 100644
+--- a/electron/services/vector-search-engine.ts
++++ b/electron/services/vector-search-engine.ts
+@@ -1,4 +1,4 @@
+-import { DatabaseSync } from 'node:sqlite';
++import type { DatabaseSync } from 'node:sqlite';
+ import { LocalAIService } from './local-ai-service.js';
+ 
+ export class VectorSearchEngine {

@@ -1,0 +1,14 @@
+diff --git a/electron/plugins/controllers/local-ai.ts b/electron/plugins/controllers/local-ai.ts
+index 459998b..9a2c5e9 100644
+--- a/electron/plugins/controllers/local-ai.ts
++++ b/electron/plugins/controllers/local-ai.ts
+@@ -54,7 +54,8 @@ export class LocalAiController extends BaseApiController {
+    * @param imagePath 图片路径
+    */
+   async ocr(imagePath: string): Promise<unknown> {
+-    return LocalAIService.getInstance().runOCR(imagePath);
++    const { parseImageOcr } = await import('../../services/ocr-image-parser.js');
++    return parseImageOcr(imagePath);
+   }
+ 
+   /**

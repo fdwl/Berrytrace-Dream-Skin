@@ -1,0 +1,81 @@
+import { app } from 'electron';
+import { join } from 'path';
+import * as os from 'os';
+import { cache } from './index';
+
+/**
+ * 统一用户数据路径管理。
+ *
+ * 优先级：BERRYTRACE_HOME 环境变量 > ~/.berrytrace（默认）
+ *
+ * 目录结构：
+ *   BERRYTRACE_HOME/
+ *   ├── plugins/          # 已安装的插件
+ *   ├── models/           # 本地 AI 模型（embedding、OCR、语音等）
+ *   ├── skills/           # 插件同步的公共 Skills
+ *   ├── data/             # 插件持久化数据（SQLite 等）
+ *   └── logs/             # 日志（可选，目前仍在 userData）
+ */
+
+function resolveHome(): string {
+  const envHome = process.env.BERRYTRACE_HOME;
+  if (envHome && envHome.trim()) return envHome.trim();
+  let homeDir = '';
+  try {
+    if (app && typeof app.getPath === 'function') {
+      homeDir = app.getPath('home');
+    }
+  } catch (e) {
+    // 忽略非 Electron 主进程环境
+  }
+  if (!homeDir) {
+    homeDir = process.env.HOME || process.env.USERPROFILE || os.homedir();
+  }
+  return join(homeDir, '.berrytrace');
+}
+
+export const BERRYTRACE_HOME = resolveHome();
+
+/** 插件安装根目录：~/.berrytrace/plugins/ */
+export const PLUGINS_DIR = join(BERRYTRACE_HOME, 'plugins');
+
+/** 获取本地 AI 模型根目录（支持用户自定义迁移路径，默认 ~/.berrytrace/models/） */
+export function getModelsRootDir(): string {
+  try {
+    const customPath = cache.get<string>('settings:custom_models_dir');
+    if (customPath && typeof customPath === 'string' && customPath.trim()) {
+      return customPath.trim();
+    }
+  } catch (e) {
+    // 忽略 cache 未初始化时的读取错误
+  }
+  return join(BERRYTRACE_HOME, 'models');
+}
+
+/** 本地 AI 模型目录：~/.berrytrace/models/ （仅用于兼容，推荐使用 getModelsRootDir()） */
+export const MODELS_DIR = join(BERRYTRACE_HOME, 'models');
+
+/** 获取 OCR 模型统一保存目录：~/.berrytrace/models/ocr/ */
+export function getOcrModelDir(): string {
+  return join(getModelsRootDir(), 'ocr');
+}
+
+/** 公共 Skills 目录：~/.berrytrace/skills/ */
+export const SKILLS_DIR = join(BERRYTRACE_HOME, 'skills');
+
+/** 插件持久化数据目录：~/.berrytrace/data/<pluginId>/ */
+export const pluginDataDir = (pluginId: string) => join(BERRYTRACE_HOME, 'data', pluginId);
+
+/** 全文索引与文档解析统一配置常量 */
+export const FULLTEXT_CONFIG = {
+  /** 单个文件允许被扫描的最大硬上限 (300MB)，超出的大型视频/镜像文件跳过 */
+  MAX_FILE_SIZE: 300 * 1024 * 1024,
+  /** 大型文档分级索引阈值 (10MB)，10MB~300MB 提取大纲存入 FTS5 索引 */
+  LARGE_FILE_THRESHOLD: 10 * 1024 * 1024,
+  /** 存入 SQLite FTS5 数据库的文本最大字符上限 (20万字符) */
+  FTS_MAX_CHARS: 200000,
+  /** 索引批处理中主线程事件循环礼让间隔 (ms) */
+  YIELD_INTERVAL_MS: 10,
+  /** PDF 按页读取默认单次建议页数 */
+  DEFAULT_PDF_PAGE_RANGE: 10,
+} as const;

@@ -1,0 +1,233 @@
+diff --git a/electron/plugins/controllers/browser.ts b/electron/plugins/controllers/browser.ts
+index f0a8d92..286127d 100644
+--- a/electron/plugins/controllers/browser.ts
++++ b/electron/plugins/controllers/browser.ts
+@@ -1,59 +1,155 @@
+-import { BrowserWindow, ipcMain } from 'electron';
++import { ipcMain } from 'electron';
+ import { ApiContext, BaseApiController } from './api-context';
+ import { ElectronMainWindow } from '../../windows/main-window';
++import { BrowserViewManager } from '../../windows/browser-view-manager';
+ 
+ export class BrowserController extends BaseApiController {
+   // ── browser namespace ──
+ 
+   /**
+-   * 执行工作区浏览器动作（打开网页、点击、输入、滚动、截图、执行JS等）
++   * 执行工作区浏览器动作（打开网页、点击、输入、滚动、截图、执行JS等）。
++   *
++   * 迁移后流程（WebContentsView 架构）：
++   *  1. 预热 — 通知 AppLayout 打开 workspace，等待 React UI 就绪并创建对应 Tab
++   *  2. 执行 — 直接在主进程通过 BrowserViewManager 操作 WebContentsView，不再经过渲染进程中转
+    */
+   async browser_action(action: string, params: Record<string, any>, context: ApiContext): Promise<any> {
+-    const actionId = `act_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+     const mainWindow = ElectronMainWindow.getInstance().getWindow();
+     if (!mainWindow || mainWindow.isDestroyed()) {
+       throw new Error('[BrowserController] Main window not found');
+     }
+ 
+-    return new Promise((resolve, reject) => {
+-      const resultChannel = `workspace-browser:result:${actionId}`;
++    // 预热工作区面板，等待 React 侧创建 Tab 并上报 tabId
++    const tabId = await this._prepareWorkspace(mainWindow);
++    const bvm = BrowserViewManager.getInstance();
+ 
+-      const handleResult = (_event: any, response: any) => {
+-        ipcMain.removeListener(resultChannel, handleResult);
+-        if (response.error) {
+-          reject(new Error(response.error));
+-        } else {
+-          resolve(response.result);
++    // 如果 BrowserViewManager 中还没有这个 Tab 的 View（Tab 是新创建的），稍等片刻让 React 侧完成 bounds 上报
++    if (!bvm.hasView(tabId)) {
++      console.warn(`[BrowserController] WebContentsView for tabId=${tabId} not yet registered, waiting...`);
++      await new Promise<void>((resolve) => {
++        const timer = setTimeout(resolve, 3000);
++        const check = setInterval(() => {
++          if (bvm.hasView(tabId)) {
++            clearInterval(check);
++            clearTimeout(timer);
++            resolve();
++          }
++        }, 100);
++      });
++    }
++
++    let result: any = null;
++
++    if (action === 'open') {
++      const { url } = params;
++      await bvm.loadURL(tabId, url);
++      result = { url: bvm.getURL(tabId) };
++
++    } else if (action === 'click') {
++      const { x, y, selector } = params;
++      await bvm.executeJavaScript(tabId, `
++        (() => {
++          let el = null;
++          if (${JSON.stringify(selector)}) {
++            el = document.querySelector(${JSON.stringify(selector)});
++          } else if (typeof ${x} === 'number' && typeof ${y} === 'number') {
++            el = document.elementFromPoint(${x}, ${y});
++          }
++          if (el) {
++            const rect = el.getBoundingClientRect();
++            const cx = rect.left + rect.width / 2;
++            const cy = rect.top + rect.height / 2;
++            const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
++            el.dispatchEvent(new MouseEvent('mousedown', opts));
++            el.dispatchEvent(new MouseEvent('mouseup', opts));
++            el.click();
++            if (el instanceof HTMLElement) el.focus();
++            return true;
++          }
++          return false;
++        })()
++      `);
++      result = { success: true };
++
++    } else if (action === 'type') {
++      const { text, selector } = params;
++      await bvm.executeJavaScript(tabId, `
++        (() => {
++          let el = ${JSON.stringify(selector)} ? document.querySelector(${JSON.stringify(selector)}) : document.activeElement;
++          if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
++            if (el instanceof HTMLElement) el.focus();
++            if (el.isContentEditable) { el.textContent = ${JSON.stringify(text)}; }
++            else { el.value = ${JSON.stringify(text)}; }
++            el.dispatchEvent(new Event('input', { bubbles: true }));
++            el.dispatchEvent(new Event('change', { bubbles: true }));
++            return true;
++          }
++          return false;
++        })()
++      `);
++      result = { success: true };
++
++    } else if (action === 'scroll') {
++      const { direction, px } = params;
++      const amount = direction === 'up' ? -(px || 500) : (px || 500);
++      await bvm.executeJavaScript(tabId, `window.scrollBy({ top: ${amount}, behavior: 'auto' })`);
++      result = { success: true };
++
++    } else if (action === 'eval') {
++      result = await bvm.executeJavaScript(tabId, params.code);
++
++    } else if (action === 'state') {
++      const text  = await bvm.executeJavaScript(tabId, `document.body?.innerText || ''`);
++      const title = await bvm.executeJavaScript(tabId, `document.title || ''`);
++      const url   = bvm.getURL(tabId);
++      result = { text, title, url };
++
++    } else if (action === 'screenshot') {
++      const nativeImg = await bvm.capturePage(tabId);
++      const base64 = nativeImg.toPNG().toString('base64');
++      result = { base64 };
++
++    } else if (action === 'back') {
++      if (bvm.canGoBack(tabId)) {
++        bvm.goBack(tabId);
++        result = { success: true, url: bvm.getURL(tabId) };
++      } else {
++        result = { success: false, reason: 'Cannot go back' };
++      }
++
++    } else if (action === 'wait') {
++      const { selector, ms } = params;
++      if (selector) {
++        const start = Date.now();
++        let found = false;
++        while (Date.now() - start < 10000) {
++          const exists = await bvm.executeJavaScript(tabId, `!!document.querySelector(${JSON.stringify(selector)})`);
++          if (exists) { found = true; break; }
++          await new Promise(r => setTimeout(r, 200));
+         }
+-      };
++        result = { success: found };
++      } else if (typeof ms === 'number') {
++        await new Promise(r => setTimeout(r, ms));
++        result = { success: true };
++      }
+ 
+-      ipcMain.on(resultChannel, handleResult);
++    } else if (action === 'close_workspace' || action === 'hide_workspace' || action === 'hide') {
++      // 隐藏工作区面板
++      mainWindow.webContents.send('workspace:hide');
++      BrowserViewManager.getInstance().hideAllViews();
++      result = { success: true };
+ 
+-      // 发送动作到渲染进程
+-      mainWindow.webContents.send('workspace-browser:action', {
+-        actionId,
+-        action,
+-        params,
+-      });
++    } else {
++      throw new Error(`[BrowserController] Unknown browser action: ${action}`);
++    }
+ 
+-      // 30秒超时保护
+-      setTimeout(() => {
+-        ipcMain.removeListener(resultChannel, handleResult);
+-        reject(new Error(`[BrowserController] Action "${action}" timed out`));
+-      }, 30000);
+-    });
++    return result;
+   }
+ 
+   /**
+    * 获取当前工作区浏览器状态
+    */
+   async browser_getActiveStatus(context: ApiContext): Promise<any> {
+-    const mainWindow = ElectronMainWindow.getInstance().getWindow();
+-    if (!mainWindow || mainWindow.isDestroyed()) {
+-      return { active: false, url: null };
+-    }
+-
+-    // 我们可以复用 action 机制获取当前状态
+     try {
+       const state = await this.browser_action('state', {}, context);
+       return { active: true, url: state.url, title: state.title };
+@@ -61,4 +157,41 @@ export class BrowserController extends BaseApiController {
+       return { active: false, url: null };
+     }
+   }
++
++  /** 缓存 prepared 状态，避免同一 session 中重复预热 */
++  private _preparedAt = 0;
++  private _lastTabId = '';
++
++  /**
++   * 通知 AppLayout 打开 workspace 面板并创建 browser-panel Tab。
++   * 返回活跃 Tab ID（React 侧创建 Tab 后通过 IPC 回传）。
++   */
++  private async _prepareWorkspace(mainWindow: Electron.BrowserWindow): Promise<string> {
++    if (this._preparedAt > 0 && Date.now() - this._preparedAt < 180_000 && this._lastTabId) {
++      return this._lastTabId;
++    }
++
++    return new Promise<string>((resolve) => {
++      const prepareId = `prep_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
++      const responseChannel = `workspace-browser:prepared:${prepareId}`;
++
++      const timer = setTimeout(() => {
++        ipcMain.removeListener(responseChannel, handlePrepared);
++        // タイムアウト時は空 tabId で続行（BrowserViewManager 側で対処）
++        resolve(this._lastTabId || '');
++      }, 15000);
++
++      const handlePrepared = (_event: any, payload?: { tabId?: string }) => {
++        clearTimeout(timer);
++        ipcMain.removeListener(responseChannel, handlePrepared);
++        const tabId = payload?.tabId || this._lastTabId || '';
++        this._lastTabId = tabId;
++        this._preparedAt = Date.now();
++        resolve(tabId);
++      };
++
++      ipcMain.on(responseChannel, handlePrepared);
++      mainWindow.webContents.send('workspace-browser:prepare', { prepareId });
++    });
++  }
+ }
