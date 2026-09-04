@@ -4,16 +4,19 @@ import path from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { verifySession } from "../scripts/injector.mjs";
+import { SKIN_VERSION, verifySession } from "../scripts/injector.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const startPath = path.resolve(here, "../scripts/start-dream-skin.ps1");
 
 const selectors = {
-  shell: "main.main-surface",
+  shell: 'main:is(.main-surface, [data-app-shell-main-surface], [class*="_MainContentSurface_"])',
   sidebar: "aside.app-shell-left-panel",
   composer: ".composer-surface-chrome",
+  homeIcon: '[data-testid="home-icon"]',
   home: '[role="main"]:has([data-testid="home-icon"])',
+  gameSource: '[data-feature="game-source"]',
+  suggestions: ".group\\/home-suggestions",
   settings: 'input[name="appearance-theme"]',
   themePreview: '[data-testid="theme-preview"]',
 };
@@ -22,19 +25,49 @@ function makeRect(width = 800, height = 600, x = 0, y = 0) {
   return { x, y, width, height, right: x + width, bottom: y + height };
 }
 
-function makeElement({ rect = makeRect(), style = {}, visible = true } = {}) {
-  return {
+function makeElement({
+  rect = makeRect(),
+  style = {},
+  visible = true,
+  text = "",
+  children = [],
+} = {}) {
+  const element = {
     isConnected: true,
+    textContent: text,
     _style: {
       display: "block",
       visibility: "visible",
       contentVisibility: "visible",
       opacity: "1",
+      color: "rgb(240, 240, 240)",
       ...style,
     },
+    childNodes: text ? [{ nodeType: 3, textContent: text }] : [],
+    children,
     getBoundingClientRect: () => rect,
     checkVisibility: () => visible,
     querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+  return element;
+}
+
+function makeSuggestionButton({
+  rect = makeRect(220, 80, 40, 300),
+  color = "rgb(210, 210, 210)",
+  labelColor = color,
+  text = "Suggestion",
+} = {}) {
+  const label = makeElement({
+    rect: makeRect(180, 24, rect.x + 12, rect.y + 12),
+    style: { color: labelColor },
+    text,
+  });
+  return {
+    ...makeElement({ rect, style: { color } }),
+    getBoundingClientRect: () => rect,
+    querySelectorAll: () => [label],
   };
 }
 
@@ -42,26 +75,33 @@ function makeHome(options = {}) {
   const home = makeElement(options);
   const hero = makeElement(options.hero ?? {});
   home.firstElementChild = { firstElementChild: { firstElementChild: hero } };
+  const suggestions = options.suggestions ?? null;
+  home.querySelector = (selector) => selector === selectors.suggestions ? suggestions : null;
   return home;
 }
 
 function makeDomFixture({
-  scope = { level: "L1", baseState: "thread" },
+  scope = { level: "L1", baseState: "thread", missingL1: [] },
   shell = makeElement(),
   sidebar = makeElement(),
   composer = makeElement(),
   home = null,
+  homeSignal = null,
+  genericMain = null,
+  genericInput = null,
   settings = null,
   visibilityState = "visible",
   hidden = false,
   viewportWidth = 1280,
   viewportHeight = 800,
+  scrollWidth = viewportWidth,
+  scrollHeight = viewportHeight,
 } = {}) {
   const styleNode = {};
   const documentElement = {
-    scrollWidth: viewportWidth,
+    scrollWidth,
     clientWidth: viewportWidth,
-    scrollHeight: viewportHeight,
+    scrollHeight,
     clientHeight: viewportHeight,
     getAttribute: (name) => name === "data-dream-skin" ? "active" : null,
   };
@@ -74,7 +114,11 @@ function makeDomFixture({
       if (selector === selectors.shell) return shell;
       if (selector === selectors.sidebar) return sidebar;
       if (selector === selectors.composer) return composer;
+      if (selector === selectors.homeIcon) return null;
       if (selector === selectors.home) return home;
+      if (selector === selectors.gameSource || selector === selectors.suggestions) return homeSignal;
+      if (selector === '[data-ds-part="main"], [data-ds-part="home"]') return genericMain ?? home;
+      if (selector === '[data-ds-part="composer"]') return genericInput;
       if (selector === selectors.settings || selector === selectors.themePreview) return settings;
       return null;
     },
@@ -83,7 +127,7 @@ function makeDomFixture({
   };
   const window = {
     __CODEX_DREAM_SKIN_STATE__: {
-      version: "1.5.6",
+      version: SKIN_VERSION,
       themeId: "fixture-theme",
       revision: "fixture-revision",
       styleMode: "style",
@@ -157,7 +201,7 @@ test("normal L1 renderer requires and records the exact target window binding", 
   ]);
 });
 
-test("visible settings and home anchors are the only L0 structure exceptions", async () => {
+test("visible settings is the only L0 structure exception", async () => {
   const settings = await verify({
     dom: makeDomFixture({
       scope: { level: "L0", baseState: "settings" },
@@ -170,13 +214,35 @@ test("visible settings and home anchors are the only L0 structure exceptions", a
 
   const home = await verify({
     dom: makeDomFixture({
-      scope: { level: "L0", baseState: "home" },
+      scope: {
+        level: "L0",
+        baseState: "home",
+        missingL1: ["left-panel"],
+      },
       shell: null,
       sidebar: null,
       home: makeHome({ rect: makeRect(900, 650, 20, 20) }),
     }),
   });
-  assert.equal(home.result.pass, true);
+  assert.equal(home.result.pass, false);
+  assert.equal(home.result.readiness.structurePass, false);
+
+  const fallbackHome = makeHome({ rect: makeRect(900, 650, 20, 20) });
+  const lateHomeIconSignal = {
+    closest: (selector) => selector === '[role="main"]' ? fallbackHome : null,
+  };
+  const lateHomeIcon = await verify({
+    dom: makeDomFixture({
+      scope: { level: "L0", baseState: "home" },
+      shell: null,
+      sidebar: null,
+      home: null,
+      homeSignal: lateHomeIconSignal,
+    }),
+  });
+  assert.equal(lateHomeIcon.result.homePresent, true);
+  assert.equal(lateHomeIcon.result.pass, false);
+  assert.equal(lateHomeIcon.result.readiness.structurePass, false);
 
   const noAnchor = await verify({
     dom: makeDomFixture({
@@ -187,6 +253,90 @@ test("visible settings and home anchors are the only L0 structure exceptions", a
   });
   assert.equal(noAnchor.result.pass, false);
   assert.equal(noAnchor.result.readiness.structurePass, false);
+
+  const generic = await verify({
+    dom: makeDomFixture({
+      shell: null,
+      sidebar: null,
+      home: null,
+      genericMain: makeElement({ rect: makeRect(900, 650, 20, 20) }),
+      genericInput: makeElement({ rect: makeRect(620, 80, 180, 620) }),
+    }),
+  });
+  assert.equal(generic.result.pass, true);
+  assert.equal(generic.result.readiness.structurePass, true);
+
+  const genericL0 = await verify({
+    dom: makeDomFixture({
+      scope: {
+        level: "L0",
+        baseState: "thread",
+        missingL1: ["shell-main", "left-panel", "header-tint"],
+      },
+      shell: null,
+      sidebar: null,
+      home: null,
+      genericMain: makeElement({ rect: makeRect(900, 650, 20, 20) }),
+      genericInput: makeElement({ rect: makeRect(620, 80, 180, 620) }),
+    }),
+  });
+  assert.equal(genericL0.result.pass, false,
+    "Generic app parts must not turn an L0 thread with missing shell/header anchors into visible success.");
+  assert.equal(genericL0.result.readiness.structurePass, false);
+
+  const falseHome = await verify({
+    dom: makeDomFixture({
+      scope: { level: "L1", baseState: "home", missingL1: [] },
+      home: null,
+      homeSignal: null,
+      genericMain: makeElement({ rect: makeRect(900, 650, 20, 20) }),
+      genericInput: makeElement({ rect: makeRect(620, 80, 180, 620) }),
+    }),
+  });
+  assert.equal(falseHome.result.homePresent, false);
+  assert.equal(falseHome.result.pass, false,
+    "A renderer that claims Home must expose a real Home identity signal.");
+});
+
+test("home verification matches macOS and does not require a fixed suggestion-card count", async () => {
+  const oneSuggestion = {
+    querySelectorAll: (selector) => selector === "button"
+      ? [makeSuggestionButton({ text: "One real card" })]
+      : [],
+  };
+  const homeWithOneSuggestion = await verify({
+    dom: makeDomFixture({
+      home: makeHome({
+        rect: makeRect(900, 650, 20, 20),
+        hero: { rect: makeRect(800, 260, 40, 60) },
+        suggestions: oneSuggestion,
+      }),
+    }),
+  });
+  assert.equal(homeWithOneSuggestion.result.homePresent, true);
+  assert.equal(homeWithOneSuggestion.result.visibleCardCount, 1);
+  assert.equal(homeWithOneSuggestion.result.pass, true);
+
+  const mismatchedSuggestion = {
+    querySelectorAll: (selector) => selector === "button"
+      ? [makeSuggestionButton({
+        text: "Hidden by mismatched text color",
+        color: "rgb(210, 210, 210)",
+        labelColor: "rgb(10, 10, 10)",
+      })]
+      : [],
+  };
+  const badHome = await verify({
+    dom: makeDomFixture({
+      home: makeHome({
+        rect: makeRect(900, 650, 20, 20),
+        hero: { rect: makeRect(800, 260, 40, 60) },
+        suggestions: mismatchedSuggestion,
+      }),
+    }),
+  });
+  assert.equal(badHome.result.suggestionLabelColorsMatch, false);
+  assert.equal(badHome.result.pass, false);
 });
 
 // Regression for #256. The previous version of this test asserted that a
@@ -307,6 +457,27 @@ test("hidden documents and unreasonable viewports cannot pass", async () => {
   });
   assert.equal(tiny.result.pass, false);
   assert.equal(tiny.result.readiness.viewportPass, false);
+});
+
+test("horizontal document overflow cannot be reported as a verified skin", async () => {
+  const boundary = await verify({
+    dom: makeDomFixture({ scrollWidth: 1280 }),
+  });
+  assert.equal(boundary.result.documentOverflow.x, false);
+  assert.equal(boundary.result.pass, true, "Equal document and viewport widths are not overflow.");
+
+  const horizontal = await verify({
+    dom: makeDomFixture({ scrollWidth: 1281 }),
+  });
+  assert.equal(horizontal.result.documentOverflow.x, true);
+  assert.equal(horizontal.result.pass, false);
+
+  const verticalOnly = await verify({
+    dom: makeDomFixture({ scrollHeight: 1600 }),
+  });
+  assert.equal(verticalOnly.result.documentOverflow.y, true);
+  assert.equal(verticalOnly.result.documentOverflow.x, false);
+  assert.equal(verticalOnly.result.pass, true, "Vertical scrolling is expected for long conversations.");
 });
 
 test("zero-size and CSS-hidden shell anchors cannot satisfy L1", async () => {

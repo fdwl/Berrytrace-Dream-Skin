@@ -2,11 +2,12 @@
 param([Parameter(Mandatory = $true)][string]$Root)
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $Root 'scripts\localization-windows.ps1')
 $startPath = Join-Path $Root 'scripts\start-dream-skin.ps1'
 $source = [System.IO.File]::ReadAllText($startPath)
-$dotSourcePattern = '(?m)^\.\s+\(Join-Path \$PSScriptRoot ''(?:common-windows|theme-windows)\.ps1''\)\r?\n'
-if ([regex]::Matches($source, $dotSourcePattern).Count -ne 2) {
-  throw 'Start readiness fixture could not isolate the two runtime imports.'
+$dotSourcePattern = '(?m)^\.\s+\(Join-Path \$PSScriptRoot ''(?:common-windows|theme-windows|localization-windows)\.ps1''\)\r?\n'
+if ([regex]::Matches($source, $dotSourcePattern).Count -ne 3) {
+  throw 'Start readiness fixture could not isolate the three runtime imports.'
 }
 $source = [regex]::Replace($source, $dotSourcePattern, '')
 $source = $source.Replace(
@@ -28,12 +29,18 @@ $script:daemon | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
 }
 $script:dateCall = 0
 $script:verifyCalls = 0
+$script:onceCalls = 0
 $script:removeCalls = 0
 $script:stateWritten = $false
 $script:stateRemoved = $false
 $script:daemonStopped = $false
 $script:lockExited = $false
 $script:hostMessages = @()
+$script:cdpReady = $false
+$script:appearanceInstallCalls = 0
+$script:appearanceRestoreCalls = 0
+$script:codexStopped = $false
+$script:codexStarted = $false
 
 function Enter-DreamSkinOperationLock {
   param([int]$TimeoutMilliseconds)
@@ -70,6 +77,7 @@ function Initialize-DreamSkinThemeStore {
   return Get-DreamSkinThemePaths -StateRoot $StateRoot
 }
 function Test-DreamSkinPaused { param([string]$StateRoot); return $false }
+function Test-DreamSkinPendingAppearanceTransaction { param([string]$BackupPath); return $false }
 function Read-DreamSkinState { param([string]$Path); return $null }
 function Get-DreamSkinCodexStatePathCandidate { param([object]$State); return $null }
 function Get-DreamSkinCodexInstallFromState { param([object]$State); return $null }
@@ -77,10 +85,44 @@ function Get-DreamSkinCodexProcesses { param([object]$Codex); return @() }
 function Test-DreamSkinPathEqual { param([string]$Left, [string]$Right); return $true }
 function Get-DreamSkinVerifiedCdpIdentity {
   param([int]$Port, [object]$Codex)
+  if (-not $script:cdpReady) { return $null }
   return [pscustomobject]@{ BrowserId = 'fixture-browser' }
+}
+function Get-DreamSkinVerifiedCdpIdentityForAnyRegistered { param([int]$Port); return $null }
+function Test-DreamSkinPortAvailable { param([int]$Port); return $true }
+function Get-DreamSkinActiveThemeAppearance { param([string]$ThemeDirectory); return 'dark' }
+function Install-DreamSkinBaseTheme {
+  param(
+    [string]$ConfigPath, [string]$BackupPath, [string]$AppearanceTheme,
+    [switch]$PassThruTransaction
+  )
+  $script:appearanceInstallCalls += 1
+  return [pscustomobject]@{ SchemaVersion = 1 }
+}
+function Restore-DreamSkinManagedAppearanceSnapshot {
+  param([string]$ConfigPath, [string]$BackupPath, [object]$Transaction)
+  $script:appearanceRestoreCalls += 1
+  return [pscustomobject]@{ ConflictedKeys = @(); MarkerStatus = 'restored' }
+}
+function Complete-DreamSkinAppearanceTransaction { param([string]$BackupPath, [object]$Transaction) }
+function Start-DreamSkinCodexForDebugging {
+  param([object]$Codex, [string[]]$Arguments, [int]$Port, [int[]]$PreserveProcessIds)
+  $script:cdpReady = $true
+  return [pscustomobject]@{ Strategy = 'package-activation' }
+}
+function Stop-DreamSkinCodex {
+  param([object]$Codex, [int[]]$PreserveProcessIds, [switch]$AllowForce)
+  $script:codexStopped = $true
+  $script:cdpReady = $false
+}
+function Start-DreamSkinCodex {
+  param([object]$Codex)
+  $script:codexStarted = $true
+  return 909
 }
 function Stop-DreamSkinRecordedInjector { param([object]$State); return $true }
 function Set-DreamSkinPaused { param([bool]$Paused, [string]$StateRoot); return $true }
+function Invoke-DreamSkinCodexWindowActivation { param([object]$Codex); return $true }
 function ConvertTo-DreamSkinProcessArgument { param([string]$Value); return $Value }
 function Start-Process {
   [CmdletBinding()]
@@ -104,6 +146,10 @@ function Invoke-DreamSkinNative {
   if ($ArgumentList -contains '--verify') {
     $script:verifyCalls += 1
     return [pscustomobject]@{ ExitCode = 2; Output = @('{"pass":false}') }
+  }
+  if ($ArgumentList -contains '--once') {
+    $script:onceCalls += 1
+    return [pscustomobject]@{ ExitCode = 2; Output = @('{"mode":"once","targets":[]}') }
   }
   if ($ArgumentList -contains '--remove') {
     $script:removeCalls += 1
@@ -152,7 +198,10 @@ try {
 $announcedActive = @($script:hostMessages | Where-Object {
   $_ -like 'Codex Dream Skin is active*'
 }).Count -gt 0
-if (-not $failed -or $script:verifyCalls -ne 1 -or $script:removeCalls -ne 1 -or
+if (-not $failed -or $script:verifyCalls -ne 1 -or $script:onceCalls -ne 1 -or
+  $script:removeCalls -ne 0 -or $script:appearanceInstallCalls -ne 1 -or
+  $script:appearanceRestoreCalls -ne 1 -or -not $script:codexStopped -or
+  -not $script:codexStarted -or
   -not $script:stateWritten -or -not $script:stateRemoved -or
   -not $script:daemonStopped -or -not $script:daemon.HasExited -or
   -not $script:lockExited -or $announcedActive) {

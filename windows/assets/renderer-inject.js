@@ -1,18 +1,40 @@
 // Canonical cross-platform renderer. Run tools/sync-runtime-assets.mjs after editing.
 ((cssText, artDataUrl, themeConfig) => {
-  const SELECTOR_CONTRACT = {"schema":"codex-dream-skin-selectors/1","selectors":[{"key":"shell-main","selector":"main.main-surface","tier":"L1","scope":"all","required":true},{"key":"left-panel","selector":"aside.app-shell-left-panel","tier":"L1","scope":"all","required":true},{"key":"header-tint","selector":"header.app-header-tint","tier":"L1","scope":"all","required":true},{"key":"home-icon","selector":"[data-testid=\"home-icon\"]","tier":"L1","scope":"home","required":true},{"key":"home-route","selector":"[role=\"main\"]:has([data-testid=\"home-icon\"])","tier":"L1","scope":"home","required":true},{"key":"home-route-css","selector":"[role=\"main\"]","tier":"L1","scope":"home","required":true},{"key":"home-banners","selector":".home-banners","tier":"L2","scope":"home","required":false},{"key":"composer-chrome","selector":".composer-surface-chrome","tier":"L2","scope":"home+thread","required":false},{"key":"composer-toolbar","selector":".composer-surface-chrome [class*=\"_footer_\"]","tier":"L2","scope":"home+thread","required":false},{"key":"home-utility","selector":"[class*=\"_homeUtilityBar_\"]","tier":"L2","scope":"home","required":false},{"key":"game-source","selector":"[data-feature=\"game-source\"]","tier":"L2","scope":"home","required":false},{"key":"home-suggestions","selector":".group\\/home-suggestions","tier":"L2","scope":"home","required":false},{"key":"project-selector","selector":".group\\/project-selector","tier":"L2","scope":"home config","required":false},{"key":"markdown","selector":"[class*=\"_markdown\"]","tier":"L2","scope":"thread","required":false},{"key":"thread-surface","selector":".thread-scroll-container","tier":"L2","scope":"thread","required":false},{"key":"message","selector":"[data-message-author-role]","tier":"L2","scope":"thread","required":false},{"key":"appearance-radio","selector":"input[name=\"appearance-theme\"]","tier":"L2","scope":"settings","required":false},{"key":"overlay-menu","selector":"[role=\"menu\"]","tier":"L2","scope":"overlay","required":false},{"key":"overlay-dialog","selector":"[role=\"dialog\"]","tier":"L2","scope":"overlay","required":false},{"key":"overlay-popper","selector":"[data-radix-popper-content-wrapper]","tier":"L2","scope":"overlay","required":false}],"stableTestids":["app-shell-header-context-menu-surface","home-icon","theme-preview"]};
+  const SELECTOR_CONTRACT = {"schema":"codex-dream-skin-selectors/1","selectors":[{"key":"shell-main","selector":"main:is(.main-surface, [data-app-shell-main-surface], [class*=\"_MainContentSurface_\"])","tier":"L1","scope":"all","required":true},{"key":"left-panel","selector":"aside.app-shell-left-panel","tier":"L1","scope":"all","required":true},{"key":"header-tint","selector":"header:is(.app-header-tint, [data-app-shell-header-edge-scroll], [class*=\"_Header_\"])","tier":"L1","scope":"all","required":true},{"key":"main-content-top-fade","selector":":is(.app-shell-main-content-top-fade, [data-app-shell-main-content-top-fade], [class*=\"_MainContentTopFade_\"])","tier":"L2","scope":"all","required":false},{"key":"home-icon","selector":"[data-testid=\"home-icon\"]","tier":"L1","scope":"home","required":true},{"key":"home-route","selector":"[role=\"main\"]:has([data-testid=\"home-icon\"])","tier":"L1","scope":"home","required":true},{"key":"home-route-css","selector":"[role=\"main\"]","tier":"L1","scope":"home","required":true},{"key":"home-banners","selector":".home-banners","tier":"L2","scope":"home","required":false},{"key":"composer-chrome","selector":":is(.composer-surface-chrome, [class*=\"_ComposerLayoutRoot_\"], [data-composer-surface-variant][data-composer-radius-variant])","tier":"L2","scope":"home+thread","required":false},{"key":"composer-toolbar","selector":":is(.composer-surface-chrome [class*=\"_footer_\"], [class*=\"_ComposerLayoutRoot_\"] [class*=\"_ComposerLayoutFooter_\"], [data-composer-surface-variant][data-composer-radius-variant] :is([data-composer-footer-responsive], [class*=\"_ComposerLayoutFooter_\"], [class*=\"_footer_\"]))","tier":"L2","scope":"home+thread","required":false},{"key":"home-utility","selector":":is([class*=\"_homeUtilityBar_\"], [class*=\"_ComposerHomeUtilityBar_\"])","tier":"L2","scope":"home","required":false},{"key":"game-source","selector":"[data-feature=\"game-source\"]","tier":"L2","scope":"home","required":false},{"key":"home-suggestions","selector":".group\\/home-suggestions","tier":"L2","scope":"home","required":false},{"key":"project-selector","selector":".group\\/project-selector","tier":"L2","scope":"home config","required":false},{"key":"markdown","selector":"[class*=\"_markdown\"]","tier":"L2","scope":"thread","required":false},{"key":"thread-surface","selector":".thread-scroll-container","tier":"L2","scope":"thread","required":false},{"key":"message","selector":":is([data-message-author-role], [data-local-conversation-user-anchor], [data-local-conversation-final-assistant])","tier":"L2","scope":"thread","required":false},{"key":"settings-panel","selector":"[data-settings-panel-slug=\"general-settings\"]","tier":"L2","scope":"settings","required":false},{"key":"appearance-radio","selector":"input[name=\"appearance-theme\"]","tier":"L2","scope":"settings","required":false},{"key":"overlay-menu","selector":"[role=\"menu\"]","tier":"L2","scope":"overlay","required":false},{"key":"overlay-dialog","selector":"[role=\"dialog\"]","tier":"L2","scope":"overlay","required":false},{"key":"overlay-popper","selector":"[data-radix-popper-content-wrapper]","tier":"L2","scope":"overlay","required":false}],"stableTestids":["app-shell-header-context-menu-surface","home-icon","theme-preview"]};
   const STATE_KEY = "__CODEX_DREAM_SKIN_STATE__";
   const DISABLED_KEY = "__CODEX_DREAM_SKIN_DISABLED__";
   const STYLE_REGISTRY_KEY = "__CODEX_DREAM_SKIN_STYLE_SHEETS__";
   const STYLE_ID = "codex-dream-skin-style";
   const SHELL_ATTR = "data-dream-shell";
   const PART_ATTR = "data-ds-part";
+  const COMPOSER_BORDER_BRIDGES = [
+    "border-color", "border-top-color", "border-right-color", "border-bottom-color",
+    "border-left-color", "border-width", "border-top-width", "border-right-width",
+    "border-bottom-width", "border-left-width", "border-style", "border-top-style",
+    "border-right-style", "border-bottom-style", "border-left-style",
+  ].map((property) => ({
+    property,
+    variable: `--ds-community-composer-${property}`,
+  })).filter(({ variable }) => cssText.includes(`${variable}:`));
   const ROOT_ATTRS = [
     "data-dream-skin", SHELL_ATTR,
     "data-dream-art-wide", "data-dream-art-safe", "data-dream-task-mode",
     "data-dream-art-safe-area", "data-dream-art-task-mode", "data-dream-art-aspect",
     "data-dream-art-ready",
   ];
+  const initialRoute = new URLSearchParams(String(location.search || ""))
+    .get("initialRoute") || "";
+  const pathname = String(location.pathname || "");
+  const excludedPetSurface = location.protocol === "app:" && (
+    pathname.endsWith("/avatar-overlay-composition-surface.html") ||
+    initialRoute === "/avatar-overlay" || initialRoute.startsWith("/avatar-overlay/")
+  );
+  if (excludedPetSurface) {
+    const previous = window[STATE_KEY];
+    if (typeof previous?.cleanup === "function") previous.cleanup();
+    window[DISABLED_KEY] = true;
+    return;
+  }
   const VERSION = __DREAM_SKIN_VERSION_JSON__;
   const STYLE_REVISION = __DREAM_SKIN_STYLE_REVISION_JSON__;
   const PAYLOAD_REVISION = __DREAM_SKIN_PAYLOAD_REVISION_JSON__;
@@ -22,7 +44,7 @@
     ? THEME.artMetadata : null;
   const ANALYSIS_CACHE_KEY = "__CODEX_DREAM_SKIN_ANALYSIS_CACHE__";
   const THEME_VARIABLES = [
-    "--ds-bg", "--ds-panel", "--ds-panel-2", "--ds-green", "--ds-lime",
+    "--ds-bg", "--ds-panel", "--ds-panel-2", "--ds-green", "--ds-lime", "--ds-on-accent",
     "--ds-cyan", "--ds-purple", "--ds-text", "--ds-muted", "--ds-line",
     "--ds-bg-rgb", "--ds-panel-rgb", "--ds-panel-2-rgb", "--ds-accent-rgb",
     "--ds-accent-alt-rgb", "--ds-secondary-rgb", "--ds-highlight-rgb",
@@ -118,15 +140,31 @@
     if (!value || value === "transparent") return null;
     const hex = String(value).trim().match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
     if (hex) {
-      const rgbHex = hex[1].length <= 4
-        ? hex[1].slice(0, 3).split("").map((digit) => `${digit}${digit}`).join("")
-        : hex[1].slice(0, 6);
+      const digits = hex[1];
+      const rgbHex = digits.length <= 4
+        ? digits.slice(0, 3).split("").map((digit) => `${digit}${digit}`).join("")
+        : digits.slice(0, 6);
+      const alphaHex = digits.length === 4
+        ? `${digits[3]}${digits[3]}`
+        : digits.length === 8 ? digits.slice(6, 8) : "ff";
       const number = Number.parseInt(rgbHex, 16);
-      return { r: number >> 16, g: (number >> 8) & 255, b: number & 255 };
+      return {
+        r: number >> 16,
+        g: (number >> 8) & 255,
+        b: number & 255,
+        alpha: Number.parseInt(alphaHex, 16) / 255,
+      };
     }
-    const m = String(value).match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
+    const m = String(value).trim().match(
+      /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i,
+    );
     if (!m) return null;
-    return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+    return {
+      r: Number(m[1]),
+      g: Number(m[2]),
+      b: Number(m[3]),
+      alpha: m[4] === undefined ? 1 : Math.min(1, Math.max(0, Number(m[4]))),
+    };
   };
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -141,6 +179,44 @@
   const rgbToHex = ({ r, g, b }) => `#${[r, g, b]
     .map((value) => clamp(Math.round(value), 0, 255).toString(16).padStart(2, "0"))
     .join("")}`;
+
+  const relativeLuminance = ({ r, g, b }) => {
+    const channels = [r, g, b].map((value) => {
+      const normalized = clamp(value, 0, 255) / 255;
+      return normalized <= 0.04045
+        ? normalized / 12.92
+        : ((normalized + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+  };
+
+  const compositeColor = (value, background, alphaOverride = null) => {
+    const foreground = parseRgb(value);
+    if (!foreground) return background;
+    const alpha = clamp(alphaOverride ?? foreground.alpha ?? 1, 0, 1);
+    return {
+      r: clamp(foreground.r, 0, 255) * alpha + background.r * (1 - alpha),
+      g: clamp(foreground.g, 0, 255) * alpha + background.g * (1 - alpha),
+      b: clamp(foreground.b, 0, 255) * alpha + background.b * (1 - alpha),
+    };
+  };
+
+  const readableAccentInk = (accent, panel) => {
+    // The send button sits on the composer surface, which renders panel RGB
+    // at 94% regardless of the panel color's declared alpha. Compare against
+    // both possible backdrop extremes so artwork cannot flip the decision.
+    const luminances = [0, 255].map((backdrop) => {
+      const surface = compositeColor(
+        panel,
+        { r: backdrop, g: backdrop, b: backdrop },
+        0.94,
+      );
+      return relativeLuminance(compositeColor(accent, surface));
+    });
+    const whiteContrast = Math.min(...luminances.map((value) => 1.05 / (value + 0.05)));
+    const blackContrast = Math.min(...luminances.map((value) => (value + 0.05) / 0.05));
+    return whiteContrast >= blackContrast ? "rgb(255 255 255)" : "rgb(0 0 0)";
+  };
 
   const rgbToHsl = ({ r, g, b }) => {
     const values = [r, g, b].map((value) => value / 255);
@@ -266,6 +342,13 @@
     for (const [name, value] of Object.entries(variables)) {
       if (typeof value === "string" && value) setStyleProperty(root, name, value);
     }
+    if (explicit.has("accent")) {
+      const accentInk = readableAccentInk(
+        accent,
+        variables["--ds-panel"],
+      );
+      if (accentInk) setStyleProperty(root, "--ds-on-accent", accentInk);
+    }
     const publicColors = {
       "--ds-theme-color-background": variables["--ds-bg"],
       "--ds-theme-color-panel": variables["--ds-panel"],
@@ -331,7 +414,7 @@
     const focusY = typeof ART.focusY === "number" ? ART.focusY : profile?.focusY ?? 0.5;
     const taskMode = ART.taskMode && ART.taskMode !== "auto"
       ? ART.taskMode : profile?.taskMode || "ambient";
-    const wide = profile?.wide || false;
+    const wide = profile?.wide || profile?.aspect === "wide" || profile?.aspect === "ultrawide";
     const aspect = profile?.aspect || "unknown";
     const focusXValue = `${(clamp(focusX, 0, 1) * 100).toFixed(2)}%`;
     const focusYValue = `${(clamp(focusY, 0, 1) * 100).toFixed(2)}%`;
@@ -569,11 +652,75 @@
   };
 
   const partNodes = new Set();
+  const composerBorderRestores = new Map();
   const queryAll = (selector) => {
     if (!selector) return [];
     try { return [...document.querySelectorAll(selector)]; } catch { return []; }
   };
   const selectorNodes = (key) => queryAll(selectorByKey.get(key)?.selector);
+  const genericNodes = (selector) => queryAll(selector)
+    .filter((node) => node && typeof node.setAttribute === "function");
+  const genericInputNodes = () => genericNodes(
+    'textarea, [contenteditable="true"], [role="textbox"]',
+  ).filter((node) => !node.closest?.('[role="dialog"], [aria-modal="true"]'));
+  const resolvedMainNode = () => {
+    const exact = selectorNodes("shell-main")[0];
+    if (exact) return exact;
+    for (const input of genericInputNodes()) {
+      const main = input.closest?.('main, [role="main"]');
+      if (main && typeof main.setAttribute === "function") return main;
+    }
+    return genericNodes('main, [role="main"]')
+      .find((node) => !node.closest?.('[role="dialog"], [aria-modal="true"]')) ?? null;
+  };
+  const fallbackMainNodes = () => selectorNodes("shell-main").length
+    ? [] : [resolvedMainNode()].filter(Boolean);
+  const fallbackSidebarNodes = () => {
+    if (selectorNodes("left-panel").length) return [];
+    const main = resolvedMainNode();
+    const mainParent = main?.parentElement;
+    if (!main || !mainParent) return [];
+    const candidate = genericNodes('aside, nav[aria-label]')
+      .filter((node) => !main.contains?.(node))
+      .filter((node) => !node.closest?.('[role="dialog"], [aria-modal="true"]'))
+      .find((node) => node.parentElement === mainParent
+        || node.parentElement?.parentElement === mainParent
+        || node.parentElement === mainParent.parentElement);
+    return candidate ? [candidate] : [];
+  };
+  const fallbackComposerNodes = () => selectorNodes("composer-chrome").length
+    ? [] : (() => {
+      const main = resolvedMainNode();
+      for (const input of genericInputNodes()) {
+        if (main && !main.contains?.(input)) continue;
+        const layoutRoot = input.closest?.('[class*="_ComposerLayoutRoot_"]');
+        if (layoutRoot && (!main || main.contains?.(layoutRoot))) return [layoutRoot];
+        const semanticOwner = input.closest?.(
+          '.composer-surface-chrome, [data-composer-surface-variant][data-composer-radius-variant], ' +
+          '[class*="_ComposerLayoutRoot_"]',
+        );
+        if (semanticOwner && (!main || main.contains?.(semanticOwner))) return [semanticOwner];
+        const ownerSelector =
+          '[data-testid*="composer" i], [data-testid*="prompt" i], ' +
+          '[class*="composer" i], [class*="prompt" i]';
+        const nearest = input.closest?.(ownerSelector);
+        if (!nearest || (main && !main.contains?.(nearest))) continue;
+        let owner = nearest;
+        for (let parent = nearest.parentElement; parent && parent !== main;
+          parent = parent.parentElement) {
+          if (parent.matches?.(ownerSelector)) owner = parent;
+        }
+        return [owner];
+      }
+      return [];
+    })();
+  const fallbackComposerToolbarNodes = (composerNodes) => {
+    if (selectorNodes("composer-toolbar").length || !composerNodes.length) return [];
+    return genericNodes(
+      '[data-composer-footer-responsive], [class*="_ComposerLayoutFooter_"], [class*="_footer_"]',
+    ).filter((node) => composerNodes.some((composer) =>
+      composer !== node && composer.contains?.(node)));
+  };
   const addPart = (desired, part, nodes) => {
     for (const node of nodes) {
       if (node && typeof node.setAttribute === "function" && !desired.has(node)) {
@@ -581,21 +728,64 @@
       }
     }
   };
+  const restoreComposerBorders = (node) => {
+    const saved = composerBorderRestores.get(node);
+    if (!saved) return;
+    for (const [property, { value, priority }] of saved) {
+      if (value) node.style.setProperty(property, value, priority);
+      else node.style.removeProperty(property);
+      metrics.styleWrites += 1;
+    }
+    composerBorderRestores.delete(node);
+  };
+  const refreshComposerBorders = (composerNodes) => {
+    const desired = new Set(COMPOSER_BORDER_BRIDGES.length ? composerNodes : []);
+    for (const node of composerBorderRestores.keys()) {
+      if (!desired.has(node)) restoreComposerBorders(node);
+    }
+    for (const node of desired) {
+      if (!node?.style || composerBorderRestores.has(node)) continue;
+      const saved = new Map();
+      for (const { property, variable } of COMPOSER_BORDER_BRIDGES) {
+        saved.set(property, {
+          value: node.style.getPropertyValue(property),
+          priority: node.style.getPropertyPriority(property),
+        });
+        node.style.setProperty(property, `var(${variable})`, "important");
+        metrics.styleWrites += 1;
+      }
+      composerBorderRestores.set(node, saved);
+    }
+  };
+  const resolvedMessageNodes = () => selectorNodes("message").map((node) => {
+    if (!node?.hasAttribute?.("data-local-conversation-user-anchor")) return node;
+    // Current Codex user anchors span the conversation column. Prefer the
+    // adaptive native bubble, while retaining the older anchor as a fallback.
+    return node.querySelector?.(
+      '[class*="max-w-"][class*="rounded-2xl"][class*="text-start"]',
+    ) ?? node;
+  });
   const refreshParts = () => {
     metrics.partPasses += 1;
     const desired = new Map();
     addPart(desired, "root", [document.documentElement]);
-    addPart(desired, "sidebar", selectorNodes("left-panel"));
-    addPart(desired, "main", selectorNodes("shell-main"));
+    addPart(desired, "sidebar", [...selectorNodes("left-panel"), ...fallbackSidebarNodes()]);
     addPart(desired, "header", selectorNodes("header-tint"));
+    // Route-specific parts win when a generic shell collapses home and main
+    // onto the same element.
     addPart(desired, "home", selectorNodes("home-route"));
+    addPart(desired, "main", [...selectorNodes("shell-main"), ...fallbackMainNodes()]);
     addPart(desired, "project-list", selectorNodes("project-selector"));
     addPart(desired, "thread", selectorNodes("thread-surface"));
-    addPart(desired, "message", selectorNodes("message"));
-    addPart(desired, "composer", selectorNodes("composer-chrome"));
-    addPart(desired, "composer-toolbar", selectorNodes("composer-toolbar"));
+    addPart(desired, "message", resolvedMessageNodes());
+    const composerNodes = [...selectorNodes("composer-chrome"), ...fallbackComposerNodes()];
+    addPart(desired, "composer", composerNodes);
+    addPart(desired, "composer-toolbar", [
+      ...selectorNodes("composer-toolbar"), ...fallbackComposerToolbarNodes(composerNodes),
+    ]);
     addPart(desired, "dialog", selectorNodes("overlay-dialog"));
-    const homeHero = selectorNodes("home-icon")[0]?.parentElement;
+    const homeHero = selectorNodes("game-source")[0] ??
+      selectorNodes("home-icon")[0]?.parentElement;
     addPart(desired, "home-hero", homeHero ? [homeHero] : []);
 
     for (const node of partNodes) {
@@ -612,9 +802,11 @@
       }
       partNodes.add(node);
     }
+    refreshComposerBorders(composerNodes);
   };
 
   const removeParts = () => {
+    for (const node of [...composerBorderRestores.keys()]) restoreComposerBorders(node);
     for (const node of partNodes) node.removeAttribute?.(PART_ATTR);
     partNodes.clear();
     for (const node of queryAll(`[${PART_ATTR}]`)) node.removeAttribute?.(PART_ATTR);
@@ -632,9 +824,10 @@
     const overlay = selectorHit("overlay-menu") || selectorHit("overlay-dialog") ||
       selectorHit("overlay-popper");
     let baseState = "thread";
-    if (selectorHit("appearance-radio") || stableTestidHit("theme-preview")) baseState = "settings";
+    if (selectorHit("settings-panel") || selectorHit("appearance-radio") ||
+      stableTestidHit("theme-preview")) baseState = "settings";
     else if (selectorHit("home-icon") || selectorHit("home-route")) baseState = "home";
-    else if (!selectorHit("shell-main")) baseState = "settings";
+    else if (!selectorHit("shell-main") && !document.querySelector('main, [role="main"]')) baseState = "settings";
     const missingL1 = SELECTOR_CONTRACT.selectors
       .filter((entry) => entry.tier === "L1" && entry.required &&
         scopeMatches(entry.scope, baseState, overlay) && !selectorHit(entry.key))
@@ -733,7 +926,10 @@
   };
   if (typeof MutationObserver === "function") {
     rootObserver = new MutationObserver(() => scheduleEnsure({ root: true }));
-    partObserver = new MutationObserver(() => scheduleEnsure({ parts: true }, 80));
+    // SPA route changes are observable as DOM mutations even when Chromium's
+    // Navigation API emits no event. Keep verification scope and public parts
+    // derived from the same post-mutation tree.
+    partObserver = new MutationObserver(() => scheduleEnsure({ scope: true, parts: true }, 80));
   }
 
   let mediaQuery = null;
@@ -803,7 +999,7 @@
     bodyReadyHandler = () => {
       if (!window[DISABLED_KEY]) {
         observeBody();
-        scheduleEnsure({ parts: true }, 0);
+        scheduleEnsure({ scope: true, parts: true }, 0);
       }
     };
     document.addEventListener("DOMContentLoaded", bodyReadyHandler, { once: true });

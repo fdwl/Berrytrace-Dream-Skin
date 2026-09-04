@@ -1,5 +1,55 @@
 # Windows Changelog
 
+## Unreleased
+
+### 新增
+
+- 托盘新增 System / English / 中文语言选择，选择会持久保存，并覆盖状态、主题操作、更新、恢复/卸载和一键换肤流程；System 会根据系统 UI 语言自动选择中文或英文（#351）。
+
+### 修复
+
+- 完整补齐 Codex 26.818 主题兼容（#373，感谢 @QingYe-05 的 Windows 实机源码证据）：托盘“更换背景图”现在保留当前 `theme.json`、颜色、构图参数和已验证的 `theme.css`；共享 renderer 同时清除 sticky composer 的两层原生渐变、约束 Markdown 宽表、映射真实用户气泡，并改善流式思考、命令详情、新版动作按钮、横向壁纸和顶部栏的可读性；固定品牌/状态伪文案不再覆盖原生界面。
+- 修复新版 Codex 把输入框壳迁移到 `_ComposerLayoutRoot_` 后，Dream Skin 误把 `_ComposerLayoutFooter_` 标记为 composer、导致主题输入框样式只落在底部工具栏的问题；同时排除 `/avatar-overlay` 与 Pet composition surface，并在发现旧注入时执行移除与验证，避免主题壁纸污染透明 Pet 窗口形成矩形背景。
+- 修复 Chromium 136 及更高版本上 Dream Skin 完全打不开 CDP、主题一点都不生效的问题（#235、#363）：Chromium 会忽略指向默认数据目录的 `--remote-debugging-port`，而 Windows 启动器此前只在显式传入 `-ProfilePath` 时才追加 `--user-data-dir`，而出厂路径里没有任何调用方传过它——这个分支恒为假。现在默认创建并复用 `%LOCALAPPDATA%\CodexDreamSkin\cdp-profile`，与官方 Codex profile 隔离，不修改 WindowsApps；显式 `-ProfilePath` 仍可覆盖。注意首次使用受管 profile 需要在该 profile 内重新登录一次 Codex，之后会持久保留。
+- 修复 Windows 首次或冷启动状态下从 DreamSkin.cc 一键换肤被错误拒绝的问题。客户端现在会在下载主题包前安全启动并验证当前主题；如果官方 Codex 未提供可用 CDP 端点，则在任何主题库或活动主题写入前返回明确失败。
+- 修复透明或极端显式强调色下按钮文字对比度不稳定的问题：共享渲染器现在按真实 composer 面板表面和最坏背景计算前景色，并正确处理 alpha 与 RGB 夹取（#351）。
+- 修复 Windows 启动失败后只留下颜色、背景等部分外观状态的问题（#354、#357）：新增有界持久 journal 和三方恢复，保留较新的用户编辑；一键换肤在慢启动、超时或渲染未确认时不强杀仍运行的子进程，也不留下混合的活动主题文件，并提供可区分的有界失败原因。该修复处理本地失败启动的状态一致性，不改变官方 Codex 的 CDP 能力。
+- 修复 Windows PowerShell 5.1 在中文、日文等非 ASCII 临时目录下读取
+  bundled Node.js `process.execPath` 时受控制台代码页影响，导致安装器错误
+  报告「Node.js executable path could not be validated」的问题。路径探针现在
+  通过 ASCII Base64 传输原始 UTF-8 字节并严格解码，仍保留签名、版本和文件
+  存在性校验；无效探针不会回退到未经确认的候选路径（#337）。
+
+- Windows 路径穿越校验此前会把合法的、以 `.` 开头的主题文件名也当作可疑路径拒绝；现在能正确区分它们与真正的 `..` 路径穿越（#296）。
+- Windows 运行时加载主题前强制校验 `schemaVersion` 必须是数字 `1`，拒绝缺失或未来版本的 schema（#299）。
+- 主题包 manifest 时间戳校验拒绝不合法的 RFC 3339 值（#297），双平台共享。
+
+### 内部
+
+- 同步 v1.5.16 版本号，发布 #373 在 v1.5.15 中遗漏的完整 Codex 26.818 兼容修复。
+- 同步 v1.5.15 版本号，发布 Codex 26.814-26.818 composer 根节点与 Pet 透明 surface 兼容修复、原生侧栏图标颜色保留，以及受限 Safe CSS composer 边框桥接（#372、#368、#366）。
+- 同步 v1.5.14 版本号，发布 Windows 一键换肤冷启动会话基线修复（#352、#360）。
+- 同步 v1.5.13 版本号，发布本轮双端语言、对比度和 Windows 失败启动外观回滚修复。
+- 同步 v1.5.12 版本号，发布上述修复。
+- README / SECURITY.md 补充说明换肤期间本机回环 CDP 调试口未做身份验证这一既有安全边界（#18）。
+- CI 新增对 shared runtime 与 tools 目录的测试覆盖（#300）。
+- 修复共享的 `image-metadata.mjs` 生成源与 macOS 产物不同步的问题：Windows 一侧此前完全没有拿到 `readRawDimensions` 拆分后的能力，现已随双端产物重新生成补上。
+
+- 修复 Codex Desktop 26.727 设置页改用新版导航标记后，被注入器误判为非 ChatGPT 页面并报 `No page matched the expected ChatGPT shell markers` 的问题。双端共享契约现识别 `data-settings-panel-slug="general-settings"`，同时保留旧版外观设置锚点和严格的 `app:` 来源校验；首页与任务页的 L1 校验边界不变。
+- 修复 Codex Desktop 26.727 更新后主区域、顶栏和顶部渐隐仍保持原生白底，或注入被错误报告为成功的问题（#320、#322、#326、#330）。共享选择器现同时识别旧结构与新版 app-shell 标记，首页和普通任务页必须达到完整 L1 可见性后才会提交成功。
+- 同 ID 社区主题再次导入时原地升级，不再生成重复的 `id-2` / `id-3` 目录；仅在身份与完整语义指纹都匹配时清理旧后缀副本，缺失或非法 ID 使用双端一致的稳定映射（#318）。
+- 主题目录替换增加持久化 journal 与 commit marker。PowerShell 进程被强制终止或系统重启后，托盘启动和下一次导入会恢复未提交的旧主题；只有已持久提交且指纹匹配的新主题会被保留，损坏或冲突证据 fail-closed。
+- 社区 Safe CSS 与网站合同对齐：保留注册壁纸、支持有界组合玻璃滤镜，并修复搜索框出现在输入框前时漏标真实 composer 的问题。
+- 修复 Windows 上从 Chrome/Edge 点击 DreamSkin.cc「一键换肤」无法稳定唤起或完成的问题（#307）。安装器持久注册项不再把 64 位浏览器不可访问的 `{sysnative}` 写入 HKCU `dreamskin://` handler；handler 同时接受网页规范链接和 Windows/浏览器归一化后的 `dreamskin://apply/?version=...` 形式；应用阶段与 macOS 对齐为 `colors` 合同、可见首页验证和首次失败后的激活 + `--once` 重试，并加固 watcher 进程关闭与成功提示。
+- 修复安装器遇到 Codex `config.toml` 中合法多行数组时直接拒绝写入的问题（#313）。配置编辑器现在按 TOML 结构扫描 table header，安全跨过普通多行数组并保持原字节风格；未闭合数组、括号不匹配，以及 Dream Skin 需要改写的目标 key 自身为多行值时仍会在写入前 fail-closed。
+- 修复 v1.5.6 安装器在部分 Windows 10/11 环境中校验自带 Node.js 签名时，PowerShell 自动加载 `Microsoft.PowerShell.Security` / `Get-AuthenticodeSignature` 失败而中止安装的问题（#313、#314）。签名校验现在会在执行 `node.exe` 前显式加载安全模块，并在模块名加载失败时回退到 `$PSHOME` 下的系统模块清单路径；签名状态和发行者校验仍保持 fail-closed。
+- 修复社区主题一键换肤和 ZIP 导入拒绝 `backdrop-filter: blur(var(--ds-theme-surface-blur))` 的问题（#307、#312）。Safe CSS 仍只允许 `none`、0-20px blur 或注册的主题 blur 变量，不放宽到任意 filter 函数。
+- 修复 Codex Desktop 26.721.x 首页在 `home-icon` 延迟渲染时被误判为注入校验失败的问题（#307）。Windows 校验现在与 macOS 一样复用已由首页内容信号解析出的 `[role="main"]` 容器；严格的 `home-icon` 路径仍优先，旧版行为不变。
+
+### 内部
+
+- 同步 v1.5.11 版本号，发布 Codex 26.727 设置页识别修复。
+
 ## 1.5.6 — 2026-07-26
 
 ### 安全
