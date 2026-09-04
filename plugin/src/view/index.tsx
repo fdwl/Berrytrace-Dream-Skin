@@ -14,6 +14,8 @@ import {
   Library,
   Loader2,
   RefreshCw,
+  ShieldAlert,
+  ExternalLink,
 } from 'lucide-react';
 import {
   transformDreamSkinToBerryTrace,
@@ -36,6 +38,7 @@ import {
 } from '../adapter/package-importer';
 import {
   DREAMSKIN_GALLERY_URL,
+  DREAMSKIN_SITE_URL,
   DOWNLOAD_INTERCEPT_PATTERNS,
   extractVersionId,
   fetchThemeMeta,
@@ -44,7 +47,7 @@ import {
   verifyPackageChecksum,
   VERSION_ID_RE,
 } from '../adapter/dreamskin-api';
-import { GALLERY_CSS, GALLERY_JS } from './gallery-inject';
+import { GALLERY_CSS, GALLERY_JS, DARK_OVERRIDE_CSS } from './gallery-inject';
 import { SkinMenuItem, type SkinMenuEntry } from './SkinMenuItem';
 
 declare const window: any;
@@ -100,6 +103,9 @@ const EmbeddedSiteComp: React.ComponentType<{
   src: string;
   injectCSS?: string;
   injectJS?: string;
+  /** 可随时改的一段 CSS（走 guest 里一个固定 id 的 style 节点，整体替换、天然幂等）。
+      我们拿它让站点跟着 App 一起明暗 —— 不能用 injectCSS，那条每调一次多插一层。 */
+  dynamicCSS?: string;
   onGuestMessage?: (payload: unknown) => void;
   onProtocolLink?: (url: string) => void;
   onReady?: () => void;
@@ -205,7 +211,43 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
   const [statusMessage, setStatusMessage] = useState<string>('就绪 - 支持拖拽 .zip / .json 主题包至此安装');
   const [isDragging, setIsDragging] = useState<boolean>(false);
   /** 顶部页签。默认落在主题库 —— 网站嵌进来之后它才是主入口，上传退居次要。 */
-  const [activeTab, setActiveTab] = useState<'gallery' | 'mine'>('gallery');
+  const [activeTab, setActiveTab] = useState<'gallery' | 'mine' | 'about'>('gallery');
+
+  /**
+   * 宿主此刻是不是深色。用来让嵌进来的站点跟着一起暗
+   * （App 深色而站点一片白，李博的原话是「特别刺眼」）。
+   *
+   * 两条来源都要：`sdk.ui.getTheme()` 给初值，`onThemeChange` 给后续变化。
+   * 老宿主没有这两个 API 时退到直接读 documentElement 的 .dark ——
+   * 插件和宿主在同一个 document 里，这条永远成立。
+   */
+  const [hostDark, setHostDark] = useState<boolean>(() => {
+    try {
+      const ui = (propSdk || (window as any).berrytracePluginSdk)?.ui;
+      if (typeof ui?.getTheme === 'function') return ui.getTheme() === 'dark';
+    } catch { /* 落到下面那条 */ }
+    return typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+  });
+
+  useEffect(() => {
+    const ui = (propSdk || (window as any).berrytracePluginSdk)?.ui;
+    if (typeof ui?.onThemeChange === 'function') {
+      try {
+        const off = ui.onThemeChange((mode: 'light' | 'dark') => setHostDark(mode === 'dark'));
+        if (typeof off === 'function') return off;
+      } catch (err) {
+        console.warn('🎨 [DreamSkin] onThemeChange 订阅失败，退到 DOM 观察:', err);
+      }
+    }
+    // 兜底：盯 documentElement 的 class。
+    // 🔴 宿主换明暗走的就是这个 class（SkinLayer 也直接写它），所以这条比
+    // 事件更底层、更不会漏 —— 但它只在事件那条不可用时才启用，避免重复触发。
+    if (typeof document === 'undefined') return;
+    const root = document.documentElement;
+    const obs = new MutationObserver(() => setHostDark(root.classList.contains('dark')));
+    obs.observe(root, { attributes: true, attributeFilter: ['class'] });
+    return () => obs.disconnect();
+  }, [propSdk]);
   /** 正在从主题库装的那个版本 id（用来把按钮转成转圈）。 */
   const [installingVersion, setInstallingVersion] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -830,7 +872,34 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
   const TABS = [
     { id: 'gallery' as const, label: '主题库', icon: Library },
     { id: 'mine' as const, label: `我的皮肤${themes.length ? ` (${themes.length})` : ''}`, icon: Brush },
+    { id: 'about' as const, label: '免责声明', icon: ShieldAlert },
   ];
+
+  /**
+   * 用**系统默认浏览器**打开 dreamskin.cc。
+   *
+   * 🔴 刻意不走 `openUrl({ internal: true })`（宿主内置浏览器窗口），也不走
+   * 「主题库」那个内嵌 webview：免责声明这一页的意思正是**把边界划出来** ——
+   * 让用户清楚地离开我们的应用、到对方站点上去。在自家窗口里打开，
+   * 这句话就白说了。
+   */
+  const openDreamSkinSite = () => {
+    const s2 = propSdk || (window as any).berrytracePluginSdk;
+    try {
+      if (typeof s2?.system?.openExternal === 'function') {
+        void s2.system.openExternal(DREAMSKIN_SITE_URL);
+        return;
+      }
+      // 老宿主没有 openExternal 时退到 openUrl，显式要求 internal:false。
+      if (typeof s2?.system?.openUrl === 'function') {
+        void s2.system.openUrl(DREAMSKIN_SITE_URL, { internal: false });
+        return;
+      }
+      window.open(DREAMSKIN_SITE_URL, '_blank', 'noopener,noreferrer');
+    } catch (err) {
+      console.warn('🎨 [DreamSkin] 打开官网失败:', err);
+    }
+  };
 
   const activeTheme = themes.find((t) => t.id === activeThemeId) || null;
 
@@ -905,6 +974,9 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
               src={DREAMSKIN_GALLERY_URL}
               injectCSS={GALLERY_CSS}
               injectJS={GALLERY_JS}
+              // 🔴 走 dynamicCSS 而不是拼进 injectCSS：后者是 insertCSS，
+              // 每调一次多插一层且撤不掉，切一次明暗就叠一层旧的压在上面。
+              dynamicCSS={hostDark ? DARK_OVERRIDE_CSS : ''}
               onGuestMessage={handleGuestMessage}
               onProtocolLink={(url: string) => {
                 // 兜底通道：注入脚本已经把 dreamskin:// 链接就地改写了，
@@ -1074,6 +1146,80 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
               })}
             </div>
           )}
+        </div>
+      )}
+
+      {/* ── 页签三：免责声明 ────────────────────────────────────────
+          🔴 这一页是**必须有**的，不是装饰：主题库里展示的是第三方站点的
+          内容与他人的作品，权责边界不写出来，出了纠纷会被算到我们头上。
+          与站点作者沟通过嵌入这件事**不改变**下面任何一条 —— 沟通不是授权，
+          更不是背书。改这一页的措辞前请先想清楚这一点。 */}
+      {activeTab === 'about' && (
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6">
+          <div className="max-w-2xl mx-auto flex flex-col gap-5">
+            <div className="flex items-start gap-3">
+              <ShieldAlert className="size-5 text-brand shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <h2 className="text-sm font-bold text-foreground">关于 DreamSkin 与免责声明</h2>
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  本插件由 BerryTrace 提供，不隶属于 DreamSkin，也不是其官方客户端。
+                </p>
+              </div>
+            </div>
+
+            <section className="space-y-1.5">
+              <h3 className="text-xs font-semibold text-foreground">这是什么</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                DreamSkin（dreamskin.cc）是由第三方独立开发并运营的主题社区，与 BerryTrace
+                是彼此独立的两个项目。本插件只做一件事：把你选中的主题包取回本地，
+                转换成 BerryTrace 能识别的外观配置。
+              </p>
+            </section>
+
+            <section className="space-y-1.5">
+              <h3 className="text-xs font-semibold text-foreground">内容来源</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                「主题库」页签里显示的全部网页内容、主题作品、文字与图片，均由 dreamskin.cc
+                及其用户提供，<span className="text-foreground">不由 BerryTrace 提供、审核或存储</span>。
+                我们不参与其内容生产，也不对其准确性、合法性、安全性或可用性作出任何担保。
+              </p>
+            </section>
+
+            <section className="space-y-1.5">
+              <h3 className="text-xs font-semibold text-foreground">版权与责任</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                每一份主题包的著作权归其原作者所有。若某个主题涉及侵权、违规或其他纠纷，
+                <span className="text-foreground">责任由该主题的发布者与 dreamskin.cc 承担，与 BerryTrace 无关</span>。
+                请你在使用前自行确认所下载内容的授权范围。如果你是权利人并认为某个主题
+                侵犯了你的权益，请直接联系 dreamskin.cc 处理 —— 我们没有能力也没有权限
+                下架对方站点上的内容。
+              </p>
+            </section>
+
+            <section className="space-y-1.5">
+              <h3 className="text-xs font-semibold text-foreground">关于嵌入</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                我们已就「在 BerryTrace 内嵌入展示」与站点作者取得沟通。这不改变上述权责划分，
+                也不代表双方存在合作、代理、赞助或相互背书的关系。
+              </p>
+            </section>
+
+            <section className="space-y-2">
+              <h3 className="text-xs font-semibold text-foreground">想自己做皮肤？</h3>
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                主题的制作、编辑与发布都在 DreamSkin 官网上完成，本插件不提供编辑能力。
+                下面这个地址会在<span className="text-foreground">你的系统浏览器</span>里打开：
+              </p>
+              <button
+                type="button"
+                onClick={openDreamSkinSite}
+                className="self-start flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-xl border border-black/10 dark:border-white/10 bg-transparent text-foreground hover:bg-accent transition-colors cursor-pointer"
+              >
+                <ExternalLink className="size-3.5 shrink-0" />
+                <span>{DREAMSKIN_SITE_URL}</span>
+              </button>
+            </section>
+          </div>
         </div>
       )}
     </div>
@@ -1252,7 +1398,7 @@ function openGalleryFromMenu(): void {
 }
 
 /**
- * 把「皮肤」这一条挂进头像下拉菜单。
+ * 把「DreamSkin 皮肤」这一条挂进头像下拉菜单。
  *
  * 座位是宿主 0904 新开的 `user-profile-menu:items`（配色之下、分割线之上）。
  * 宿主版本旧时这个座位不存在 —— `registerSlotItem` 对不存在的座位
@@ -1271,23 +1417,20 @@ function registerAvatarMenuItem(): (() => void) | null {
       slotId: 'user-profile-menu:items',
       id: 'dream-skin:menu',
       priority: 50,
-      title: '皮肤',
+      title: 'DreamSkin 皮肤',
       render: () =>
         React.createElement(SkinMenuItem, {
-          readState: () => {
-            // SkinMenuItem 要的是同步返回值，而读存储是异步的。
-            // 用一份**上一次读到的**缓存先画出来，同时发起刷新 ——
-            // 菜单是 hover 展开的，第二次展开就一定是新的了。
-            void readSkinsForMenu().then((v) => { menuStateCache = v; });
-            return menuStateCache;
-          },
+          // 直接把异步读取交给它。组件自己在**挂载时**和**每次展开时**各拉一次，
+          // 并带请求序号防乱序 —— 见 SkinMenuItem 里 refresh() 的说明。
+          //
+          // 🔴 这里以前塞的是一份同步缓存（初值为空），后果是第一次展开
+          // 菜单里一套皮肤都没有，得关掉再展开一次。别改回去。
+          loadState: readSkinsForMenu,
           onOpenGallery: openGalleryFromMenu,
           onResetAppearance: () => { void resetAppearanceFromMenu(); },
           onApplySkin: (id: string) => { void applySkinFromMenu(id); },
         }),
     });
-    // 先热一次缓存，让第一次展开就有内容。
-    void readSkinsForMenu().then((v) => { menuStateCache = v; });
     return typeof dispose === 'function' ? dispose : null;
   } catch (err) {
     console.warn('🎨 [DreamSkin] 注册头像菜单条目失败:', err);
@@ -1295,8 +1438,6 @@ function registerAvatarMenuItem(): (() => void) | null {
   }
 }
 
-/** 菜单状态的一份快照。见 registerAvatarMenuItem 里 readState 的说明。 */
-let menuStateCache: { skins: SkinMenuEntry[]; activeId: string | null } = { skins: [], activeId: null };
 
 /**
  * BerryTrace 插件 View 进程入口文件类

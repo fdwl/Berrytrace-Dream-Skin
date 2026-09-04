@@ -40,6 +40,9 @@ export const DREAMSKIN_API_BASE = 'https://api.dreamskin.cc';
 /** 主题库页面。 */
 export const DREAMSKIN_GALLERY_URL = 'https://dreamskin.cc/gallery';
 
+/** 站点首页。免责声明那一页用它，且**只在系统浏览器里打开**（不嵌、不进内置窗口）。 */
+export const DREAMSKIN_SITE_URL = 'https://dreamskin.cc';
+
 /**
  * 版本 id 的形状。与站点自己那条正则一致（bundle 里的 `lv`）。
  * 校验它是必需的：这个字符串会被拼进 URL，也会被拿去当色系 id。

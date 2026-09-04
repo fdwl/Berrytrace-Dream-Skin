@@ -114,6 +114,94 @@ export const GALLERY_CSS = `
 `;
 
 /**
+ * 让嵌进来的站点跟着 App 一起变深色。
+ *
+ * ═══ 为什么只能靠覆盖 ═══════════════════════════════════════════════════
+ * 〔0905 无头浏览器实测〕**dreamskin.cc 自己完全不支持暗色**，四条路全堵：
+ *   · `prefers-color-scheme` 规则数 = **0**（三份 CSS 共 125093 字节里一条都没有）；
+ *   · `<html>` 上只有 `lang`，`<body>` 零属性 —— 没有 `.dark`、没有 `data-theme`；
+ *   · `<meta name="color-scheme" content="light">` **写死 light**；
+ *   · localStorage 里 7 个 `dreamskin.*` 键，没有一个跟外观有关。
+ * 负向验证：强行 `classList.add('dark')` + `data-theme=dark` + `style.colorScheme=dark`
+ * 之后再量，body 仍是 `oklch(0.983 …)` —— **一点没动**，因为 CSS 里根本没有对应选择器。
+ * ⇒ 想让它变暗，只能我们自己覆盖。
+ *
+ * ═══ 为什么覆盖变量而不是逐个元素改 ═══════════════════════════════════════
+ * 整站配色由 `:root` 上 8 个变量驱动。实测覆盖率（有背景色的元素里"浅色底"的个数）：
+ *   · /gallery：25 → 8   · /：17 → 4
+ * 剩下的那几个只有**两类**需要单独写规则，就是下面 ② ③。
+ * 逐元素改的话，对方一改版就大面积失效，而且失效是静默的。
+ *
+ * 🔴 失效条件：站点改版导致 `:root` 上这组变量名变化时，本段整体重量一次。
+ * 判据脚本：`plugin/scripts/verify-gallery-inject.mjs`。
+ */
+export const DARK_OVERRIDE_CSS = `
+/* ① 站点的 8 个配色变量，翻成深色。
+      原值（实测）：--bg #faf9f8 / --panel #fdfcfc / --mist #ededea
+                    --text #1e1f22 / --muted #66696e / --ink #16181c
+                    --line rgba(23,24,28,.1) / --site-accent #3f4650 */
+:root {
+  --bg:          oklch(0.185 0.006 260);
+  --panel:       oklch(0.225 0.006 260);
+  --mist:        oklch(0.270 0.006 260);
+  --text:        oklch(0.930 0.004 260);
+  --muted:       oklch(0.680 0.008 260);
+  --ink:         oklch(0.950 0.003 260);
+  --line:        rgba(255, 255, 255, .12);
+  --site-accent: #9fb0c4;
+  /* 这两个站点**从来没定义过**（三份 CSS 里 grep 命中 0），一直在吃 fallback ——
+     分页控件的 hover 与当前页底色。补上就跟着一起暗，属于白捡的。 */
+  --hairline:    rgba(255, 255, 255, .12);
+  --panel-alt:   rgba(255, 255, 255, .06);
+  /* 让滚动条、原生表单控件也跟着暗。CSS 的 color-scheme 压得过 <meta>。 */
+  color-scheme: dark;
+}
+
+/* ② 主按钮必须单独写死。
+      🔴 站点的规则是 \`.btn.is-primary{background:var(--ink);color:#fbfbfa}\` ——
+      --ink **同时**当 h1 文字色和主按钮底色用。①把 --ink 翻浅之后，
+      这里就变成 #fbfbfa 浅字压在浅底上，**一个字都看不见**。 */
+.btn.is-primary,
+a.btn.is-primary,
+.community-card-preview.btn.is-primary,
+.community-card-apply.btn.is-primary,
+.community-preview-apply.btn.is-primary {
+  background: oklch(0.950 0.003 260) !important;
+  color: oklch(0.200 0.008 260) !important;
+}
+
+/* ③ 「全部 / 浅色 / 深色」那个筛选胶囊：在 gallery 的 CSS 里是**硬编码字面量**
+      \`background: rgb(237,237,234)\`，不走变量，只能单独覆盖。 */
+.gallery-community-appearance {
+  background: oklch(0.270 0.006 260) !important;
+}
+
+/* ④ 🔴 皮肤预览区**必须还原成原值**。
+      那里画的是「这套皮肤长什么样」，用的是皮肤自己的配色（实测量到过
+      rgb(66,255,114) 这种绿）。把我们的深色变量继承进去，用户看到的预览
+      就不是那套皮肤真实的样子了 —— 而这正是他来这个页面要看的东西。
+      在子树上重新声明一遍原值即可，不影响外面。 */
+.community-card-thumbnail,
+.community-preview-stage,
+.community-home-card-thumbnail {
+  --bg:    oklch(98.3% .002 95);
+  --panel: oklch(99.2% .001 95);
+  --mist:  oklch(94.5% .003 95);
+  --text:  oklch(24% .006 260);
+  --muted: oklch(52% .008 260);
+  --ink:   oklch(21% .008 260);
+  --line:  rgba(23, 24, 28, .1);
+  color-scheme: light;
+}
+
+/* ⑤ 我们自己那颗按钮跟着反色（浅底深字），与站点主按钮保持一致。 */
+.bt-apply-btn {
+  background: oklch(0.950 0.003 260);
+  color: #16181c;
+}
+`;
+
+/**
  * 注入的 JS。
  *
  * ⚠️ 这段字符串会被 `EmbeddedSite` 包进一层 try/catch + 幂等 marker 再
@@ -186,6 +274,38 @@ function actionHost(card, link) {
   );
 }
 
+/**
+ * 站点**自己**那颗一键换肤在不在（针对某个版本）。
+ *
+ * 🔴 这是 0905 那个「有时候皮肤下面会多一个一键换肤」的判据。
+ * 站点按 UA 判平台：macOS / Windows 上、且主题 platforms 命中时，它会渲染
+ * 自己的 <a href="dreamskin://apply?version=…">。Linux 上一颗都不渲染 ——
+ * 所以这个 bug 在车间机上**永远复现不出来**，只有李博的 Mac 上才有。
+ *
+ * 站点那颗经 hijackProtocolLinks() 接管之后功能与我们的完全一致，
+ * 所以有它就不该再补一颗。
+ */
+function hasNativeApply(v) {
+  return !!document.querySelector('a[data-bt-hijacked="1"][data-bt-version="' + v + '"]');
+}
+
+/**
+ * 站点那颗后到时，把我们先注入的那颗撤掉。
+ *
+ * 🔴 少了这一步，「先注入后重复」这条时序仍然会漏：站点是 SPA，
+ * 首屏 HTML 里没有按钮，hydration 之后才渲染出来 —— 那时我们的按钮
+ * 早就挂上去了。这也是李博说「**有时候**」的原因：快的时候看不到，
+ * 慢的时候两颗一起在。
+ */
+function dropRedundantOwnButtons() {
+  var mine = document.querySelectorAll('.bt-apply-btn[data-bt-version]');
+  for (var i = 0; i < mine.length; i++) {
+    var b = mine[i];
+    var v = b.getAttribute('data-bt-version');
+    if (v && hasNativeApply(v) && b.parentNode) b.parentNode.removeChild(b);
+  }
+}
+
 /** 扫一遍所有卡片，缺按钮的补上。幂等。 */
 function decorateCards(root) {
   var links = root.querySelectorAll('a[href*="/themes/ver_"]');
@@ -205,6 +325,8 @@ function decorateCards(root) {
     // decorateCards() 又从页内某条指向本主题的链接上再挂一颗（实测就是 2 颗）。
     // 一个版本一颗按钮，这才是用户预期。
     if (document.querySelector('.bt-apply-btn[data-bt-version="' + v + '"]')) continue;
+    // 站点自己那颗已经在（且已被接管）⇒ 不补，用它的，样式还原生。
+    if (hasNativeApply(v)) continue;
     if (seen[v]) continue;
     seen[v] = 1;
     actionHost(card, link).appendChild(makeButton(v));
@@ -219,6 +341,7 @@ function decorateDetail() {
   var v = versionFromHref(location.pathname);
   if (!v) return;
   if (document.querySelector('.bt-apply-btn[data-bt-version="' + v + '"]')) return;
+  if (hasNativeApply(v)) return;   // 站点自己那颗在，用它的
   // 详情页上站点自己那颗按钮是 a.community-preview-apply（macOS/Windows 才有），
   // 它不在时那块位置由 p.community-preview-apply-unavailable 占着（已被 CSS 藏掉）。
   // 两者的父节点是同一个，所以先找它们。
@@ -260,7 +383,12 @@ function hijackProtocolLinks(root) {
     var m = (a.getAttribute('href') || '').match(/version=([^&]+)/);
     if (!m) continue;
     var v = decodeURIComponent(m[1]);
-    if (a.dataset) a.dataset.btHijacked = '1';
+    if (a.dataset) {
+      a.dataset.btHijacked = '1';
+      // 记下版本号，好让 hasNativeApply() 一次 querySelector 就查得到 ——
+      // 否则每次都要把所有 dreamskin:// 链接的 href 重新 parse 一遍。
+      a.dataset.btVersion = v;
+    }
     a.addEventListener('click', function (vv) {
       return function (ev) {
         ev.preventDefault();
@@ -274,12 +402,17 @@ function hijackProtocolLinks(root) {
 function sweep() {
   try {
     hideNoticesByText(document);
-    // 🔴 detail 必须在 cards **之前** —— 两者现在共用「一个版本一颗按钮」的全局去重，
-    // 谁先跑谁占位。详情页上 detail 那颗落在操作区（正位），cards 那颗会落在
-    // 某条链接旁边（歪的）。顺序反了不会报错，只是按钮长在奇怪的地方。
+    // 🔴 次序是判据的一部分，四步都不能换位置：
+    //   ① hijack 先跑 —— 后面两步要靠 data-bt-hijacked 判断「站点自己那颗在不在」；
+    //      放到最后的话每一轮 sweep 都会先补一颗我们的，再接管一颗站点的 ⇒ 两颗。
+    //   ② 清理：站点那颗是 hydration 之后才出现的，我们可能已经先补过了。
+    //   ③ detail 在 cards 之前 —— 两者共用「一个版本一颗」的全局去重，谁先跑谁占位。
+    //      详情页上 detail 那颗落在操作区（正位），cards 那颗会落在某条链接旁边（歪的）。
+    // 顺序错了都不报错，只是按钮多一颗或长在奇怪的地方。
+    hijackProtocolLinks(document);
+    dropRedundantOwnButtons();
     decorateDetail();
     decorateCards(document);
-    hijackProtocolLinks(document);
   } catch (e) {
     post({ type: 'error', message: String(e && e.message || e) });
   }
