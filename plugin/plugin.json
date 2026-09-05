@@ -1,7 +1,7 @@
 {
   "id": "org.dreamskin.plugin.dream-skin",
   "name": "BerryTrace DreamSkin 主题与皮肤中心",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "type": "panel",
   "view": "dist/view.js",
   "description": "无缝兼容 DreamSkin (.zip / theme.json) 资源包的 BerryTrace 原生主题与个性化皮肤插件",

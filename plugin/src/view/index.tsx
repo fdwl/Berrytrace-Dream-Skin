@@ -1281,22 +1281,115 @@ export class DreamSkinView {
  * 与面板共用的只有存储键和 adapter 函数（那两样才是真正的单一事实源）。
  */
 
+/**
+ * 菜单这条路自己持有的那份 SDK。
+ *
+ * 🔴 为什么不能读 `window.berrytracePluginSdk`：**宿主从来没有设过这个全局。**
+ * 〔0905 实机 CDP 量在李博 Mac 上〕`Object.keys(window)` 里与插件相关的只有
+ * `__berrytracePluginScopes` / `berrytrace` / `PluginRegistry` 这几个，
+ * 没有 `berrytracePluginSdk`；宿主是 `createSDKInstance` **每个插件造一份**，
+ * 作为 `app` 传进插件构造函数，从不挂全局。
+ *
+ * 后果不是报错，是每次都稳稳地走 warn 那一支：
+ *   `🎨 [DreamSkin] 宿主没有 ui.registerSlotItem，跳过头像菜单贡献`
+ * ⇒ 头像菜单里那一格**从来没有被注册过**（实机 `getSlotItems` 恒为空数组）。
+ *
+ * 这个洞能藏这么久，是因为**面板里的同类代码写的是 `propSdk || window.…`**，
+ * 靠 props 那一半一直好使 —— 面板功能全正常，于是没人怀疑菜单这条路取不到 SDK。
+ * 这正是 CLAUDE.md 六点七说的「有退化路径时，别问『调到了吗』，要问『走的哪条路』」。
+ *
+ * 失效条件：宿主哪天真的开始设 `window.berrytracePluginSdk` 了，这段注释可以删。
+ */
+let menuSdk: any = null;
+
+/** 由 `onload(app)` 注入。**必须在 `registerAvatarMenuItem()` 之前调**。 */
+function setMenuSdk(app: any): void {
+  menuSdk = app ?? null;
+  // 🔴 这里必须出声。菜单那条路全靠 `sdk.storage` 读皮肤列表，拿不到的表现是
+  // **菜单里永远转着骨架** —— 一个不会自己停下来的加载态，没有任何报错。
+  // （0905 实机就撞上了：配色、明暗、分组标题全渲染出来了，就是皮肤列表空着。）
+  // 缺件必须出声。菜单这条路上每一样东西缺了，表现都是「界面看着正常、
+  // 就是某一块永远空着或者永远转着骨架」，没有任何一处会报错。
+  // 〔0905 实机确认这三样在李博机器上都在〕
+  const missing = [
+    menuSdk?.ui?.registerSlotItem ? '' : 'ui.registerSlotItem',
+    menuSdk?.ui?.registerPalette ? '' : 'ui.registerPalette',
+    menuSdk?.storage ? '' : 'storage',
+  ].filter(Boolean);
+  if (missing.length) {
+    console.warn(
+      '🎨 [DreamSkin] 注入的 SDK 缺少：' + missing.join('、') +
+      ' —— 头像菜单里对应的那部分会是空的。SDK keys=' +
+      (menuSdk ? Object.keys(menuSdk).join(',') : '(null)')
+    );
+  }
+}
+
+/** 取 SDK：优先用注入的那份，全局只当兜底（今天它恒为 undefined，留着不碍事）。 */
+function getMenuSdk(): any {
+  if (menuSdk) return menuSdk;
+  return typeof window !== 'undefined' ? (window as any).berrytracePluginSdk : null;
+}
+
+/* ── 皮肤数据到底存在哪儿 ────────────────────────────────────────────────────
+ *
+ * 🔴 **存在 `window.localStorage`，不在 `sdk.storage`。** 这不是设计，是既成事实：
+ * 面板里读写皮肤的每一处（`:268` 读、`:354` 写、`:529` 清）判据都是
+ *     `const sdk = window.berrytracePluginSdk;  if (sdk?.storage) … else localStorage`
+ * 而那个全局**从来不存在**（见 `menuSdk` 上面那段实机取证）⇒ 分支恒走 else
+ * ⇒ 用户所有已装皮肤都躺在 localStorage 里，一条都没进过 `sdk.storage`。
+ *
+ * 🔴 0905 把菜单这条路改成拿真 SDK 之后，`sdk?.storage` **头一次变成了真**，
+ * 菜单于是去读一个从来没被写过的空分区。实机表现：明暗、配色、分组标题全都
+ * 渲染出来了，**只有皮肤列表永远转着骨架** —— 一个不会自己停下来的加载态，
+ * 零报错。（这是修 SDK 获取时顺手带出来的回归，当场量到、当场修。）
+ *
+ * 所以菜单这条路一律走下面两个函数，**判据取「数据在哪」，不取「SDK 有没有」**。
+ *
+ * 失效条件：面板那三处也改成用真 SDK、并把 localStorage 里的存量数据迁移过去
+ * 之后，这一层可以收敛成直接调 `sdk.storage`。在那之前**两边必须看到同一份数据**
+ * —— 菜单切了皮肤面板要看得见，反过来也一样。
+ */
+
+/** 读一项。先读 localStorage（存量全在那儿），空了再问 sdk.storage（为迁移留口）。 */
+async function readThemeStore<T>(key: string): Promise<T | null> {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw) return JSON.parse(raw) as T;
+  } catch (err) {
+    // 坏 JSON 不该让整个菜单瞎掉，往下试另一个来源。
+    console.warn(`🎨 [DreamSkin:Menu] localStorage 里的 ${key} 解不开:`, err);
+  }
+  try {
+    const v = await getMenuSdk()?.storage?.getItem(key);
+    if (v) return v as T;
+  } catch (err) {
+    console.warn(`🎨 [DreamSkin:Menu] sdk.storage 读 ${key} 失败:`, err);
+  }
+  return null;
+}
+
+/**
+ * 写一项。**只写 localStorage** —— 面板读的就是那儿。
+ * 双写会造出两份可能不一致的真相，比只写一处危险得多。
+ */
+function writeThemeStore(key: string, value: unknown): void {
+  try {
+    if (value === null || value === undefined) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    console.warn(`🎨 [DreamSkin:Menu] 写 ${key} 失败:`, err);
+  }
+}
+
 /** 读已安装皮肤 + 当前生效。菜单展开的那一刻现读。 */
 async function readSkinsForMenu(): Promise<{ skins: SkinMenuEntry[]; activeId: string | null }> {
-  const sdk = (window as any).berrytracePluginSdk;
   let list: ThemeItem[] = [];
   let activeId: string | null = null;
   try {
-    if (sdk?.storage) {
-      list = (await sdk.storage.getItem(STORAGE_KEY_CUSTOM_THEMES)) || [];
-      const active = await sdk.storage.getItem(STORAGE_KEY_ACTIVE_THEME);
-      activeId = active?.themeId ?? null;
-    } else {
-      const raw = window.localStorage.getItem(STORAGE_KEY_CUSTOM_THEMES);
-      if (raw) list = JSON.parse(raw);
-      const rawActive = window.localStorage.getItem(STORAGE_KEY_ACTIVE_THEME);
-      if (rawActive) activeId = JSON.parse(rawActive)?.themeId ?? null;
-    }
+    list = (await readThemeStore<ThemeItem[]>(STORAGE_KEY_CUSTOM_THEMES)) || [];
+    const active = await readThemeStore<{ themeId?: string }>(STORAGE_KEY_ACTIVE_THEME);
+    activeId = active?.themeId ?? null;
   } catch (err) {
     console.warn('🎨 [DreamSkin:Menu] 读皮肤列表失败:', err);
   }
@@ -1313,14 +1406,11 @@ async function readSkinsForMenu(): Promise<{ skins: SkinMenuEntry[]; activeId: s
 
 /** 菜单里点某套皮肤 —— 走与面板完全相同的那条应用链路。 */
 async function applySkinFromMenu(themeId: string): Promise<void> {
-  const sdk = (window as any).berrytracePluginSdk;
+  const sdk = getMenuSdk();
   const { skins } = await readSkinsForMenu();
   if (!skins.some((s) => s.id === themeId)) return;
 
-  let list: ThemeItem[] = [];
-  try {
-    list = (await sdk?.storage?.getItem(STORAGE_KEY_CUSTOM_THEMES)) || [];
-  } catch { /* 下面按空表兜底 */ }
+  const list: ThemeItem[] = (await readThemeStore<ThemeItem[]>(STORAGE_KEY_CUSTOM_THEMES)) || [];
   const item = list.find((t) => t.id === themeId);
   if (!item) {
     console.warn(`🎨 [DreamSkin:Menu] 皮肤 ${themeId} 在存储里找不到，跳过`);
@@ -1347,7 +1437,7 @@ async function applySkinFromMenu(themeId: string): Promise<void> {
     }
   }
 
-  await sdk?.storage?.setItem(STORAGE_KEY_ACTIVE_THEME, {
+  writeThemeStore(STORAGE_KEY_ACTIVE_THEME, {
     themeId: item.id,
     name: applied.name,
     imageBlobUrl: item.imageBlobUrl,
@@ -1357,7 +1447,7 @@ async function applySkinFromMenu(themeId: string): Promise<void> {
 
 /** 菜单里点「恢复默认外观」。 */
 async function resetAppearanceFromMenu(): Promise<void> {
-  const sdk = (window as any).berrytracePluginSdk;
+  const sdk = getMenuSdk();
   const sdkUi = (sdk?.ui ?? null) as (SdkUi & {
     unregisterPalette?: (id: string) => boolean;
     setPalette?: (id: string) => void;
@@ -1374,13 +1464,13 @@ async function resetAppearanceFromMenu(): Promise<void> {
   }
   if (typeof sdkUi.setPalette === 'function') sdkUi.setPalette('mono');
 
-  await sdk?.storage?.removeItem(STORAGE_KEY_ACTIVE_THEME);
+  writeThemeStore(STORAGE_KEY_ACTIVE_THEME, null);
   sdk?.events?.emit('dream-skin:applied', { themeId: null, name: null });
 }
 
 /** 菜单里点「主题库」—— 打开插件面板。 */
 function openGalleryFromMenu(): void {
-  const sdk = (window as any).berrytracePluginSdk;
+  const sdk = getMenuSdk();
   try {
     if (typeof sdk?.workspace?.activateView === 'function') {
       sdk.workspace.activateView('dream-skin-view');
@@ -1398,6 +1488,64 @@ function openGalleryFromMenu(): void {
 }
 
 /**
+ * 重启之后，把**所有已安装的皮肤**重新注册进宿主的色系表。
+ *
+ * 🔴 皮肤的 **CSS** 确实由宿主 SkinLayer 在插件系统启动之前从持久化存储恢复
+ * （所以界面零闪烁，看着一切正常）；但色系表项是另一回事。
+ *
+ * 〔0905 实机 CDP 量在李博 Mac 上，插件重载之前〕
+ *   · `useAppStore.getState().paletteId` = `dreamskin-firefly`
+ *   · 而 `useAppStore.getState().paletteOptions` **只有 mono/berry/onedark/dracula
+ *     四个内置** —— 当前生效的那个不在表里；
+ *   · 但宿主 localStorage 的 `app-palette-registry` 里 6 套皮肤一直都在，
+ *     `ownerPluginId` 全是本插件。
+ * 也就是说：**磁盘上有、宿主内存表恢复了、而 zustand 的快照没跟上**。
+ * 宿主自己把这条坑写在 `src/stores/app.ts:191` 的 `refreshPaletteRegistry` 上：
+ * 「注册表本身是模块级的 Map，改它**不会**惊动 zustand，订阅方看到的还是旧快照」。
+ *
+ * ⚠️ **「启动后那份快照为什么只剩四个内置」这一跳我没查到底。**（没有找到调
+ * `unregisterPalettesByPlugin` 的时机，而 localStorage 里数据完好，两者对不上。）
+ * 所以这里**不去赌那个答案**：改成把已装皮肤**全部**注册一遍 —— 全量、幂等，
+ * 无论宿主那半是「没恢复」还是「恢复了没通知」，跑完之后表都是齐的。
+ *
+ * 两个直接后果（都是 0905 李博报的）：
+ *   · 头像菜单右边写着「配色：黑白灰」，而界面明明是皮肤的样子；
+ *   · `currentPalette.isSkin` 恒为 `false` ⇒ 「皮肤生效时内置配色应当置灰」
+ *     那条判据**射程为空**，怎么写都不会生效（CLAUDE.md 六点六第 ④ 种）。
+ *
+ * ⚠️ 只注册、**不 `setPalette`**：`paletteId` 是宿主自己持久化并恢复的，用户完全
+ * 可能在皮肤装着的情况下手动切回某个内置配色。重放时顺手 `setPalette` 会把他
+ * 那次选择覆盖掉 —— 我们要补的是「表里缺了项」，不是「当前选择不对」。
+ */
+async function replayInstalledPalettes(): Promise<void> {
+  const sdk = getMenuSdk();
+  const sdkUi = (sdk?.ui ?? null) as (SdkUi & {
+    registerPalette?: (d: { id: string; label?: string; attr?: string | null; modes: Array<'light' | 'dark'> }) => boolean;
+  }) | null;
+  if (!sdkUi || typeof sdkUi.registerPalette !== 'function') return;
+
+  try {
+    const list: ThemeItem[] = (await readThemeStore<ThemeItem[]>(STORAGE_KEY_CUSTOM_THEMES)) || [];
+    if (!list.length) return;
+
+    let ok = 0;
+    for (const item of list) {
+      if (!item?.id) continue;
+      const modes = supportedModesFor(item.config?.appearance);
+      if (sdkUi.registerPalette({
+        id: paletteIdForTheme(item.id),
+        label: item.name || item.id,
+        attr: paletteIdForTheme(item.id),
+        modes,
+      })) ok++;
+    }
+    console.log(`🎨 [DreamSkin] 色系重放：${ok}/${list.length} 套已装皮肤进表`);
+  } catch (err) {
+    console.warn('🎨 [DreamSkin] 色系重放失败:', err);
+  }
+}
+
+/**
  * 把「DreamSkin 皮肤」这一条挂进头像下拉菜单。
  *
  * 座位是宿主 0904 新开的 `user-profile-menu:items`（配色之下、分割线之上）。
@@ -1406,7 +1554,7 @@ function openGalleryFromMenu(): void {
  * 直接注册即可：座位不在场的后果就是这一格不显示，不会出错。
  */
 function registerAvatarMenuItem(): (() => void) | null {
-  const sdk = (window as any).berrytracePluginSdk;
+  const sdk = getMenuSdk();
   const reg = sdk?.ui?.registerSlotItem;
   if (typeof reg !== 'function') {
     console.warn('🎨 [DreamSkin] 宿主没有 ui.registerSlotItem，跳过头像菜单贡献');
@@ -1418,8 +1566,13 @@ function registerAvatarMenuItem(): (() => void) | null {
       id: 'dream-skin:menu',
       priority: 50,
       title: 'DreamSkin 皮肤',
-      render: () =>
+      render: (props?: { context?: unknown }) =>
         React.createElement(SkinMenuItem, {
+          // 宿主 0905 起把这一格收进了「外观」二级面板，并用 `context` 交代
+          // 「面板已经展开了，请直接平铺」——再画自己的浮层就是第三级菜单，
+          // 而那个浮层的 `left-full` 会把它顶出屏幕（看不见，且零报错）。
+          // 老宿主不传 context ⇒ 这里是 undefined ⇒ 走浮层那一支，行为不变。
+          flat: (props?.context as { layout?: string } | undefined)?.layout === 'flat',
           // 直接把异步读取交给它。组件自己在**挂载时**和**每次展开时**各拉一次，
           // 并带请求序号防乱序 —— 见 SkinMenuItem 里 refresh() 的说明。
           //
@@ -1467,11 +1620,19 @@ export class DreamSkinViewPlugin {
       } else if (typeof window !== 'undefined' && window.berrytrace?.workspace?.registerView) {
         window.berrytrace.workspace.registerView('dream-skin-view', DreamSkinView);
       }
+      // 🔴 必须先注入 SDK 再注册菜单：菜单那条路取 SDK 走 `getMenuSdk()`，
+      // 而它在被注入之前只能拿到一个**并不存在**的全局（见 menuSdk 上面那段）。
+      // 顺序反了的表现就是老样子 —— 一句 warn，然后菜单里什么都没有。
+      setMenuSdk(this.app);
+
       // 头像下拉菜单里挂一条「皮肤」（含二级菜单）。
       // 它不依赖面板是否打开 —— 面板可能一次都没被打开过。
       this._disposeMenu = registerAvatarMenuItem();
 
-      // 主题由宿主 SkinLayer 在启动时 step 2 自动恢复，此处无需手动重放
+      // 皮肤的 CSS 由宿主 SkinLayer 在启动 step 2 自动恢复，但**色系表项不会**
+      // —— 那是运行期状态，重启后得由我们自己补回去。详见函数上面那段。
+      void replayInstalledPalettes();
+
       console.log('🎨 [DreamSkin:ViewPlugin] 视图注册完成，SkinLayer 已自动恢复上次主题。');
     } catch (err) {
       console.error('🚨 [DreamSkin:ViewPlugin] 注册视图失败:', err);
