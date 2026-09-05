@@ -257,6 +257,56 @@ function hexToRgbTriple(colorStr: string | undefined): string | null {
   return null;
 }
 
+/**
+ * 把 `#rgb` / `#rrggbb` / `#rrggbbaa` / `rgb()` / `rgba()` 解析成 `[r, g, b]`。
+ * 认不出来返回 `null`（调用方必须自己兜底，别当成黑色）。
+ */
+export function parseColorToRgb(colorStr: string | undefined | null): [number, number, number] | null {
+  const triple = hexToRgbTriple(colorStr || undefined);
+  if (triple) {
+    const [r, g, b] = triple.split(' ').map(Number);
+    return [r, g, b];
+  }
+  const m = String(colorStr || '').match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+  if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return null;
+}
+
+/** WCAG 相对亮度，0（黑）~ 1（白）。 */
+export function relativeLuminance(rgb: [number, number, number]): number {
+  const f = (v: number) => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * f(rgb[0]) + 0.7152 * f(rgb[1]) + 0.0722 * f(rgb[2]);
+}
+
+/**
+ * 从皮肤**自己的配色**推它到底是明还是暗，认不出来返回 `null`。
+ *
+ * 判据是「文字比底色亮 ⇒ 这是一套暗色配色」—— 不设亮度阈值。
+ * 阈值要拍脑袋、会随皮肤风格漂；而明暗这件事的定义本来就是文字和底色的
+ * 相对关系，直接量它零猜测，也正好是我们要保住的那个性质（可读性）。
+ *
+ * 为什么需要它：`theme.json` 的 `appearance` 允许写 `"auto"`，意思是
+ * 「明暗交给宿主定」。但一套 `text: #f0f0ef` / `background: #141313` 的配色
+ * 只在深色下成立，宿主停在浅色档时整套色就是错配的。`auto` 说的是作者没声明，
+ * 不是「这套色两边都能用」。
+ */
+export function inferAppearanceFromColors(
+  colors: DreamSkinColors | undefined | null,
+): 'light' | 'dark' | null {
+  if (!colors) return null;
+  const text = parseColorToRgb(colors.text);
+  const base = parseColorToRgb(colors.background) || parseColorToRgb(colors.panel);
+  if (!text || !base) return null;
+  const lText = relativeLuminance(text);
+  const lBase = relativeLuminance(base);
+  // 两者几乎一样亮时说明这套色自己就是错的，别替作者猜。
+  if (Math.abs(lText - lBase) < 0.01) return null;
+  return lText > lBase ? 'dark' : 'light';
+}
+
 function hexToRgbaStr(colorStr: string | undefined, alpha: number, fallback: string): string {
   if (!colorStr) return fallback;
   const str = colorStr.trim();
@@ -519,7 +569,24 @@ export async function applySkinViaSDK(
   // ── 5. 顶级通透玻璃拟态 (结合自定义主题色彩协同) ──────────────────────────
   // 优先获取宿主系统的实际 Dark/Light 模式，避免强行把系统的 dark 冲掉
   const currentHostMode = sdkUi.getTheme ? sdkUi.getTheme() : (document.documentElement.classList.contains("dark") ? "dark" : "light");
-  const isDark = appearance === "dark" || (appearance === "auto" && currentHostMode === "dark") || (appearance !== "light" && currentHostMode === "dark");
+  /*
+   * 作者没声明明暗（`auto`）时，先问**皮肤自己的配色**，问不出来才问宿主。
+   *
+   * 只问宿主是不够的：`暮色温柔`/`明日香 二号机` 的 appearance 都是 `auto`，
+   * 而配色是纯暗的（text #f0f0ef / background #141313）。宿主停在浅色档时
+   * 下面这些兜底色和阴影会整套取反，且是注入那一刻算死的 —— 宿主之后再切
+   * 明暗也不会重算。
+   */
+  const inferred =
+    appearance === "auto" || !appearance
+      ? inferAppearanceFromColors({
+          text: cssVariables["--foreground"],
+          background: cssVariables["--background"],
+          panel: cssVariables["--card"],
+        })
+      : null;
+  const effectiveMode = inferred || currentHostMode;
+  const isDark = appearance === "dark" || (appearance !== "light" && effectiveMode === "dark");
 
   const borderColor = applied.cssVariables["--border"] || (isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.12)");
 
@@ -532,6 +599,20 @@ export async function applySkinViaSDK(
   const glassCard = hexToRgbaStr(userCard || userBg, isDark ? 0.72 : 0.78, defaultCard);
   const glassSidebar = hexToRgbaStr(userCard || userBg, isDark ? 0.45 : 0.58, defaultSidebar);
 
+  /*
+   * 浮层那一条（下面第 5 条）的底色与字色**必须同源**。
+   *
+   * 🔴 它曾经把底色写成 isDark ? 深常量 : 白常量，而字色仍由
+   * --popover-foreground（= 皮肤的 colors.text）决定。两者一脱钩就会错配：
+   * 实测「暮色温柔」在浅色档下是 rgba(255,255,255,.95) 底 + #f0f0ef 字，
+   * 对比度 1.06:1 —— 字等于看不见，且换任何壁纸都不变（常量与皮肤无关）。
+   * 上游 Codex 侧遇到过同一个 bug（issue #233），修法同样是让两者成对指向皮肤变量。
+   *
+   * 用 var() 而不在注入时算死，还顺带免疫另一个坑：这段 CSS 与色彩变量是两次
+   * 独立注入，切皮肤时可能残留上一个皮肤的值 —— 走变量就永远跟当前皮肤实时一致。
+   *
+   * 失效条件：宿主不再用 --popover / --popover-foreground 这对 token 时，删掉第 5 条。
+   */
   const glassCss = `
 /* 宿主全局背景声明：主工作区透明透出底层壁纸，保留卡片半透明度 */
 html.has-wallpaper {
@@ -592,12 +673,13 @@ html.has-wallpaper [data-ds-part="message"] {
     : "0 8px 24px 0 rgba(0, 0, 0, 0.06), inset 0 1px 0 0 rgba(255, 255, 255, 0.5)"} !important;
 }
 
-/* 5. 弹出层/下拉菜单：高不透明度，保证输入/阅读绝对清晰 */
+/* 5. 弹出层/下拉菜单：底色与字色同源，都走宿主 token（理由见 TS 侧注释） */
 html.has-wallpaper .bg-popover,
 html.has-wallpaper [role="dialog"],
 html.has-wallpaper [role="menu"] {
-  background-color: ${isDark ? "rgba(24, 24, 32, 0.94)" : "rgba(255, 255, 255, 0.95)"} !important;
-  border: 1px solid ${borderColor} !important;
+  background-color: var(--popover) !important;
+  color: var(--popover-foreground) !important;
+  border: 1px solid var(--border) !important;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25) !important;
 }
 `;
