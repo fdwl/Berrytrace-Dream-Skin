@@ -1300,6 +1300,9 @@ export class DreamSkinView {
  *
  * 失效条件：宿主哪天真的开始设 `window.berrytracePluginSdk` 了，这段注释可以删。
  */
+/** 本插件注册的视图类型。注册、激活、注销三处必须是同一个字符串。 */
+const DREAM_SKIN_VIEW_TYPE = 'dream-skin-view';
+
 let menuSdk: any = null;
 
 /** 由 `onload(app)` 注入。**必须在 `registerAvatarMenuItem()` 之前调**。 */
@@ -1475,23 +1478,57 @@ async function resetAppearanceFromMenu(): Promise<void> {
   sdk?.events?.emit('dream-skin:applied', { themeId: null, name: null });
 }
 
-/** 菜单里点「主题库」—— 打开插件面板。 */
+/**
+ * 菜单里点「主题库」—— 打开本插件那个视图。
+ *
+ * 🔴 **判据取返回值，不取 `typeof === 'function'`。**
+ * `sdk.workspace` 是宿主用 `createApiProxy` 包出来的 —— **本地实现里没有的名字
+ * 一律转发 IPC**，于是任何方法名的 `typeof` 都是 `'function'`。
+ * 0905 之前这里写的是
+ *     `if (typeof sdk?.workspace?.activateView === 'function') { …; return; }`
+ * 判据永远成立、三条兜底一条都跑不到，而调用落到主进程变成：
+ *     `Method activateView (apiName: workspace) not found on controller`
+ * 一个**没人接的 promise 异常**，界面上就是「点了没反应」。
+ * （宿主侧 0905 已补上真正的 `WorkspaceAPIImpl.activateView`，返回 boolean。）
+ *
+ * 失效条件：`sdk.workspace` 哪天不再是转发 Proxy（找不到的方法会当场抛）时，
+ * 这段关于 `typeof` 的说明可以删。
+ */
 function openGalleryFromMenu(): void {
   const sdk = getMenuSdk();
+
   try {
-    if (typeof sdk?.workspace?.activateView === 'function') {
-      sdk.workspace.activateView('dream-skin-view');
-      return;
+    const r = (sdk?.workspace as { activateView?: (v: string) => unknown } | undefined)
+      ?.activateView?.(DREAM_SKIN_VIEW_TYPE);
+    if (r === true) return;
+    // 老宿主：这里拿到的是 IPC 的 Promise，它**一定会 reject**（控制器上没这个方法）。
+    // 不接住就是一条未捕获异常 —— 接住，然后走下面的退路。
+    if (r && typeof (r as Promise<unknown>).catch === 'function') {
+      (r as Promise<unknown>).catch(() => { /* 老宿主没有这个 API，已有退路 */ });
     }
-    if (typeof sdk?.workspace?.openView === 'function') {
-      sdk.workspace.openView('dream-skin-view');
-      return;
-    }
-    // 两条都没有就派发一条命令，宿主那边有命令注册表兜底。
-    sdk?.commands?.execute?.('dream-skin-view');
   } catch (err) {
-    console.warn('🎨 [DreamSkin:Menu] 打开主题库失败:', err);
+    console.warn('🎨 [DreamSkin:Menu] workspace.activateView 失败，走退路:', err);
   }
+
+  // 退路：直接开设置浮层并定位到本插件那个 tab。
+  // 这条路是宿主自己开设置的权威入口（`useDashboardStore.openSettings(tab)`），
+  // 设置 tab 的 id 就是 viewType（见宿主 SettingsAPI 的 registerTab 日志）。
+  try {
+    const dash = (window as unknown as {
+      useDashboardStore?: { getState?: () => { openSettings?: (tab?: string) => void } };
+    }).useDashboardStore?.getState?.();
+    if (typeof dash?.openSettings === 'function') {
+      dash.openSettings(DREAM_SKIN_VIEW_TYPE);
+      return;
+    }
+  } catch (err) {
+    console.warn('🎨 [DreamSkin:Menu] openSettings 退路也失败:', err);
+  }
+
+  // 两条都不通就说清楚，别静默 —— 「点了没反应」是最难查的那一类。
+  console.warn(
+    '🎨 [DreamSkin:Menu] 打不开主题库：宿主既没有 workspace.activateView，也没有 useDashboardStore.openSettings'
+  );
 }
 
 /**
