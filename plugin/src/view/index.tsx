@@ -1395,10 +1395,17 @@ async function readSkinsForMenu(): Promise<{ skins: SkinMenuEntry[]; activeId: s
   }
   const skins: SkinMenuEntry[] = (list || []).map((t) => {
     const modes = supportedModesFor(t?.config?.appearance);
+    // 预览图取法与面板的 `ThemePreviewCard` 完全一致：先用存下来的物理路径
+    // （`berrytrace-plugin://local-file/…`），没有再从 config.image 拼。
+    // 🔴 0905 李博：「纯看名字我根本不知道是那个皮肤」——名字是作者随手起的
+    // （`BP2xdx7Vzb`、`D3VA7DVERGEW45PE8A3Z5P9CR0` 这种），菜单里必须给图。
+    const configImage = t?.config?.image;
+    const preview = t?.imageBlobUrl || (configImage ? formatPluginResourceUrl(configImage) : '');
     return {
       id: t.id,
       name: t.name || t.id,
       onlyMode: modes.length === 1 ? modes[0] : undefined,
+      preview: preview || undefined,
     };
   });
   return { skins, activeId };
