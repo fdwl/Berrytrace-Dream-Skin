@@ -23,10 +23,21 @@
  *   ② 每行左边一个 28×18 的缩略图，hover 再出一张 176px 的大图；
  *   ③ 「仅浅 / 仅深」那个胶囊删掉 —— 信息没丢，挪进了 `title` 和预览卡。
  *
- * 🔴 预览卡**必须用 `position: fixed`**：列表容器是 `overflow-y-auto` 的，
- * 而 overflow 会裁掉子元素里一切绝对定位的浮层 —— 用 `absolute` 的话预览图
- * 会被切成一条，且**没有任何报错**。fixed 脱离该容器，代价是要自己算坐标
- * 并做边界翻转（见 `showPreview`）。
+ * 🔴 预览卡**必须 portal 到 `document.body`**，光靠 `position: fixed` 不够。
+ *
+ * 第一版只用了 fixed（理由是列表容器 `overflow-y-auto` 会裁掉 absolute 浮层）。
+ * 但 fixed 只在**没有 transform 祖先**时才相对视口定位 —— 而宿主那个「外观」
+ * 面板带着 `zoom-in-95` 入场动画（transform），**它就成了包含块**。后果有两个，
+ * 0905 李博实机同时撞上：
+ *   ① 预览卡的坐标变成相对面板算 ⇒ 整张图落在**菜单里面**（他原话：
+ *      「显示的预览图在菜单内显示，这样就导致了看不到任何预览图了」）；
+ *   ② 它进而算进面板的 `scrollHeight` ⇒ 宿主那边按 scrollHeight 算上移量
+ *      ⇒ 面板移动 ⇒ 鼠标落到别的行 ⇒ 预览卡换位置 ⇒ scrollHeight 又变
+ *      ⇒ **无限循环**（他原话：「整个菜单上下跳动非常厉害，根本不能用了」，
+ *      实测那会儿页面卡到 CDP 都不响应）。
+ *
+ * portal 到 body 之后这两条同时消失：它不再是面板的后代，既不受 transform
+ * 包含块影响，也不进面板的 scrollHeight。**别改回去。**
  *
  * 🔴 **这里的 Tailwind「方括号任意值」类（`max-h-[184px]`、`h-[94px]` …）一律无效。**
  * 插件是**独立构建**的，而这些 class 要真的有样式，得由**宿主**的 Tailwind 在扫描
@@ -40,7 +51,8 @@
  * 这一格夹在宿主自己画的内容下面，稍微差一点就露馅，而且没有任何东西会报警。
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Brush, ChevronRight, Check, Library, RotateCcw, Image as ImageIcon } from 'lucide-react';
 
 /** 已安装皮肤的最小形状（与 view/index.tsx 的 ThemeItem 取交集）。 */
@@ -70,6 +82,15 @@ export interface SkinMenuItemProps {
   onResetAppearance: () => void;
   onApplySkin: (id: string) => void;
   /**
+   * 关掉整个头像菜单。由宿主通过座位的 `context.closeMenu` 交下来。
+   *
+   * 🔴 菜单项点完就该收起 —— 宿主自己那几项（设置、问题反馈）都是这么做的。
+   * 0905 之前这一格做不到：`onClose` 是宿主组件的 prop，座位这边够不着，
+   * 于是点「主题库」设置页开了、而头像菜单还浮在旁边不走（李博截图 32）。
+   * 宿主没给（老版本）时就是 undefined，行为回到那样，不会出错。
+   */
+  onCloseMenu?: () => void;
+  /**
    * 平铺。宿主把这一格放进一个**已经展开的面板**时传 `true`（见文件头）。
    * 缺省 `false` = 老行为（自己画主条 + hover 浮层），所以老宿主不受影响。
    */
@@ -82,12 +103,23 @@ const PREVIEW_IMG_H = 94;
 /** 预览卡整体高度 = 图 + 标题行 + 内边距，翻转判断用它，别让卡掉出视口。 */
 const PREVIEW_H = PREVIEW_IMG_H + 34;
 /**
+ * 预览卡与菜单面板之间的间距。**跟宿主「面板↔头像菜单」那一档对齐**（30px）——
+ * 0905 李博：「应该往右边再去一点，保持和前面两个菜单相同的间距」。
+ */
+const PREVIEW_GAP = 30;
+
+/**
  * 皮肤列表最多这么高，再多就自己滚。
  * 〔0905 李博实机，窗口 1080×600〕装 9 套时整个菜单超出屏幕，底下的
  * 「恢复默认外观」看不见了 —— 而配色被置灰后那是唯一的出口。
  * 184px ≈ 6 行；再高一行就会顶到宿主的「设置 / 问题反馈」。
+ *
+ * ⚠️ 这只是**上限**，真正用的高度会向下取整到整数行（见 `listMaxH`）——
+ * 0905 李博：「列表底部切了半行」。露半行既不好看，也让人以为那一项坏了。
  */
 const SKIN_LIST_MAX_H = 184;
+/** 列表的 `gap-0.5`，算整数行时要一起算进去。 */
+const SKIN_LIST_GAP = 2;
 
 /** 一张缩略图；加载不出来就退成一个占位图标，**不留空洞**（空洞会让行高塌一截）。 */
 const Thumb: React.FC<{
@@ -125,6 +157,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
   onOpenGallery,
   onResetAppearance,
   onApplySkin,
+  onCloseMenu,
   flat = false,
 }) => {
   const [open, setOpen] = useState(false);
@@ -144,6 +177,27 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
    */
   const seqRef = useRef(0);
   const aliveRef = useRef(true);
+  /** 皮肤列表的滚动容器，用来量真实行高。 */
+  const listRef = useRef<HTMLDivElement | null>(null);
+  /** 向下取整到整数行之后的实际限高。 */
+  const [listMaxH, setListMaxH] = useState(SKIN_LIST_MAX_H);
+
+  /**
+   * 把限高对齐到**整数行**。
+   * 行高不写死：图标、字号、宿主的 line-height 都可能变，写死迟早对不上。
+   * 量不到（还没渲染出行）时保持上限，不影响首帧。
+   */
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const first = el.querySelector('button');
+    if (!first) return;
+    const per = (first as HTMLElement).offsetHeight + SKIN_LIST_GAP;
+    if (per <= SKIN_LIST_GAP) return;
+    const rows = Math.max(3, Math.floor((SKIN_LIST_MAX_H + SKIN_LIST_GAP) / per));
+    const next = rows * per - SKIN_LIST_GAP;
+    setListMaxH((prev) => (prev === next ? prev : next));
+  }, [state.skins.length, loaded]);
   /**
    * 🔴 **挂载时必须重新置回 `true`**，不能只在 cleanup 里置 `false`。
    *
@@ -206,9 +260,24 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
    */
   const showPreview = (id: string, el: HTMLElement) => {
     const r = el.getBoundingClientRect();
-    let left = r.right + 8;
-    if (left + PREVIEW_W > window.innerWidth - 8) left = r.left - PREVIEW_W - 8;
+
+    /**
+     * 横向以**整个面板**的边缘起算，不是以这一行起算。
+     * 行在面板内侧（面板还有一圈 padding），按行算出来的浮层会**压在面板身上**
+     * 或者只差几像素贴着它 —— 0905 李博：「被遮挡到下面了，应该往右边再去一点，
+     * 保持和前面两个菜单相同的间距」。
+     * `offsetParent` 就是那个 absolute 定位的面板；拿不到时退回按行算。
+     */
+    const panel = el.offsetParent as HTMLElement | null;
+    const pr = panel ? panel.getBoundingClientRect() : null;
+    const anchorRight = pr ? pr.right : r.right + 8;
+    const anchorLeft = pr ? pr.left : r.left - 8;
+
+    let left = anchorRight + PREVIEW_GAP;
+    if (left + PREVIEW_W > window.innerWidth - 8) left = anchorLeft - PREVIEW_W - PREVIEW_GAP;
     if (left < 8) left = 8;
+
+    // 纵向对齐 hover 的那一行，只在会掉出视口时才夹回来。
     let top = r.top;
     if (top + PREVIEW_H > window.innerHeight - 8) top = window.innerHeight - PREVIEW_H - 8;
     if (top < 8) top = 8;
@@ -234,8 +303,10 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
        底下的「恢复默认外观」直接看不见 —— 而那正是配色被置灰后唯一的出口。
        max-h 取 ~6 行：再多一行就会顶到设置/问题反馈那两行。 */
     <div
+      ref={listRef}
       // 🔴 限高走内联 style：`max-h-[184px]` 这个类宿主的 Tailwind 不会生成（见文件头）。
-      style={{ maxHeight: SKIN_LIST_MAX_H, overflowY: 'auto', overscrollBehavior: 'contain' }}
+      // 高度是**向下取整到整数行**的，别露半行（见 listMaxH）。
+      style={{ maxHeight: listMaxH, overflowY: 'auto', overscrollBehavior: 'contain' }}
       className="flex flex-col gap-0.5 pr-0.5"
     >
       {state.skins.map((skin) => {
@@ -245,7 +316,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
             key={skin.id}
             type="button"
             title={skin.onlyMode ? `${skin.name}（只有${skin.onlyMode === 'dark' ? '深' : '浅'}色版）` : skin.name}
-            onClick={() => { setOpen(false); setPreview(null); onApplySkin(skin.id); }}
+            onClick={() => { setOpen(false); setPreview(null); onCloseMenu?.(); onApplySkin(skin.id); }}
             onMouseEnter={(e) => showPreview(skin.id, e.currentTarget)}
             onMouseLeave={() => setPreview((p) => (p && p.id === skin.id ? null : p))}
             className={`flex items-center gap-2 px-2 py-1 rounded-lg text-xs transition-colors cursor-pointer border-none text-left ${
@@ -274,7 +345,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
    * hover 大图。`position: fixed` —— 上面列表是 `overflow-y-auto`，
    * 绝对定位的浮层会被它裁掉（且零报错）。
    */
-  const previewCard = preview && hovered && (
+  const previewCardNode = preview && hovered && (
     <div
       className="fixed rounded-xl border border-border bg-popover shadow-2xl p-1.5 pointer-events-none animate-in fade-in-0"
       style={{ top: preview.top, left: preview.left, width: PREVIEW_W, zIndex: 80 }}
@@ -296,6 +367,23 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
     </div>
   );
 
+  /**
+   * 🔴 portal 到 `document.body` —— 见文件头。挂在组件自己这棵树上的话，
+   * 它就是那个带 transform 的面板的后代，fixed 会退化成相对面板定位。
+   * `typeof document` 的判空是给非浏览器环境留的（渲染不到就当没有预览）。
+   */
+  const canPortal = typeof createPortal === 'function' && typeof document !== 'undefined';
+  const previewCard = !previewCardNode
+    ? null
+    : canPortal
+      ? createPortal(previewCardNode, document.body)
+      // 🔴 退路：老宿主的 `window.ReactDOM` 门面里**没有** createPortal
+      // （它 spread 的是 `react-dom/client`，而 createPortal 在主包里）。
+      // 〔0905 实测〕那时 `createPortal` 是 `undefined`，直接调用会在渲染中抛，
+      // 表现是**这一格整块消失**而不是报错。宁可就地渲染（位置可能被包含块带偏），
+      // 也不能崩。宿主侧 0905 已把 createPortal 补进门面。
+      : previewCardNode;
+
   // ══ 形态一：平铺（宿主已经展开了面板） ═══════════════════════════════════
   if (flat) {
     return (
@@ -307,7 +395,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
               它是**去别处**的入口，和下面那些「点了就切」的皮肤不是一类操作。 */}
           <button
             type="button"
-            onClick={onOpenGallery}
+            onClick={() => { setPreview(null); onCloseMenu?.(); onOpenGallery(); }}
             title="打开 DreamSkin 主题库"
             className="flex items-center gap-1 px-1 py-0.5 rounded text-[10px] text-muted-foreground hover:text-foreground hover:bg-accent/50 bg-transparent border-none cursor-pointer"
           >
@@ -325,7 +413,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
         {state.activeId && (
           <button
             type="button"
-            onClick={onResetAppearance}
+            onClick={() => { setPreview(null); onCloseMenu?.(); onResetAppearance(); }}
             className="flex items-center gap-2 px-2 py-1.5 mt-1 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 bg-transparent border-none cursor-pointer text-left"
           >
             <RotateCcw className="size-3.5 shrink-0" />
@@ -363,7 +451,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
         >
           <button
             type="button"
-            onClick={() => { setOpen(false); onOpenGallery(); }}
+            onClick={() => { setOpen(false); onCloseMenu?.(); onOpenGallery(); }}
             className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 bg-transparent border-none cursor-pointer text-left"
           >
             <Library className="size-3.5 shrink-0" />
@@ -372,7 +460,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
 
           <button
             type="button"
-            onClick={() => { setOpen(false); onResetAppearance(); }}
+            onClick={() => { setOpen(false); onCloseMenu?.(); onResetAppearance(); }}
             className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 bg-transparent border-none cursor-pointer text-left"
           >
             <RotateCcw className="size-3.5 shrink-0" />

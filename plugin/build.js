@@ -28,6 +28,20 @@ export const Fragment      = R.Fragment;
 export const Children      = R.Children;
 export const cloneElement  = R.cloneElement;
 export const isValidElement = R.isValidElement;
+// 下面这几个是 0905 补的。少一个的后果不是「用不了」，而是**构建直接失败**：
+//   ERROR: No matching export in "shim:react" for import "useLayoutEffect"
+// 而 tsc --noEmit **完全看不见**这类问题 —— 它查的是真实 react 的类型声明，
+// 不是这份 shim。所以「tsc 0 error」不代表构建得过，两个都要跑。
+// 注意：这段注释在一个模板字符串里面，**不许出现反引号**（会提前结束模板）。
+export const useLayoutEffect = R.useLayoutEffect;
+export const useReducer      = R.useReducer;
+export const useId           = R.useId;
+export const useSyncExternalStore = R.useSyncExternalStore;
+export const useImperativeHandle  = R.useImperativeHandle;
+export const useDeferredValue     = R.useDeferredValue;
+export const useTransition        = R.useTransition;
+export const StrictMode      = R.StrictMode;
+export const Suspense        = R.Suspense;
       `.trim(),
       loader: 'js',
     }));

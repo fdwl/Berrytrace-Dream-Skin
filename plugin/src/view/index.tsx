@@ -1612,6 +1612,9 @@ function registerAvatarMenuItem(): (() => void) | null {
       title: 'DreamSkin 皮肤',
       render: (props?: { context?: unknown }) =>
         React.createElement(SkinMenuItem, {
+          // 宿主给的「关掉整个菜单」回调（座位契约 0905 新增）。
+          // 老宿主不给 ⇒ undefined ⇒ 点完菜单不收起，与之前行为一致。
+          onCloseMenu: (props?.context as { closeMenu?: () => void } | undefined)?.closeMenu,
           // 宿主 0905 起把这一格收进了「外观」二级面板，并用 `context` 交代
           // 「面板已经展开了，请直接平铺」——再画自己的浮层就是第三级菜单，
           // 而那个浮层的 `left-full` 会把它顶出屏幕（看不见，且零报错）。
