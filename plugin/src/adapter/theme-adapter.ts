@@ -307,6 +307,70 @@ export function inferAppearanceFromColors(
   return lText > lBase ? 'dark' : 'light';
 }
 
+/**
+ * 把任意颜色写法拆成「**纯 RGB 三通道** + **alpha**」两半。
+ *
+ * 🔴 这是本适配器的核心归一，不是工具函数。理由（0907 实测）：
+ *
+ * · **上游 DreamSkin 自己就是这么分的**：`macos/assets/dream-skin.css:7,17`
+ *   同时维护 `--ds-panel: #191c22`（实色）与 `--ds-panel-rgb: 25 28 34`（三通道），
+ *   半透明一律在**用的地方**合成 `rgb(var(--ds-panel-rgb) / .56)`。
+ *   官方预设的 `colors.panel` 也是**不透明实色 hex**（`#171513`），只有 `line` 用 rgba。
+ * · **宿主 BerryTrace 也是这么分的**：`src/styles/palettes/berry.css:53`
+ *   `--card: rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2))`。
+ *
+ * 两边同构。以前这里把皮肤的颜色**整体**（含 alpha）塞进 `--card` / `--popover`，
+ * 等于把上游刻意分开的两半又粘死；而宿主的 Tailwind alphaToken 是**乘法**语义
+ * （`tailwind.config.js:27`：token 自身 alpha × 修饰符）⇒ 乘了两次。
+ * 〔实测，李博 Mac，皮肤 liam-girl-zangfu-qiriyou 的 panel 写作 rgba(100,100,100,0.5)〕
+ * 输入框（`bg-card` 加斜杠 40 的 dark 变体）最终 alpha **0.5 × 0.4 = 0.2008**，
+ * 而宿主给这一层的设计值是 0.72 —— 字压在壁纸上读不出来。
+ *
+ * 失效条件：宿主不再用 `--bg-surface-N-rgb` + `--surface-alpha-N` 这对钩子时，删掉本函数。
+ */
+export function splitColorChannels(
+  colorStr: string | undefined,
+): { rgb: string; alpha: number } | null {
+  if (!colorStr) return null;
+  const str = colorStr.trim();
+
+  const hexMatch = str.match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+  if (hexMatch) {
+    let hex = hexMatch[1];
+    if (hex.length === 3 || hex.length === 4) hex = hex.split('').map((x) => x + x).join('');
+    const r = parseInt(hex.slice(0, 2), 16);
+    const g = parseInt(hex.slice(2, 4), 16);
+    const b = parseInt(hex.slice(4, 6), 16);
+    const alpha = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) / 255 : 1;
+    return { rgb: `${r} ${g} ${b}`, alpha };
+  }
+
+  // rgb() / rgba() / 空格分隔与斜杠分隔的现代写法都接住
+  const fnMatch = str.match(/^rgba?\(\s*([^)]+)\)$/i);
+  if (fnMatch) {
+    const parts = fnMatch[1].split(/[,/]/).map((x) => x.trim()).filter(Boolean);
+    if (parts.length >= 3) {
+      const [r, g, b] = parts.slice(0, 3).map((x) => Math.round(parseFloat(x)));
+      if ([r, g, b].some((n) => Number.isNaN(n))) return null;
+      let alpha = 1;
+      if (parts.length >= 4) {
+        const raw = parts[3];
+        const n = parseFloat(raw);
+        if (!Number.isNaN(n)) alpha = raw.endsWith('%') ? n / 100 : n;
+      }
+      return { rgb: `${r} ${g} ${b}`, alpha };
+    }
+  }
+
+  return null;
+}
+
+/** alpha 下限：皮肤想更透可以，但不许透到字读不出来。 */
+export function clampSurfaceAlpha(alpha: number, floor: number): number {
+  if (!Number.isFinite(alpha)) return floor;
+  return Math.min(1, Math.max(floor, alpha));
+}
+
 function hexToRgbaStr(colorStr: string | undefined, alpha: number, fallback: string): string {
   if (!colorStr) return fallback;
   const str = colorStr.trim();
@@ -592,12 +656,32 @@ export async function applySkinViaSDK(
 
   const userBg = applied.cssVariables["--background"];
   const userCard = applied.cssVariables["--card"];
-  const defaultBg = isDark ? `rgba(12, 12, 18, 0)` : `rgba(243, 245, 246, 0)`;
-  const defaultCard = isDark ? `rgba(20, 20, 28, 0.72)` : `rgba(255, 255, 255, 0.78)`;
-  const defaultSidebar = isDark ? `rgba(12, 12, 18, 0.45)` : `rgba(255, 255, 255, 0.58)`;
+  /* ⚠️ 这里原来还有 `hexToRgbaStr(userCard || userBg, 0.72, …)` 算出来的
+   * `glassCard` / `glassSidebar` 两个常量，已删。它有两处静默失效：
+   *   ① 传进去的 alpha（0.72 / 0.45）在皮肤写 rgba() 时被
+   *      `if (str.startsWith('rgb')) return str;`（:374 那支）**整个丢弃** ——
+   *      本仓给这两层设计的 alpha 从来没生效过；
+   *   ② 算出来的是**含 alpha 的常量**，塞进 `--card` 之后被宿主的乘法语义再乘一次。
+   * 现在一律走下面的 splitColorChannels 归一 + 表达式。 */
 
-  const glassCard = hexToRgbaStr(userCard || userBg, isDark ? 0.72 : 0.78, defaultCard);
-  const glassSidebar = hexToRgbaStr(userCard || userBg, isDark ? 0.45 : 0.58, defaultSidebar);
+  /* ── 归一：把皮肤的面板色拆成「三通道 + alpha」喂给宿主的两个钩子 ──────────
+   * 理由与实测数字见 splitColorChannels() 的函数头。
+   *
+   * 🔴 拆开之后**不要再写 `--card: <含 alpha 的常量>`**：那正是旧版的病根。
+   * 这里写的是**表达式** `rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2))`，
+   * 与宿主 `palettes/berry.css:53` 逐字同构 —— 即使宿主换了色板也不会脱节。
+   *
+   * 三个 floor 取宿主 `src/index.css` 壁纸段的设计值（0.55 / 0.72 / 0.88）。
+   * 皮肤想更透可以（clamp 只抬不压是**错**的：那会让皮肤完全失效），
+   * 所以 floor 取的是「宿主设计值」与「皮肤意图」里更能保住可读性的那个，
+   * 且宿主侧还有第二道地板（index.css 的 Surface Opacity Floor）兜底。
+   */
+  const panelSplit = splitColorChannels(userCard || userBg);
+  const surfaceRgb = panelSplit?.rgb ?? (isDark ? '20 20 28' : '255 255 255');
+  const skinAlpha = panelSplit?.alpha ?? 1;
+  const alphaSidebar = clampSurfaceAlpha(skinAlpha, isDark ? 0.45 : 0.58);
+  const alphaCard = clampSurfaceAlpha(skinAlpha, isDark ? 0.72 : 0.78);
+  const alphaFloat = clampSurfaceAlpha(skinAlpha, isDark ? 0.88 : 0.9);
 
   /*
    * 浮层那一条（下面第 5 条）的底色与字色**必须同源**。
@@ -616,27 +700,41 @@ export async function applySkinViaSDK(
   const glassCss = `
 /* 宿主全局背景声明：主工作区透明透出底层壁纸，保留卡片半透明度 */
 html.has-wallpaper {
-  --surface-blur: ${wallpaperBlur || '0px'} !important;
+  /* 壁纸层自己的模糊仍由皮肤说了算 */
   --berrytrace-bg-blur: ${wallpaperBlur || '0px'} !important;
   --background: transparent !important;
   --bg-page: transparent !important;
-  --card: ${glassCard} !important;
-  --sidebar: ${glassSidebar} !important;
-  --sidebar-background: ${glassSidebar} !important;
-  --muted: ${glassCard} !important;
+
+  /* 色相：纯三通道，不含 alpha（上游 --ds-panel-rgb 的对应物） */
+  --bg-surface-1-rgb: ${surfaceRgb} !important;
+  --bg-surface-2-rgb: ${surfaceRgb} !important;
+  --bg-surface-3-rgb: ${surfaceRgb} !important;
+
+  /* alpha：单独一档，由宿主在**用的地方**合成 */
+  --surface-alpha-1: ${alphaSidebar} !important;
+  --surface-alpha-2: ${alphaCard} !important;
+  --surface-alpha-3: ${alphaFloat} !important;
+
+  /* 与宿主 palettes/berry.css:53,55 逐字同构的表达式，不写死含 alpha 的常量 */
+  --card: rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2)) !important;
+  --muted: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
+  --popover: rgb(var(--bg-surface-3-rgb) / var(--surface-alpha-3)) !important;
+  --sidebar: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
+  --sidebar-background: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
 }
 
-/* 1. 彻底清除工作区与导航栏/侧边栏的 backdrop-filter 模糊与寄生灰层，保证背景高清通透 */
+/* 1. 底座（工作区 / 页面根）清掉寄生灰层与模糊，让壁纸高清透出。
+ *
+ * 🔴 **不要把 .bg-card / .bg-muted / .bg-secondary / aside 加回这条**。
+ * 〔0907 实测〕旧版把它们一起关了模糊，结果是：输入框最终 alpha 只有 0.20、
+ * 背后又没有任何模糊，字直接糊在壁纸的人脸上。对照 ChatGPT 同一张皮肤，
+ * 它的输入框是 blur(16px) + 0.86 —— **模糊是可读性的承载者，不是装饰**。
+ * 上游自己也从不关这些，它靠 --ds-hero-scrim 渐变遮罩保可读性。
+ *
+ * 失效条件：宿主 index.css 的壁纸段不再给表面注入 backdrop-filter 时，本条可以删。 */
 html.has-wallpaper main,
-html.has-wallpaper aside,
-html.has-wallpaper nav,
-html.has-wallpaper [class*="sidebar"],
-html.has-wallpaper .bg-sidebar,
 html.has-wallpaper .bg-background,
-html.has-wallpaper .bg-card,
-html.has-wallpaper .bg-muted,
-html.has-wallpaper .bg-secondary,
-html.has-wallpaper [data-ds-part="sidebar"] {
+html.has-wallpaper [data-ds-part="page"] {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
@@ -650,23 +748,42 @@ html.has-wallpaper .bg-page {
   background: transparent !important;
 }
 
-/* 3. 导航栏与侧边栏 (aside / sidebar / nav / .bg-sidebar / [data-ds-part="sidebar"])：通透半透明与分隔线 */
-html.has-wallpaper aside,
-html.has-wallpaper nav,
-html.has-wallpaper [class*="sidebar"],
+/* 3. 侧边栏面板本体。
+ *
+ * 🔴 **选择器不许再写 [class*="sidebar"]（按名字子串匹配）。**
+ * 〔0907 实测，李博 Mac，CDP 逐元素量过〕那条子串在侧栏里选中 **28 个元素**，
+ * 其中只有 aside 一个是真面板；另外 27 个是内边距容器、导航按钮、会话行、
+ * 连那根 1px 装饰线 —— 它们本来都是透明的，各自被涂一层半透明灰之后叠起来，
+ * 侧栏看上去像**一摞深浅不一的灰砖**而不是一整片。
+ * 撞上的原因：Tailwind 的任意值语法把 CSS 变量名原样带进了类名字串
+ * （gap- / pl- / w- 后面方括号里包着 sidebar-* 变量），
+ * 于是纯排版容器的类名里也有 "sidebar" 三个字。
+ * ⇒ 只认**语义锚点**：aside 本体、皮肤协议的 data 属性、宿主的 .bg-sidebar 类。
+ *
+ * ⚠️ 也去掉了 nav：内容区里的 nav（面包屑、标签栏）根本不是侧栏。
+ *
+ * 失效条件：宿主不再用 .bg-sidebar / [data-ds-part="sidebar"] 标注侧栏时，改这条。 */
+html.has-wallpaper > body aside,
 html.has-wallpaper .bg-sidebar,
 html.has-wallpaper [data-ds-part="sidebar"] {
-  --sidebar-background: ${glassSidebar} !important;
-  background-color: ${glassSidebar} !important;
+  background-color: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
   border-right: 1px solid ${borderColor} !important;
 }
 
-/* 4. Card 卡片/面板/输入框：半透明 + 1px 亮边框 + 浮光阴影 */
+/* 4. Card 卡片/面板/输入框：半透明 + 1px 亮边框 + 浮光阴影。
+ *
+ * 🔴 **必须同时列裸类与带透明度修饰符的形态。**
+ * bg-card 和 bg-card 加斜杠 40 是**两个不同的类名**，前者的选择器选不到后者，
+ * 而宿主全仓 313 处用的是后者。〔0907 实测〕旧版只写裸类 ⇒ 这条规则对输入框
+ * （agent-input-box）**完全没生效**，它只吃到了被二次相乘的 --card，
+ * 最终 alpha 0.2008。**规则写了却选不到，和没写一样，且零报错。** */
 html.has-wallpaper .bg-card,
 html.has-wallpaper .bg-muted,
+html.has-wallpaper [class*="bg-card/"],
+html.has-wallpaper [class*="bg-muted/"],
 html.has-wallpaper [data-ds-part="composer"],
 html.has-wallpaper [data-ds-part="message"] {
-  background-color: ${glassCard} !important;
+  background-color: rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2)) !important;
   border: 1px solid ${borderColor} !important;
   box-shadow: ${isDark 
     ? "0 8px 32px 0 rgba(0, 0, 0, 0.3), inset 0 1px 0 0 rgba(255, 255, 255, 0.12)" 
