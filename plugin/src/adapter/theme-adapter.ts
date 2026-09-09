@@ -422,13 +422,39 @@ export function transformDreamSkinToBerryTrace(
     cssVariables["--ds-theme-color-background"] = c.background;
   }
   if (c.panel) {
-    cssVariables["--card"]                      = c.panel;
-    cssVariables["--popover"]                   = c.panel;
-    cssVariables["--sidebar-background"]        = c.panel;
+    /* 🔴 **只写色相通道，不写 `--card` / `--popover` / `--sidebar-background`。**
+     *
+     * 〔0909 实测，李博 Mac，一整天的返工都出在这条上〕宿主的语义 token 是
+     * 「色相通道 × alpha」合成出来的（`palettes/berry.css:53`
+     * `--card: rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2))`）。
+     * 适配器直接改语义 token ＝ **把宿主用来保证可读性的那层公式整个替换掉**，
+     * 于是宿主每加一道防线，皮肤就能从另一个变量把它掀翻，变成打地鼠：
+     *   · 皮肤把 alpha 烤进 `--card` ⇒ 乘法语义下双乘 ⇒ 宿主加地板；
+     *   · 皮肤把 `--bg-surface-N-rgb` 换成面板色 ⇒ **地板自己被染成中灰** ⇒ 宿主再加 `--surface-floor-rgb`；
+     *   · 皮肤把 `--accent` 换成 panelAlt ⇒ 选中态消失 ⇒ 再改皮肤。
+     * 李博原话：「同一个皮肤 zip 细节差别很多…到底是哪里出现问题，结构，还是架构？」
+     * —— 是架构：**方向盘交出去了**。上游 Codex 从不让皮肤写自己的语义 token。
+     *
+     * 边界（本文件唯一的一条）：**适配器只写色相通道与文字/品牌色，
+     * 表面的 alpha、scrim、层级一律由宿主推导。**
+     * ⚠️ 尤其不许写 `--bg-surface-0-rgb` —— 宿主的可读性地板
+     * （`src/index.css` 的 `--surface-floor-rgb`）以它为基准，写了就等于把地板拆了。
+     *
+     * 失效条件：宿主不再用「通道 × alpha」合成语义 token 时，这条边界可以重议。 */
+    const 面板 = splitColorChannels(c.panel);
+    if (面板) {
+      cssVariables["--bg-surface-1-rgb"] = 面板.rgb;
+      cssVariables["--bg-surface-2-rgb"] = 面板.rgb;
+      cssVariables["--bg-surface-3-rgb"] = 面板.rgb;
+    }
     cssVariables["--ds-theme-color-panel"]      = c.panel;
   }
   if (c.panelAlt) {
-    cssVariables["--muted"]                     = c.panelAlt;
+    /* 同上：只写通道。`--muted` 由宿主用 `--bg-surface-1-rgb × --surface-alpha-1` 推导；
+     * 选中/hover 态走 `--bg-accent-rgb`（宿主 `--accent` 的通道形式），
+     * 这样选中块永远比承载面「抬起来」，不会像 0909 那样和侧栏底色撞成同一个值。 */
+    const 次面板 = splitColorChannels(c.panelAlt);
+    if (次面板) cssVariables["--bg-accent-rgb"] = 次面板.rgb;
     /* 🔴 **不要在这里写 `--accent`。**〔0909 实测，李博 Mac，两个应用并排量的〕
      *
      * 宿主的 `--accent` 不是「品牌强调色」，它是**导航选中态/hover 的承载面**：
@@ -463,16 +489,16 @@ export function transformDreamSkinToBerryTrace(
       cssVariables["--brand-rgb"] = rgbTriple;
     }
   }
+  /* accentAlt / secondary / highlight 只留在皮肤自己的 --ds-* 命名空间里。
+   * 它们对应的宿主 token（--accent-alt / --secondary / --highlight）都是**表面**，
+   * 由宿主从通道推导；皮肤覆盖它们就会绕过 alpha 与地板（同 c.panel 那条注释）。 */
   if (c.accentAlt) {
-    cssVariables["--accent-alt"]                = c.accentAlt;
     cssVariables["--ds-theme-color-accent-alt"] = c.accentAlt;
   }
   if (c.secondary) {
-    cssVariables["--secondary"]                 = c.secondary;
     cssVariables["--ds-theme-color-secondary"]  = c.secondary;
   }
   if (c.highlight) {
-    cssVariables["--highlight"]                 = c.highlight;
     cssVariables["--ds-theme-color-highlight"]  = c.highlight;
   }
   if (c.text) {
@@ -666,7 +692,7 @@ export async function applySkinViaSDK(
       ? inferAppearanceFromColors({
           text: cssVariables["--foreground"],
           background: cssVariables["--background"],
-          panel: cssVariables["--card"],
+          panel: cssVariables["--ds-theme-color-panel"],
         })
       : null;
   const effectiveMode = inferred || currentHostMode;
@@ -675,7 +701,10 @@ export async function applySkinViaSDK(
   const borderColor = applied.cssVariables["--border"] || (isDark ? "rgba(255, 255, 255, 0.15)" : "rgba(0, 0, 0, 0.12)");
 
   const userBg = applied.cssVariables["--background"];
-  const userCard = applied.cssVariables["--card"];
+  /* 皮肤的面板色现在只留在自己的命名空间里（不再覆盖宿主 --card），
+   * 所以取色相要从这里读。读错的后果是回落到 background 色，
+   * 表现为「换了皮肤但面板颜色没跟着变」，且零报错。 */
+  const userCard = applied.cssVariables["--ds-theme-color-panel"];
   /* ⚠️ 这里原来还有 `hexToRgbaStr(userCard || userBg, 0.72, …)` 算出来的
    * `glassCard` / `glassSidebar` 两个常量，已删。它有两处静默失效：
    *   ① 传进去的 alpha（0.72 / 0.45）在皮肤写 rgba() 时被
@@ -735,12 +764,10 @@ html.has-wallpaper {
   --surface-alpha-2: ${alphaCard} !important;
   --surface-alpha-3: ${alphaFloat} !important;
 
-  /* 与宿主 palettes/berry.css:53,55 逐字同构的表达式，不写死含 alpha 的常量 */
-  --card: rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2)) !important;
-  --muted: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
-  --popover: rgb(var(--bg-surface-3-rgb) / var(--surface-alpha-3)) !important;
-  --sidebar: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
-  --sidebar-background: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
+  /* 🔴 这里**不再重写 --card / --muted / --popover / --sidebar**。
+   * 宿主 palettes/*.css 本来就是用上面这几个通道 × alpha 合成它们的，
+   * 皮肤再写一遍只会把宿主的公式换掉（理由见 c.panel 那条长注释）。
+   * 上面给了通道与 alpha，宿主自会推导出全部四层。 */
 }
 
 /* 1. 底座（工作区 / 页面根）清掉寄生灰层与模糊，让壁纸高清透出。
@@ -768,57 +795,22 @@ html.has-wallpaper .bg-page {
   background: transparent !important;
 }
 
-/* 3. 侧边栏面板本体。
+/* ── 到此为止：**适配器不再重画宿主的任何表面。** ────────────────────────────
  *
- * 🔴 **选择器不许再写 [class*="sidebar"]（按名字子串匹配）。**
- * 〔0907 实测，李博 Mac，CDP 逐元素量过〕那条子串在侧栏里选中 **28 个元素**，
- * 其中只有 aside 一个是真面板；另外 27 个是内边距容器、导航按钮、会话行、
- * 连那根 1px 装饰线 —— 它们本来都是透明的，各自被涂一层半透明灰之后叠起来，
- * 侧栏看上去像**一摞深浅不一的灰砖**而不是一整片。
- * 撞上的原因：Tailwind 的任意值语法把 CSS 变量名原样带进了类名字串
- * （gap- / pl- / w- 后面方括号里包着 sidebar-* 变量），
- * 于是纯排版容器的类名里也有 "sidebar" 三个字。
- * ⇒ 只认**语义锚点**：aside 本体、皮肤协议的 data 属性、宿主的 .bg-sidebar 类。
+ * 这里原来还有三条规则（侧边栏本体 / 卡片面板输入框 / 弹出层对话框），
+ * 一共 20 多条 !important，外加 [class*="bg-card/"]、[role="dialog"]、
+ * [role="menu"] 这类通杀选择器 —— 它们直接改宿主元素的
+ * background-color / border / box-shadow。〔0909 实测〕代价是：
+ *   · 侧栏那条曾用 [class*="sidebar"] 通杀，**误伤 27 个纯排版容器**
+ *     （Tailwind 任意值把 --sidebar-row-h 这类变量名带进了类名字串），
+ *     还把导航选中态 bg-accent 一起按成面板色 ⇒ 选中块和侧栏同色，等于没有选中态；
+ *   · 卡片那条把 alpha 与边框写死，宿主壁纸地板再怎么改都被它盖掉。
  *
- * ⚠️ 也去掉了 nav：内容区里的 nav（面包屑、标签栏）根本不是侧栏。
+ * 现在这些一律由**宿主**负责（src/index.css 的 Surface Opacity Floor：
+ * Surface 1/2/3 各有地板，scrim 走皮肤动不到的 --surface-floor-rgb）。
+ * 皮肤只提供色相通道与 alpha 意图，宿主保证「皮肤想多透都行，但不许透到读不出字」。
  *
- * 失效条件：宿主不再用 .bg-sidebar / [data-ds-part="sidebar"] 标注侧栏时，改这条。 */
-html.has-wallpaper > body aside,
-html.has-wallpaper .bg-sidebar,
-html.has-wallpaper [data-ds-part="sidebar"] {
-  background-color: rgb(var(--bg-surface-1-rgb) / var(--surface-alpha-1)) !important;
-  border-right: 1px solid ${borderColor} !important;
-}
-
-/* 4. Card 卡片/面板/输入框：半透明 + 1px 亮边框 + 浮光阴影。
- *
- * 🔴 **必须同时列裸类与带透明度修饰符的形态。**
- * bg-card 和 bg-card 加斜杠 40 是**两个不同的类名**，前者的选择器选不到后者，
- * 而宿主全仓 313 处用的是后者。〔0907 实测〕旧版只写裸类 ⇒ 这条规则对输入框
- * （agent-input-box）**完全没生效**，它只吃到了被二次相乘的 --card，
- * 最终 alpha 0.2008。**规则写了却选不到，和没写一样，且零报错。** */
-html.has-wallpaper .bg-card,
-html.has-wallpaper .bg-muted,
-html.has-wallpaper [class*="bg-card/"],
-html.has-wallpaper [class*="bg-muted/"],
-html.has-wallpaper [data-ds-part="composer"],
-html.has-wallpaper [data-ds-part="message"] {
-  background-color: rgb(var(--bg-surface-2-rgb) / var(--surface-alpha-2)) !important;
-  border: 1px solid ${borderColor} !important;
-  box-shadow: ${isDark 
-    ? "0 8px 32px 0 rgba(0, 0, 0, 0.3), inset 0 1px 0 0 rgba(255, 255, 255, 0.12)" 
-    : "0 8px 24px 0 rgba(0, 0, 0, 0.06), inset 0 1px 0 0 rgba(255, 255, 255, 0.5)"} !important;
-}
-
-/* 5. 弹出层/下拉菜单：底色与字色同源，都走宿主 token（理由见 TS 侧注释） */
-html.has-wallpaper .bg-popover,
-html.has-wallpaper [role="dialog"],
-html.has-wallpaper [role="menu"] {
-  background-color: var(--popover) !important;
-  color: var(--popover-foreground) !important;
-  border: 1px solid var(--border) !important;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25) !important;
-}
+ * 失效条件：宿主删掉 Surface Opacity Floor 那一段时，这些规则要重新讨论由谁承担。 */
 `;
   if (wallpaperUrl) {
     sdkUi.persistStyle(SKIN_STYLE_ID.GLASS, glassCss);
