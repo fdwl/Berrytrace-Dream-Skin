@@ -429,7 +429,27 @@ export function transformDreamSkinToBerryTrace(
   }
   if (c.panelAlt) {
     cssVariables["--muted"]                     = c.panelAlt;
-    cssVariables["--accent"]                    = c.panelAlt;
+    /* 🔴 **不要在这里写 `--accent`。**〔0909 实测，李博 Mac，两个应用并排量的〕
+     *
+     * 宿主的 `--accent` 不是「品牌强调色」，它是**导航选中态/hover 的承载面**：
+     * `palettes/berry.css:63,200` 写的是
+     * `--accent: rgb(var(--bg-accent-rgb) / var(--surface-alpha-1))`，
+     * 侧栏选中项（`layouts/components/SidebarLayout.tsx:671` 的 `bg-accent`）吃的就是它。
+     * 把它整体换成 `c.panelAlt`（一块**面板**色）有两个后果：
+     *   ① 选中色变成一个与宿主调色板毫无关系的颜色 —— 李博报的「侧栏自动化选中色不对」；
+     *   ② panelAlt 自带 alpha 时（社区皮肤常态，本例是 `rgba(95,95,95,0.5)`），
+     *      选中块**既颜色不对又半透** ——〔实测〕他机器上 `--accent` 就是 `rgba(95,95,95,0.5)`。
+     *
+     * **上游 Codex 也不这么干**：〔0909 用 CDP 量他 Mac 上装着**同一张皮肤**的 Codex〕
+     * 它侧栏选中项是 `rgba(102, 173, 243, 0.12)` —— 自己的品牌蓝 ghost，
+     * **完全没被皮肤的 panelAlt 接管**。皮肤该管的是面板，不是选中态。
+     *
+     * 皮肤真要改强调色，走 `c.accent`（下面那支已写进 `--color-brand` / `--primary` / `--ring`），
+     * 那几个不会撞上导航选中态。
+     *
+     * 失效条件：宿主把 nav 选中态从 `bg-accent` 换成一个专属 token
+     * （与 `--accent` 解耦）之后，皮肤可以重新接管 `--accent`。
+     */
     cssVariables["--ds-theme-color-panel-alt"]  = c.panelAlt;
   }
   if (c.accent) {
