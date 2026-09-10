@@ -457,6 +457,24 @@ export function transformDreamSkinToBerryTrace(
   if (c.background) {
     cssVariables["--background"]                = c.background;
     cssVariables["--bg-page"]                   = c.background;
+    /* 侧栏色相走**页面色**，不走 panel。
+     *
+     * 〔0910 李博实测，第二轮：「左边侧边栏，还是没有好」〕上一轮把三层表面拉开之后，
+     * 侧栏仍然是宿主基座的冷灰 —— 因为宿主的 `--sidebar` 取的是
+     * `--bg-surface-0-rgb` 的色相，而**那一条适配器按边界不许写**
+     * （宿主 `--surface-floor-rgb` 以它为基准，是可读性地板的最后一道）。
+     * ⇒ 宿主 0910 给侧栏开了一条独立通道 `--bg-sidebar-rgb`
+     *   （`src/styles/palettes/*.css`，默认值就是 `var(--bg-surface-0-rgb)`），
+     *   皮肤写它，地板照旧钉在 surface-0，两件事互不干涉。
+     *
+     * 🔴 用 `c.background` 而不是 panel 的 s1：宿主 `mono.css` 那条注释钉着李博
+     * 08-25 的决定 ——「侧栏与主区同源，**独立于 --muted**（输入框底等），两处可分别调」。
+     * 拿 s1 去染侧栏就正好撞上 `--muted`，等于把他那条决定推翻了。
+     * 页面色才是「主区」在皮肤里的对应物。
+     *
+     * 失效条件：宿主不再定义 `--bg-sidebar-rgb`（palettes/*.css 里 grep 得到）时删掉。 */
+    const 页面 = splitColorChannels(c.background);
+    if (页面) cssVariables["--bg-sidebar-rgb"] = 页面.rgb;
     cssVariables["--ds-theme-color-background"] = c.background;
   }
   if (c.panel) {
@@ -768,6 +786,14 @@ export async function applySkinViaSDK(
    * 所以 floor 取的是「宿主设计值」与「皮肤意图」里更能保住可读性的那个，
    * 且宿主侧还有第二道地板（index.css 的 Surface Opacity Floor）兜底。
    */
+  /* 侧栏色相：走页面色（理由见 c.background 那段）。取不到就整条不写 ——
+   * 宿主 `--bg-sidebar-rgb` 的默认值是 `var(--bg-surface-0-rgb)`，
+   * 不写就自动回落到基座灰，也就是 0910 之前的样子。 */
+  const 页面Split = splitColorChannels(userBg);
+  const 侧栏通道 = 页面Split
+    ? `\n  --bg-sidebar-rgb: ${页面Split.rgb} !important;`
+    : '';
+
   const panelSplit = splitColorChannels(userCard || userBg);
   const surfaceRgb = panelSplit?.rgb ?? (isDark ? '20 20 28' : '255 255 255');
   const 梯 = surfaceLadder(surfaceRgb);
@@ -819,6 +845,8 @@ html.has-wallpaper {
   --bg-surface-1-rgb: ${梯.s1} !important;
   --bg-surface-2-rgb: ${梯.s2} !important;
   --bg-surface-3-rgb: ${梯.s3} !important;
+  /* 侧栏单独一条通道（宿主 0910 新开）。**仍然不写 --bg-surface-0-rgb** ——
+   * 那是宿主可读性地板的基准，见 c.panel 那条边界。 */${侧栏通道}
 
   /* alpha：单独一档，由宿主在**用的地方**合成 */
   --surface-alpha-1: ${alphaSidebar} !important;
@@ -828,7 +856,12 @@ html.has-wallpaper {
   /* 🔴 这里**不再重写 --card / --muted / --popover / --sidebar**。
    * 宿主 palettes/*.css 本来就是用上面这几个通道 × alpha 合成它们的，
    * 皮肤再写一遍只会把宿主的公式换掉（理由见 c.panel 那条长注释）。
-   * 上面给了通道与 alpha，宿主自会推导出全部四层。 */
+   * 上面给了通道与 alpha，宿主自会推导出全部四层。
+   *
+   * 上面那条 --bg-sidebar-rgb **不是这条规矩的例外** —— 它是**通道**不是语义 token，
+   * 宿主那个 --sidebar 公式（rgb(通道 / alpha-1)）一个字没动。
+   * 判据没变：**适配器只写色相通道，alpha / scrim / 层级由宿主推导。**
+   * ⚠️ 本段在模板字符串里，是 CSS 注释不是 JS 注释 —— 不许出现反引号，会提前终止模板。 */
 }
 
 /* 1. 底座（工作区 / 页面根）清掉寄生灰层与模糊，让壁纸高清透出。
