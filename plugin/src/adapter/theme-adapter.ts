@@ -365,6 +365,44 @@ export function splitColorChannels(
   return null;
 }
 
+/**
+ * 把皮肤给的**一个**面板色，拉成宿主要的**三档**色相通道。
+ *
+ * 🔴 为什么必须拉：宿主的四层表面（`--bg-surface-0..3-rgb`）是靠**色相本身**
+ * 分层的，alpha 只是壁纸下的额外一层。三档写成同一个值时，只要 alpha 也一样
+ * （见 `surfaceAlphas` 那条：不透明皮肤下三档 alpha 恒为 1），
+ * `--muted` / `--card` / `--popover` 就**逐字节相同** ——
+ * 李博 0910 报的「只剩余 2 种颜色，换什么皮肤都一样」就是这个。
+ *
+ * 比例取自宿主 `src/styles/palettes/mono.css` 自己的梯子（以 surface-2 为基准）：
+ *   浅色 245 / 235 / 255 / 255 ⇒ s1 = 0.922×s2，s3 = 1.0×s2（浅色档卡片已到顶，浮层不再抬）
+ *   暗色  26 /  32 /  38 /  44 ⇒ s1 = 0.842×s2，s3 = 1.158×s2
+ * 即「s1 比卡片沉一档、s3 比卡片浮一档」，与宿主的设计同构。
+ *
+ * ⚠️ **不返回 surface-0**：宿主的可读性地板（`src/index.css` 的
+ * `--surface-floor-rgb`）以它为基准，皮肤写了就等于把地板拆了。
+ *
+ * 失效条件：皮肤契约能一次给出三档面板色时，删掉这个推导，改成直接读。
+ */
+export function surfaceLadder(rgb: string): { s1: string; s2: string; s3: string } {
+  const ch = rgb.split(/\s+/).map((x) => Number(x));
+  if (ch.length !== 3 || ch.some((n) => !Number.isFinite(n))) return { s1: rgb, s2: rgb, s3: rgb };
+  const 夹 = (x: number) => String(Math.max(0, Math.min(255, Math.round(x))));
+  /* 明暗**由面板色自己说了算**，不从外面传：这个函数在两处被调用，
+   * 一处（transformDreamSkinToBerryTrace）根本拿不到明暗档，
+   * 传参就会变成「有的地方对、有的地方按浅色算」。
+   * 判据取感知亮度，阈值 128 —— 深面板要「浮层更亮」，浅面板要「浮层不再抬」。 */
+  const 亮度 = (0.299 * ch[0] + 0.587 * ch[1] + 0.114 * ch[2]);
+  const isDark = 亮度 < 128;
+  const k1 = isDark ? 0.842 : 0.922;
+  const k3 = isDark ? 1.158 : 1.0;
+  return {
+    s1: ch.map((n) => 夹(n * k1)).join(' '),
+    s2: ch.map((n) => 夹(n)).join(' '),
+    s3: ch.map((n) => 夹(n * k3)).join(' '),
+  };
+}
+
 /** alpha 下限：皮肤想更透可以，但不许透到字读不出来。 */
 export function clampSurfaceAlpha(alpha: number, floor: number): number {
   if (!Number.isFinite(alpha)) return floor;
@@ -443,9 +481,14 @@ export function transformDreamSkinToBerryTrace(
      * 失效条件：宿主不再用「通道 × alpha」合成语义 token 时，这条边界可以重议。 */
     const 面板 = splitColorChannels(c.panel);
     if (面板) {
-      cssVariables["--bg-surface-1-rgb"] = 面板.rgb;
-      cssVariables["--bg-surface-2-rgb"] = 面板.rgb;
-      cssVariables["--bg-surface-3-rgb"] = 面板.rgb;
+      /* 🔴 三档**不许写成同一个值**。写一样的话，只要 alpha 也一样
+       * （不透明皮肤下必然如此，见 surfaceAlphas），
+       * --muted / --card / --popover 会逐字节相同 ⇒ 界面上只剩两种底色。
+       * 〔0910 李博实测报的就是这个〕理由与比例见 surfaceLadder()。 */
+      const 梯 = surfaceLadder(面板.rgb);
+      cssVariables["--bg-surface-1-rgb"] = 梯.s1;
+      cssVariables["--bg-surface-2-rgb"] = 梯.s2;
+      cssVariables["--bg-surface-3-rgb"] = 梯.s3;
     }
     cssVariables["--ds-theme-color-panel"]      = c.panel;
   }
@@ -727,10 +770,28 @@ export async function applySkinViaSDK(
    */
   const panelSplit = splitColorChannels(userCard || userBg);
   const surfaceRgb = panelSplit?.rgb ?? (isDark ? '20 20 28' : '255 255 255');
+  const 梯 = surfaceLadder(surfaceRgb);
   const skinAlpha = panelSplit?.alpha ?? 1;
-  const alphaSidebar = clampSurfaceAlpha(skinAlpha, isDark ? 0.45 : 0.58);
-  const alphaCard = clampSurfaceAlpha(skinAlpha, isDark ? 0.72 : 0.78);
-  const alphaFloat = clampSurfaceAlpha(skinAlpha, isDark ? 0.88 : 0.9);
+
+  /* 🔴 `skinAlpha === 1` 是「皮肤**没表态**」，不是「皮肤要求完全不透明」。
+   *
+   * 〔0910 实测，CDP 连李博 Mac 上运行中的应用〕他的皮肤 panel 是不透明 hex
+   * （`#fbf9f3`）⇒ `skinAlpha = 1` ⇒ `clampSurfaceAlpha(1, floor) = min(1, max(floor,1)) = 1`
+   * **三档一起变 1**。后果两条，他一眼就看见了：
+   *   · 三档 alpha 相同 + 当时三档色相也相同 ⇒ --muted/--card/--popover 逐字节相同，
+   *     界面上「只剩余 2 种颜色，换什么皮肤都一样」（他的原话）；
+   *   · 壁纸再也透不进任何面板 —— 有壁纸却没有毛玻璃。
+   * 而**绝大多数皮肤的 panel 都是不透明 hex**，所以这不是个别皮肤的问题。
+   *
+   * ⇒ 皮肤给了 alpha（<1）才算表态，按它来（floor 兜住可读性）；
+   *   没表态就用宿主壁纸段的设计值，也就是这几个 floor 本身。
+   *
+   * 失效条件：皮肤契约能分别声明三档表面透明度时，这条推导换成直接读。 */
+  const 有透明意图 = Number.isFinite(skinAlpha) && skinAlpha < 1;
+  const 定档 = (floor: number) => (有透明意图 ? clampSurfaceAlpha(skinAlpha, floor) : floor);
+  const alphaSidebar = 定档(isDark ? 0.45 : 0.58);
+  const alphaCard = 定档(isDark ? 0.72 : 0.78);
+  const alphaFloat = 定档(isDark ? 0.88 : 0.9);
 
   /*
    * 浮层那一条（下面第 5 条）的底色与字色**必须同源**。
@@ -755,9 +816,9 @@ html.has-wallpaper {
   --bg-page: transparent !important;
 
   /* 色相：纯三通道，不含 alpha（上游 --ds-panel-rgb 的对应物） */
-  --bg-surface-1-rgb: ${surfaceRgb} !important;
-  --bg-surface-2-rgb: ${surfaceRgb} !important;
-  --bg-surface-3-rgb: ${surfaceRgb} !important;
+  --bg-surface-1-rgb: ${梯.s1} !important;
+  --bg-surface-2-rgb: ${梯.s2} !important;
+  --bg-surface-3-rgb: ${梯.s3} !important;
 
   /* alpha：单独一档，由宿主在**用的地方**合成 */
   --surface-alpha-1: ${alphaSidebar} !important;
