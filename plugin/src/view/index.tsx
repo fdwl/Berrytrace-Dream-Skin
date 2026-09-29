@@ -81,7 +81,7 @@ export interface ThemeItem {
 const PALETTE_ID_PREFIX = 'dreamskin-';
 
 /** 本插件 id。要与 plugin.json 的 `id` 逐字相同 —— 它决定内嵌站点用哪个 Cookie 罐。 */
-const PLUGIN_ID = 'org.dreamskin.plugin.dream-skin';
+const PLUGIN_ID = 'berrytrace.dream-skin';
 
 /**
  * 宿主提供的「把外部网站嵌进插件面板」的组件。

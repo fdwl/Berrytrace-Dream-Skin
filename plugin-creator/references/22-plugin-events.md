@@ -47,7 +47,7 @@
 | `daily-chronicle:trigger-summary-res` | `com.berrytrace.plugin.daily-chronicle` | — |
 | `daily-chronicle:update-summary-time-req` | — | `com.berrytrace.plugin.daily-chronicle` |
 | `daily-chronicle:update-summary-time-res` | `com.berrytrace.plugin.daily-chronicle` | — |
-| `dream-skin:applied` | `org.dreamskin.plugin.dream-skin` | — |
+| `dream-skin:applied` | `berrytrace.dream-skin` | — |
 | `editor:agent-edit-request` | `com.berrytrace.plugin.cline_agent`, `com.berrytrace.plugin.cline_agent` | `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor`, `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor` |
 | `editor:agent-edit-response` | `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor`, `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor` | `com.berrytrace.plugin.cline_agent`, `com.berrytrace.plugin.cline_agent` |
 | `editor:ping-open-file` | `com.berrytrace.plugin.cline_agent`, `com.berrytrace.plugin.cline_agent` | `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor`, `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor` |
@@ -128,7 +128,7 @@
 | `workspace:active-tab-changed` | — | `com.berrytrace.plugin.daily-chronicle`, `com.berrytrace.plugin.markdown-editor`, `com.berrytrace.plugin.markdown-editor` |
 | `workspace:changed` | — | `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor`, `com.berrytrace.plugin.code-editor`, `com.berrytrace.plugin.markdown-editor` |
 | `workspace:content-changed` | — | `com.berrytrace.plugin.daily-chronicle` |
-| `workspace:context-changed` | — | `com.berrytrace.plugin.daily-chronicle`, `org.dreamskin.plugin.dream-skin` |
+| `workspace:context-changed` | — | `com.berrytrace.plugin.daily-chronicle`, `berrytrace.dream-skin` |
 | `workspace:file-changed` | `com.berrytrace.plugin.npx-tools`, `com.berrytrace.plugin.npx-tools` | — |
 | `workspace:file-closed` | — | `com.berrytrace.plugin.daily-chronicle` |
 | `workspace:file-deleted` | — | `com.berrytrace.plugin.daily-chronicle` |
