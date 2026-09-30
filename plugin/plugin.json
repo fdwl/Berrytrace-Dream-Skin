@@ -2,20 +2,12 @@
   "id": "berrytrace.dream-skin",
   "slug": "dream-skin",
   "name": "BerryTrace DreamSkin 主题与皮肤中心",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "type": "panel",
   "view": "dist/view.js",
   "description": "无缝兼容 DreamSkin (.zip / theme.json) 资源包的 BerryTrace 原生主题与个性化皮肤插件",
   "category": "主题与外观",
   "contributes": {
-    "ribbonIcons": [
-      {
-        "id": "open-dream-skin-view",
-        "title": "主题皮肤库",
-        "icon": "Palette",
-        "targetView": "dream-skin-view"
-      }
-    ],
     "workspaceViews": [
       {
         "id": "dream-skin-view",
