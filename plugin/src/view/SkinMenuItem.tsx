@@ -95,6 +95,12 @@ export interface SkinMenuItemProps {
    * 缺省 `false` = 老行为（自己画主条 + hover 浮层），所以老宿主不受影响。
    */
   flat?: boolean;
+  /**
+   * 宿主自己画皮肤列表（它有 `ui.registerSkin`，1012 起）。为 `true` 时平铺形态只剩
+   * 一行「主题库」入口：列表、选中态、「恢复默认外观」都在宿主的外观面板里，
+   * 这里再画一遍就是李博说的「下面显示了两个外观」。
+   */
+  hostDrawsSkins?: boolean;
 }
 
 /** hover 预览卡的尺寸，算边界翻转要用，写死在一处避免两边对不上。 */
@@ -159,6 +165,7 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
   onApplySkin,
   onCloseMenu,
   flat = false,
+  hostDrawsSkins = false,
 }) => {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<{ skins: SkinMenuEntry[]; activeId: string | null }>({
@@ -383,6 +390,21 @@ export const SkinMenuItem: React.FC<SkinMenuItemProps> = ({
       // 表现是**这一格整块消失**而不是报错。宁可就地渲染（位置可能被包含块带偏），
       // 也不能崩。宿主侧 0905 已把 createPortal 补进门面。
       : previewCardNode;
+
+  // ══ 形态零：宿主画皮肤列表，这里只给「主题库」入口 ═══════════════════════
+  if (flat && hostDrawsSkins) {
+    return (
+      <button
+        type="button"
+        onClick={() => { setPreview(null); onCloseMenu?.(); onOpenGallery(); }}
+        title="打开 DreamSkin 主题库"
+        className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 bg-transparent border-none cursor-pointer text-left"
+      >
+        <Library className="size-3.5 shrink-0" />
+        <span>DreamSkin 主题库</span>
+      </button>
+    );
+  }
 
   // ══ 形态一：平铺（宿主已经展开了面板） ═══════════════════════════════════
   if (flat) {

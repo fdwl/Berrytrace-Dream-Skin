@@ -359,6 +359,8 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
       await writeActive(sdk, null);
       storedActiveIdRef.current = null;
     }
+    // 列表变了 ⇒ 宿主外观面板里的皮肤行跟着增减。
+    await syncRegisteredSkins();
   };
 
   /**
@@ -413,6 +415,19 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
     if (isApplyingRef.current) return;
     isApplyingRef.current = true;
     try {
+      // 宿主有皮肤注册表（1012 起）⇒ 只告诉宿主「选这套」。应用动作在 registerSkin 的
+      // activate 里（applySkinFromMenu），撤旧皮肤 / 互斥 / 持久化意图全由宿主做，
+      // 这样外观面板里的选中态、「恢复默认外观」按钮和别的皮肤插件才是同一套状态。
+      const hostSkinUi = getHostSkinUi(getPanelSdk());
+      if (hostSkinUi) {
+        await syncRegisteredSkins();
+        await hostSkinUi.setActiveSkin(skinIdFor(item.id));
+        setActiveThemeId(item.id);
+        storedActiveIdRef.current = item.id;
+        setStatusMessage(`已切换为主题：${item.name}`);
+        return;
+      }
+
       // 若是大体积 Base64 数据，优先保存至系统磁盘，拿回轻量的 URL
       const savedImageUrl = await saveWallpaperToDisk(propSdk || window.berrytracePluginSdk, item.id, item.imageBlobUrl);
       const applied = transformDreamSkinToBerryTrace(item.config, savedImageUrl);
@@ -452,6 +467,16 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
 
   // 恢复原生 BerryTrace 默认外观
   const resetAppearance = async (paletteOwnerId: string | null) => {
+    const hostSkinUi = getHostSkinUi(getPanelSdk());
+    if (hostSkinUi) {
+      // 宿主退役皮肤时调我们的 deactivate（deactivateThemeForHost）清 CSS / 壁纸 / 存储里的 active。
+      await hostSkinUi.setActiveSkin(null);
+      setActiveThemeId(null);
+      storedActiveIdRef.current = null;
+      setStatusMessage('已恢复 BerryTrace 原生默认外观');
+      return;
+    }
+
     const sdkUi = getSdkUi(propSdk);
     if (sdkUi) {
       await clearSkinViaSDK(sdkUi, getSdkPlugin(propSdk) ?? undefined);
@@ -493,11 +518,8 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
     unregisterSkinPalette(id);
 
     const updated = themesRef.current.filter((t) => t.id !== id);
-    if (activeThemeId === id) {
-      await handleReset();
-    } else {
-      await persistThemesAndActive(updated);
-    }
+    if (activeThemeId === id) await handleReset();
+    await persistThemesAndActive(updated);
     setStatusMessage(`已删除主题 [${id}]`);
   };
 
@@ -526,6 +548,7 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
       await handleReset();
       setThemes([]);
       themesRef.current = [];
+      await syncRegisteredSkins();
       setStatusMessage('🎉 已彻底一键清空所有自定义皮肤及物理解压文件，恢复初始状态');
     } catch (err: any) {
       console.error('清空自定义皮肤失败:', err);
@@ -1539,6 +1562,109 @@ async function applySkinFromMenu(themeId: string): Promise<void> {
   sdk?.events?.emit('dream-skin:applied', { themeId: item.id, name: item.name });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 宿主皮肤注册表（sdk.ui.registerSkin / setActiveSkin，宿主 1012 起）
+//
+// 每套已装皮肤在宿主登记成一个 skin：外观面板里一行（预览图 + 名字），选中态由宿主
+// 统一维护（跟月下等别的皮肤插件互斥），「恢复默认外观」也是宿主画的。
+// 我们这边只负责两件事：activate = 应用这套（与菜单那条路同一函数），
+// deactivate = 清掉我们贴上去的 CSS / 壁纸 / 存储里的 active。
+// 色系摘表与 setPalette('mono') 不在 deactivate 里做：宿主退役皮肤后会
+// unregisterPalettesByPlugin + 刷新色系表，这里再 setPalette 反而会重入退役流程。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HOST_SKIN_ID_PREFIX = 'dream-skin:';
+
+/** 宿主注册表里这套主题的 skin id。 */
+function skinIdFor(themeId: string): string {
+  return HOST_SKIN_ID_PREFIX + themeId;
+}
+
+interface HostSkinUi {
+  registerSkin: (def: {
+    id: string;
+    label: string;
+    modes: Array<'light' | 'dark'>;
+    previewUrl?: string;
+    activate: () => void | Promise<void>;
+    deactivate: () => void | Promise<void>;
+  }) => (() => void) | boolean | void;
+  setActiveSkin: (id: string | null) => Promise<void>;
+}
+
+/** 宿主有皮肤注册表才返回；老宿主 ⇒ null，调用方走原来那条自己应用的路。 */
+function getHostSkinUi(sdk: any): HostSkinUi | null {
+  const ui = sdk?.ui;
+  if (typeof ui?.registerSkin !== 'function' || typeof ui?.setActiveSkin !== 'function') return null;
+  return ui as HostSkinUi;
+}
+
+/** themeId → 注销函数。只在这个 Map 里的才算登记过，防止重复 registerSkin。 */
+const registeredHostSkins = new Map<string, () => void>();
+
+/**
+ * 让宿主注册表与磁盘上的皮肤列表一致：新装的登记、删掉的注销。
+ * onload、列表落盘（导入 / 删除）、清空全部之后各调一次。幂等。
+ */
+async function syncRegisteredSkins(): Promise<void> {
+  const sdk = getMenuSdk();
+  const hostUi = getHostSkinUi(sdk);
+  if (!hostUi) return;
+
+  let list: ThemeItem[] = [];
+  try {
+    list = (await loadSkinsFromDisk(sdk)).ok;
+  } catch (err) {
+    console.warn('🎨 [DreamSkin] 同步宿主皮肤注册表：读皮肤列表失败', err);
+    return;
+  }
+  const wanted = new Map<string, ThemeItem>();
+  for (const t of list) if (t?.id) wanted.set(t.id, t);
+
+  for (const [themeId, dispose] of registeredHostSkins) {
+    if (wanted.has(themeId)) continue;
+    try { dispose(); } catch (err) { console.warn('🎨 [DreamSkin] 注销宿主皮肤失败', themeId, err); }
+    registeredHostSkins.delete(themeId);
+  }
+
+  for (const [themeId, item] of wanted) {
+    if (registeredHostSkins.has(themeId)) continue;
+    // 预览图取法与菜单 / 面板一致：先用存下来的物理路径，没有再从 config.image 拼。
+    const configImage = item.config?.image;
+    const preview = item.imageBlobUrl || (configImage ? formatPluginResourceUrl(configImage) : '');
+    try {
+      const dispose = hostUi.registerSkin({
+        id: skinIdFor(themeId),
+        label: item.name || themeId,
+        modes: supportedModesFor(item.config?.appearance),
+        previewUrl: preview || undefined,
+        activate: () => applySkinFromMenu(themeId),
+        deactivate: () => deactivateThemeForHost(),
+      });
+      registeredHostSkins.set(themeId, typeof dispose === 'function' ? dispose : () => {});
+    } catch (err) {
+      console.warn('🎨 [DreamSkin] 向宿主登记皮肤失败', themeId, err);
+    }
+  }
+}
+
+/** 宿主退役这套皮肤时调：清我们贴的 CSS / 壁纸 + 存储里的 active。色系由宿主摘。 */
+async function deactivateThemeForHost(): Promise<void> {
+  const sdk = getMenuSdk();
+  const sdkUi = (sdk?.ui ?? null) as SdkUi | null;
+  if (sdkUi) await clearSkinViaSDK(sdkUi, sdk?.plugin);
+  await writeActive(sdk, null);
+  sdk?.events?.emit('dream-skin:applied', { themeId: null, name: null });
+}
+
+/** onunload：把登记过的皮肤全部注销（SDK 也会兜底 dispose，这里主要是清 Map，重载时才会重新登记）。 */
+function disposeRegisteredSkins(): void {
+  for (const [themeId, dispose] of registeredHostSkins) {
+    try { dispose(); } catch (err) { console.warn('🎨 [DreamSkin] 注销宿主皮肤失败', themeId, err); }
+  }
+  registeredHostSkins.clear();
+}
+
 /** 菜单里点「恢复默认外观」。 */
 async function resetAppearanceFromMenu(): Promise<void> {
   const sdk = getMenuSdk();
@@ -1705,6 +1831,9 @@ function registerAvatarMenuItem(): (() => void) | null {
           // 而那个浮层的 `left-full` 会把它顶出屏幕（看不见，且零报错）。
           // 老宿主不传 context ⇒ 这里是 undefined ⇒ 走浮层那一支，行为不变。
           flat: (props?.context as { layout?: string } | undefined)?.layout === 'flat',
+          // 宿主有皮肤注册表 ⇒ 皮肤列表、选中态、「恢复默认外观」都由宿主外观面板画
+          //（1012 李博：两个「外观」要合并成一个）。这一格只剩「主题库」入口。
+          hostDrawsSkins: getHostSkinUi(sdk) !== null,
           // 直接把异步读取交给它。组件自己在**挂载时**和**每次展开时**各拉一次，
           // 并带请求序号防乱序 —— 见 SkinMenuItem 里 refresh() 的说明。
           //
@@ -1761,6 +1890,10 @@ export class DreamSkinViewPlugin {
       // 它不依赖面板是否打开 —— 面板可能一次都没被打开过。
       this._disposeMenu = registerAvatarMenuItem();
 
+      // 把已装皮肤登记进宿主皮肤注册表。宿主记着「上次选的是哪套」，登记到那套时
+      // 会立刻调 activate 把它应用回来，所以这一步也是启动恢复的一环。
+      void syncRegisteredSkins();
+
       // 皮肤的 CSS 由宿主 SkinLayer 在启动 step 2 自动恢复，但**色系表项不会**
       // —— 那是运行期状态，重启后得由我们自己补回去。详见函数上面那段。
       void replayInstalledPalettes();
@@ -1779,6 +1912,7 @@ export class DreamSkinViewPlugin {
     } catch (err) {
       console.warn('🚨 [DreamSkin:ViewPlugin] 注销头像菜单条目失败:', err);
     }
+    disposeRegisteredSkins();
     try {
       if (this.app?.workspace?.unregisterView) {
         this.app.workspace.unregisterView('dream-skin-view');
