@@ -22,6 +22,8 @@ import {
   applySkinViaSDK,
   clearSkinViaSDK,
   saveWallpaperToDisk,
+  writeWallpaperFile,
+  WALLPAPER_DIR_NAME,
   resolvePreviewDataUrl,
   formatPluginResourceUrl,
   getSkinRootDir,
@@ -47,22 +49,24 @@ import {
   verifyPackageChecksum,
   VERSION_ID_RE,
 } from '../adapter/dreamskin-api';
+import {
+  clearStore,
+  loadSkinsFromDisk,
+  readActive,
+  toStoredSkin,
+  writeActive,
+  writeStoredSkins,
+  type LoadedSkin,
+  type StoredSkin,
+} from '../adapter/theme-store';
+import { splitRedownloadable } from '../adapter/skin-disk-check';
 import { GALLERY_CSS, GALLERY_JS, DARK_OVERRIDE_CSS } from './gallery-inject';
 import { SkinMenuItem, type SkinMenuEntry } from './SkinMenuItem';
 
 declare const window: any;
 
-export interface ThemeItem {
-  id: string;
-  name: string;
-  author: string;
-  isCustom?: boolean;
-  config: DreamSkinThemeConfig;
-  themeCss?: string;
-  imageBlobUrl?: string;
-  /** 来自主题库的版本 id（`ver_…`）。手动导入的包没有这个字段。 */
-  versionId?: string;
-}
+/** 面板 / 菜单里用的皮肤条目：落盘字段 + 运行期现拼的 imageBlobUrl（不落盘）。 */
+export type ThemeItem = LoadedSkin;
 
 
 /**
@@ -118,9 +122,6 @@ const EmbeddedSiteComp: React.ComponentType<{
 function paletteIdForTheme(themeId: string): string {
   return (PALETTE_ID_PREFIX + String(themeId)).replace(/[^A-Za-z0-9_.:-]/g, '-').slice(0, 64);
 }
-
-const STORAGE_KEY_CUSTOM_THEMES = 'berrytrace_dream_skin_custom_themes';
-const STORAGE_KEY_ACTIVE_THEME = 'berrytrace_dream_skin_active';
 
 interface DreamSkinAppProps {
   sdk?: any;
@@ -256,46 +257,42 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
   // 标志位：防范应用主题过程中触发事件广播造成的递归重入
   const isApplyingRef = useRef<boolean>(false);
 
+  // 运行期最新值。异步流程（连续重新下载多个皮肤）里闭包里的 themes 会过期，读这里。
+  const themesRef = useRef<ThemeItem[]>([]);
+  /** 磁盘上缺图的存储条目。不展示，但必须随列表写回 —— 用户没决定之前不能被写丢。 */
+  const missingRef = useRef<StoredSkin[]>([]);
+  /** 存储里记录的「当前生效」皮肤 id（可能指向一个缺图的皮肤）。 */
+  const storedActiveIdRef = useRef<string | null>(null);
+  /** 缺图询问每次打开面板只问一次。 */
+  const askedMissingRef = useRef<boolean>(false);
+  const [missingPrompt, setMissingPrompt] = useState<StoredSkin[] | null>(null);
+  const [resolvingMissing, setResolvingMissing] = useState<boolean>(false);
+
+  /** 面板拿到的 SDK。属性优先，全局只当兜底。 */
+  const getPanelSdk = () => propSdk || window.berrytracePluginSdk;
+
   // 仅恢复 UI 激活状态及主题列表（不触发 DOM/CSS 重新应用，防止死循环）
+  // 列表以磁盘为准：图片文件缺了的皮肤不进 themes，收进 missingRef，首次加载时问用户。
   const syncActiveThemeStateOnly = async () => {
     try {
-      const sdk = window.berrytracePluginSdk;
-      let savedCustom: ThemeItem[] = [];
-      let savedActiveId: string | null = null;
-      let savedActiveName: string | null = null;
+      const sdk = getPanelSdk();
+      const { ok, missing } = await loadSkinsFromDisk(sdk);
+      const active = await readActive(sdk);
 
-      if (sdk?.storage) {
-        savedCustom = (await sdk.storage.getItem(STORAGE_KEY_CUSTOM_THEMES)) || [];
-        const savedActive = await sdk.storage.getItem(STORAGE_KEY_ACTIVE_THEME);
-        savedActiveId = savedActive?.themeId ?? null;
-        savedActiveName = savedActive?.name ?? null;
-      } else {
-        const rawCustom = window.localStorage.getItem(STORAGE_KEY_CUSTOM_THEMES);
-        if (rawCustom) savedCustom = JSON.parse(rawCustom);
-        const rawActive = window.localStorage.getItem(STORAGE_KEY_ACTIVE_THEME);
-        if (rawActive) {
-          const parsed = JSON.parse(rawActive);
-          savedActiveId = parsed?.themeId ?? null;
-          savedActiveName = parsed?.name ?? null;
-        }
+      themesRef.current = ok;
+      missingRef.current = missing;
+      storedActiveIdRef.current = active?.themeId ?? null;
+      setThemes(ok);
+
+      const activeItem = ok.find((t) => t.id === active?.themeId);
+      setActiveThemeId(activeItem?.id ?? null);
+      if (activeItem) {
+        setStatusMessage(`当前生效主题：${activeItem.name || active?.name || activeItem.id}`);
       }
 
-      // 恢复 imageBlobUrl：优先使用存储中保存的完整协议路径，不要用相对文件名重新生成
-      const cleanedCustom = savedCustom.map((item) => {
-        if (item.imageBlobUrl && item.imageBlobUrl.startsWith('data:image')) {
-          // 旧版本存了 Base64，丢弃，用空字符串（下次会触发 onError 降级）
-          return { ...item, imageBlobUrl: '' };
-        }
-        return item;
-      });
-
-      setThemes(cleanedCustom);
-
-      if (savedActiveId) {
-        // 如果 custom 列表里有这个 ID，直接同步该 item 的 imageBlobUrl 并补全存储
-        const activeItem = cleanedCustom.find((t) => t.id === savedActiveId);
-        setActiveThemeId(savedActiveId);
-        setStatusMessage(`当前生效主题：${activeItem?.name || savedActiveName || savedActiveId}`);
+      if (missing.length > 0 && !askedMissingRef.current) {
+        askedMissingRef.current = true;
+        setMissingPrompt(missing);
       }
     } catch (err: any) {
       console.error('同步保存的主题状态失败:', err);
@@ -346,32 +343,21 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
     applied?: BerryTraceAppliedTheme | null
   ) => {
     const customList = newThemes.filter((t) => t.isCustom);
+    themesRef.current = newThemes;
     setThemes(newThemes);
 
-    // 只存储 UI 状态（ID + name），CSS 已由 sdk.ui.persistStyle 接管
-    const sdk = window.berrytracePluginSdk;
-    if (sdk?.storage) {
-      await sdk.storage.setItem(STORAGE_KEY_CUSTOM_THEMES, customList);
-      if (activeItem && applied) {
-        await sdk.storage.setItem(STORAGE_KEY_ACTIVE_THEME, {
-          themeId: activeItem.id,
-          name: applied.name,
-          imageBlobUrl: activeItem.imageBlobUrl,
-        });
-      } else if (activeItem === null) {
-        await sdk.storage.removeItem(STORAGE_KEY_ACTIVE_THEME);
-      }
-    } else {
-      window.localStorage.setItem(STORAGE_KEY_CUSTOM_THEMES, JSON.stringify(customList));
-      if (activeItem && applied) {
-        window.localStorage.setItem(STORAGE_KEY_ACTIVE_THEME, JSON.stringify({
-          themeId: activeItem.id,
-          name: applied.name,
-          imageBlobUrl: activeItem.imageBlobUrl,
-        }));
-      } else if (activeItem === null) {
-        window.localStorage.removeItem(STORAGE_KEY_ACTIVE_THEME);
-      }
+    // 只存储 UI 状态；CSS 已由 sdk.ui.persistStyle 接管。图片只存相对信息，URL 不落盘。
+    // 缺图未决的条目要一起写回，否则用户还没选就等于被静默删掉了。
+    const sdk = getPanelSdk();
+    const shownIds = new Set(customList.map((t) => t.id));
+    const pending = missingRef.current.filter((m) => !shownIds.has(m.id));
+    await writeStoredSkins(sdk, [...customList.map(toStoredSkin), ...pending]);
+    if (activeItem && applied) {
+      await writeActive(sdk, { themeId: activeItem.id, name: applied.name });
+      storedActiveIdRef.current = activeItem.id;
+    } else if (activeItem === null) {
+      await writeActive(sdk, null);
+      storedActiveIdRef.current = null;
     }
   };
 
@@ -465,7 +451,7 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
   };
 
   // 恢复原生 BerryTrace 默认外观
-  const handleReset = async () => {
+  const resetAppearance = async (paletteOwnerId: string | null) => {
     const sdkUi = getSdkUi(propSdk);
     if (sdkUi) {
       await clearSkinViaSDK(sdkUi, getSdkPlugin(propSdk) ?? undefined);
@@ -475,23 +461,30 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
     }
     // 摘掉当前皮肤的色系并切回内置默认，否则明暗会一直被它的 modes 锁着 ——
     // 「恢复默认外观」这句话对用户的承诺里就包含「明暗能切了」。
-    if (activeThemeId) unregisterSkinPalette(activeThemeId);
+    if (paletteOwnerId) unregisterSkinPalette(paletteOwnerId);
     const sdkUiForPalette = getSdkUi(propSdk) as (SdkUi & { setPalette?: (id: string) => void }) | null;
     if (typeof sdkUiForPalette?.setPalette === 'function') sdkUiForPalette.setPalette('mono');
 
     setActiveThemeId(null);
     setStatusMessage('已恢复 BerryTrace 原生默认外观');
-    await persistThemesAndActive(themes, null, null);
+    await persistThemesAndActive(themesRef.current, null, null);
   };
+  const handleReset = () => resetAppearance(activeThemeId);
 
   // 删除自定义导入的主题 (物理清理解压目录与数据)
   const handleDeleteCustomTheme = async (id: string) => {
     try {
-      const sdk = propSdk || window.berrytracePluginSdk;
+      const sdk = getPanelSdk();
       const fs = sdk?.filesystem;
       const skinRootDir = await getSkinRootDir(sdk);
-      if (fs?.removeDir && skinRootDir) {
-        await fs.removeDir(`${skinRootDir}/${id}`).catch(() => {});
+      const target = themesRef.current.find((t) => t.id === id);
+      if (fs && skinRootDir && target?.skinDir) {
+        if (target.skinDir === WALLPAPER_DIR_NAME) {
+          // 公共壁纸目录不能整个删，只删这一张。
+          if (target.imageFile) await fs.removeFile?.(`${skinRootDir}/${target.skinDir}/${target.imageFile}`)?.catch?.(() => {});
+        } else {
+          await fs.removeDir?.(`${skinRootDir}/${target.skinDir}`)?.catch?.(() => {});
+        }
       }
     } catch (e) {
       console.warn('删除物理主题目录异常:', e);
@@ -499,7 +492,7 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
 
     unregisterSkinPalette(id);
 
-    const updated = themes.filter((t) => t.id !== id);
+    const updated = themesRef.current.filter((t) => t.id !== id);
     if (activeThemeId === id) {
       await handleReset();
     } else {
@@ -511,30 +504,28 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
   // 一键清空所有自定义主题与解压目录，恢复初始状态
   const handleClearAllCustomThemes = async () => {
     try {
-      const sdk = propSdk || window.berrytracePluginSdk;
+      const sdk = getPanelSdk();
       const fs = sdk?.filesystem;
       const skinRootDir = await getSkinRootDir(sdk);
 
-      // 1. 物理删除所有解压的皮肤文件夹
-      const customItems = themes.filter((t) => t.isCustom);
+      // 1. 物理删除所有解压的皮肤文件夹（含缺图未决的条目留下的残余目录）
+      const allItems: StoredSkin[] = [...themesRef.current, ...missingRef.current];
       if (fs?.removeDir && skinRootDir) {
-        for (const item of customItems) {
-          await fs.removeDir(`${skinRootDir}/${item.id}`).catch(() => {});
+        const dirs = new Set(allItems.map((t) => t.skinDir).filter((d): d is string => !!d && d !== WALLPAPER_DIR_NAME));
+        for (const dir of dirs) {
+          await fs.removeDir(`${skinRootDir}/${dir}`).catch(() => {});
         }
-        await fs.removeDir(`${skinRootDir}/wallpapers`).catch(() => {});
+        await fs.removeDir(`${skinRootDir}/${WALLPAPER_DIR_NAME}`).catch(() => {});
       }
 
-      // 2. 擦除插件持久化存储 (storage & localStorage)
-      if (sdk?.storage) {
-        await sdk.storage.removeItem(STORAGE_KEY_CUSTOM_THEMES);
-        await sdk.storage.removeItem(STORAGE_KEY_ACTIVE_THEME);
-      }
-      window.localStorage.removeItem(STORAGE_KEY_CUSTOM_THEMES);
-      window.localStorage.removeItem(STORAGE_KEY_ACTIVE_THEME);
+      // 2. 擦除插件持久化存储。用户点的是「清空全部」，缺图未决的条目也一并清掉。
+      missingRef.current = [];
+      await clearStore(sdk);
 
       // 3. 恢复原生默认外观
       await handleReset();
       setThemes([]);
+      themesRef.current = [];
       setStatusMessage('🎉 已彻底一键清空所有自定义皮肤及物理解压文件，恢复初始状态');
     } catch (err: any) {
       console.error('清空自定义皮肤失败:', err);
@@ -543,7 +534,12 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
   };
 
   // 解析并导入 DreamSkinPackage
-  const processImportPackage = async (pkg: DreamSkinPackage, filename: string) => {
+  const processImportPackage = async (
+    pkg: DreamSkinPackage,
+    filename: string,
+    opts: { activate?: boolean; versionId?: string } = {},
+  ) => {
+    const activate = opts.activate !== false;
     if (!pkg.theme?.id) {
       throw new Error('主题包无效：theme.json 缺少 id 字段');
     }
@@ -551,8 +547,20 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
     const themeId = pkg.theme.id;
     pkg.theme.name = pkg.theme.name || pkg.manifest?.themeId || filename.replace(/\.(zip|json)$/i, '');
 
-    // imageBlobUrl 由 installThemeZipNative 直接返回 berrytrace-plugin:// 物理路径，直接使用
-    const imageUrl = pkg.imageBlobUrl || '';
+    // 图片落盘信息只存相对的 skinDir + imageFile。
+    // 原生解压路径直接给；JSZip 降级路径给的是 data: URI，先写进 skin/wallpapers/ 再取相对信息。
+    let skinDir = pkg.skinDir;
+    let imageFile = pkg.imageFile;
+    let imageUrl = pkg.imageBlobUrl || '';
+    if (!imageFile && imageUrl.startsWith('data:image')) {
+      const sdk = getPanelSdk();
+      const saved = await writeWallpaperFile(sdk, themeId, imageUrl);
+      if (saved) {
+        skinDir = saved.skinDir;
+        imageFile = saved.imageFile;
+        imageUrl = formatPluginResourceUrl(`${await getSkinRootDir(sdk)}/${skinDir}/${imageFile}`);
+      }
+    }
 
     const newThemeItem: ThemeItem = {
       id: themeId,
@@ -561,11 +569,21 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
       isCustom: true,
       config: pkg.theme,
       themeCss: pkg.themeCss,
+      skinDir,
+      imageFile,
+      versionId: opts.versionId,
       imageBlobUrl: imageUrl,
     };
 
     // 同名主题直接覆盖替换，不追加不改名
-    const updated = [...themes.filter((t) => t.id !== themeId), newThemeItem];
+    const updated = [...themesRef.current.filter((t) => t.id !== themeId), newThemeItem];
+
+    if (!activate) {
+      // 重新下载补回缺图皮肤：只回到列表里，不换肤。
+      await persistThemesAndActive(updated);
+      if (storedActiveIdRef.current === themeId) setActiveThemeId(themeId);
+      return;
+    }
 
     // 自动应用
     const applied = transformDreamSkinToBerryTrace(pkg.theme, imageUrl);
@@ -633,12 +651,16 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
    * 汇到一处的好处很实在：这条流程里最容易出错的是**校验与降级**那几步，
    * 三个入口各写一遍必然漂。
    */
-  const installFromVersionId = async (versionId: string) => {
+  const installFromVersionId = async (
+    versionId: string,
+    opts: { activate?: boolean; switchTab?: boolean } = {},
+  ): Promise<boolean> => {
+    const activate = opts.activate !== false;
     if (!VERSION_ID_RE.test(versionId)) {
       setStatusMessage(`❌ 版本号形状不对：${versionId}`);
-      return;
+      return false;
     }
-    if (installingVersion) return;   // 同一时刻只装一个，避免两次解压写同一个目录
+    if (installingVersion) return false;   // 同一时刻只装一个，避免两次解压写同一个目录
     setInstallingVersion(versionId);
     try {
       const sdk = propSdk || window.berrytracePluginSdk;
@@ -693,20 +715,26 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
         pkg.theme.appearance = meta.displayMeta.appearance;
       }
 
-      await processImportPackage(pkg, `${versionId}.zip`);
+      await processImportPackage(pkg, `${versionId}.zip`, { activate, versionId });
 
       // ⑤ 收尾：把下载的临时包删掉（解压产物已经落在 skin 目录里了）。
       await sdk?.filesystem?.removeFile?.(tmpPath).catch(() => {});
 
       const modes = supportedModesFor(pkg.theme?.appearance);
       const lockNote = modes.length === 1 ? `（此皮肤只支持${modes[0] === 'dark' ? '深色' : '浅色'}，明暗切换已锁定）` : '';
-      setStatusMessage(`🎉 已换肤：${pkg.theme?.name || displayName}${lockNote}`);
+      if (activate) {
+        setStatusMessage(`🎉 已换肤：${pkg.theme?.name || displayName}${lockNote}`);
+      } else {
+        setStatusMessage(`已重新下载：${pkg.theme?.name || displayName}`);
+      }
       // 装完把用户拨到「我的皮肤」，让他看见东西真的进来了 ——
       // 留在主题库页面的话，除了背景变了没有任何反馈。
-      setActiveTab('mine');
+      if (opts.switchTab !== false) setActiveTab('mine');
+      return true;
     } catch (err: any) {
       console.error('一键换肤失败:', err);
       setStatusMessage(`❌ 一键换肤失败：${err?.message || '未知错误'}`);
+      return false;
     } finally {
       setInstallingVersion(null);
     }
@@ -901,6 +929,57 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
     }
   };
 
+  /* ── 缺图皮肤的处置（用户在询问框里选） ───────────────────────────────
+     不静默删、不静默重下：只有用户点了按钮才动。 */
+
+  /** 「移除」：只从列表里去掉；如果其中有当前生效的那套，一并恢复默认外观。 */
+  const handleRemoveMissing = async (targets: StoredSkin[]) => {
+    setResolvingMissing(true);
+    try {
+      const ids = new Set(targets.map((t) => t.id));
+      const wasActive = storedActiveIdRef.current !== null && ids.has(storedActiveIdRef.current);
+      for (const t of targets) unregisterSkinPalette(t.id);
+      missingRef.current = missingRef.current.filter((m) => !ids.has(m.id));
+      if (wasActive) await resetAppearance(null);
+      else await persistThemesAndActive(themesRef.current);
+      setStatusMessage(`已从列表移除 ${targets.length} 个缺失文件的皮肤`);
+    } catch (err: any) {
+      setStatusMessage(`移除失败: ${err?.message || '未知错误'}`);
+    } finally {
+      setMissingPrompt(null);
+      setResolvingMissing(false);
+    }
+  };
+
+  /** 「重新下载」：只处理有版本 id 的；没有的原样留在存储里，下次打开面板再问。 */
+  const handleRedownloadMissing = async (targets: StoredSkin[]) => {
+    setResolvingMissing(true);
+    try {
+      const { redownloadable } = splitRedownloadable(targets);
+      let okCount = 0;
+      for (const { skin, versionId } of redownloadable) {
+        const ok = await installFromVersionId(versionId, { activate: false, switchTab: false });
+        if (ok) {
+          okCount++;
+          // 重装后的 theme.id 若与旧条目不同，旧条目在这里清掉。
+          missingRef.current = missingRef.current.filter((m) => m.id !== skin.id);
+        }
+      }
+      await persistThemesAndActive(themesRef.current);
+      const left = missingRef.current.length;
+      setStatusMessage(
+        `已重新下载 ${okCount}/${redownloadable.length} 个皮肤` + (left ? `，仍有 ${left} 个缺失文件的皮肤未处理` : ''),
+      );
+    } catch (err: any) {
+      setStatusMessage(`重新下载失败: ${err?.message || '未知错误'}`);
+    } finally {
+      setMissingPrompt(null);
+      setResolvingMissing(false);
+    }
+  };
+
+  const missingSplit = missingPrompt ? splitRedownloadable(missingPrompt) : null;
+
   const activeTheme = themes.find((t) => t.id === activeThemeId) || null;
 
   return (
@@ -912,6 +991,64 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
         isDragging ? 'ring-2 ring-brand ring-inset' : ''
       }`}
     >
+      {/* 缺图询问：每次打开面板最多问一次。 */}
+      {missingPrompt && missingSplit && (
+        <div className="absolute inset-0 z-[60] flex items-center justify-center bg-background/80 backdrop-blur-sm p-6">
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="w-full max-w-md rounded-2xl border border-black/10 dark:border-white/10 bg-card text-card-foreground shadow-lg p-5 flex flex-col gap-3"
+          >
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 text-brand shrink-0" />
+              <h2 className="text-sm font-bold">有 {missingPrompt.length} 个皮肤的图片文件找不到了</h2>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              它们已暂时不在列表里显示。请选择重新下载，或把它们从列表移除。
+            </p>
+            <ul className="max-h-48 overflow-auto flex flex-col gap-1 text-xs">
+              {missingPrompt.map((m) => {
+                const canRedownload = missingSplit.redownloadable.some((r) => r.skin.id === m.id);
+                return (
+                  <li key={m.id} className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg bg-black/5 dark:bg-white/5">
+                    <span className="truncate">{m.name || m.id}</span>
+                    <span className="shrink-0 text-[10px] text-muted-foreground">
+                      {canRedownload ? '可重新下载' : '手动导入，无法重新下载'}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={resolvingMissing}
+                onClick={() => setMissingPrompt(null)}
+                className="px-3 py-2 text-xs rounded-xl cursor-pointer border-none bg-transparent text-muted-foreground hover:text-foreground disabled:opacity-50"
+              >
+                暂不处理
+              </button>
+              <button
+                type="button"
+                disabled={resolvingMissing}
+                onClick={() => { void handleRemoveMissing(missingPrompt); }}
+                className="px-3.5 py-2 text-xs font-semibold rounded-xl cursor-pointer border border-black/10 dark:border-white/10 bg-transparent text-foreground disabled:opacity-50"
+              >
+                从列表移除
+              </button>
+              <button
+                type="button"
+                disabled={resolvingMissing || missingSplit.redownloadable.length === 0}
+                onClick={() => { void handleRedownloadMissing(missingPrompt); }}
+                className="px-3.5 py-2 text-xs font-semibold rounded-xl cursor-pointer border-none bg-brand text-brand-foreground disabled:opacity-50"
+              >
+                {resolvingMissing ? '处理中…' : `重新下载（${missingSplit.redownloadable.length}）`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 拖拽落点提示。
           ⚠️ 网站嵌进来之后拖拽的权重下降了，但**不能删** —— 主题库里没有的包
           （作者私发的、自己做的）只能这么进来。所以它从「页面主角」降级成
@@ -1020,7 +1157,7 @@ const DreamSkinApp: React.FC<DreamSkinAppProps> = ({ sdk: propSdk }) => {
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={handleReset}
+                onClick={() => { void handleReset(); }}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-black/10 dark:border-white/10 bg-muted text-foreground rounded-lg hover:bg-accent transition-colors cursor-pointer"
                 title="恢复 BerryTrace 原生默认外观，并解开明暗锁定"
               >
@@ -1334,65 +1471,20 @@ function getMenuSdk(): any {
   return typeof window !== 'undefined' ? (window as any).berrytracePluginSdk : null;
 }
 
-/* ── 皮肤数据到底存在哪儿 ────────────────────────────────────────────────────
+/* ── 皮肤数据只存在 sdk.storage ──────────────────────────────────────────────
  *
- * 🔴 **存在 `window.localStorage`，不在 `sdk.storage`。** 这不是设计，是既成事实：
- * 面板里读写皮肤的每一处（`:268` 读、`:354` 写、`:529` 清）判据都是
- *     `const sdk = window.berrytracePluginSdk;  if (sdk?.storage) … else localStorage`
- * 而那个全局**从来不存在**（见 `menuSdk` 上面那段实机取证）⇒ 分支恒走 else
- * ⇒ 用户所有已装皮肤都躺在 localStorage 里，一条都没进过 `sdk.storage`。
- *
- * 🔴 0905 把菜单这条路改成拿真 SDK 之后，`sdk?.storage` **头一次变成了真**，
- * 菜单于是去读一个从来没被写过的空分区。实机表现：明暗、配色、分组标题全都
- * 渲染出来了，**只有皮肤列表永远转着骨架** —— 一个不会自己停下来的加载态，
- * 零报错。（这是修 SDK 获取时顺手带出来的回归，当场量到、当场修。）
- *
- * 所以菜单这条路一律走下面两个函数，**判据取「数据在哪」，不取「SDK 有没有」**。
- *
- * 失效条件：面板那三处也改成用真 SDK、并把 localStorage 里的存量数据迁移过去
- * 之后，这一层可以收敛成直接调 `sdk.storage`。在那之前**两边必须看到同一份数据**
- * —— 菜单切了皮肤面板要看得见，反过来也一样。
+ * 面板、头像菜单、后台 main 共用 adapter/theme-store.ts 读写，这里不再有自己的存储分支。
+ * 菜单列皮肤前先核对磁盘（loadSkinsFromDisk）：图片缺了的不显示，询问在面板打开时做。
  */
-
-/** 读一项。先读 localStorage（存量全在那儿），空了再问 sdk.storage（为迁移留口）。 */
-async function readThemeStore<T>(key: string): Promise<T | null> {
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (raw) return JSON.parse(raw) as T;
-  } catch (err) {
-    // 坏 JSON 不该让整个菜单瞎掉，往下试另一个来源。
-    console.warn(`🎨 [DreamSkin:Menu] localStorage 里的 ${key} 解不开:`, err);
-  }
-  try {
-    const v = await getMenuSdk()?.storage?.getItem(key);
-    if (v) return v as T;
-  } catch (err) {
-    console.warn(`🎨 [DreamSkin:Menu] sdk.storage 读 ${key} 失败:`, err);
-  }
-  return null;
-}
-
-/**
- * 写一项。**只写 localStorage** —— 面板读的就是那儿。
- * 双写会造出两份可能不一致的真相，比只写一处危险得多。
- */
-function writeThemeStore(key: string, value: unknown): void {
-  try {
-    if (value === null || value === undefined) window.localStorage.removeItem(key);
-    else window.localStorage.setItem(key, JSON.stringify(value));
-  } catch (err) {
-    console.warn(`🎨 [DreamSkin:Menu] 写 ${key} 失败:`, err);
-  }
-}
 
 /** 读已安装皮肤 + 当前生效。菜单展开的那一刻现读。 */
 async function readSkinsForMenu(): Promise<{ skins: SkinMenuEntry[]; activeId: string | null }> {
   let list: ThemeItem[] = [];
   let activeId: string | null = null;
   try {
-    list = (await readThemeStore<ThemeItem[]>(STORAGE_KEY_CUSTOM_THEMES)) || [];
-    const active = await readThemeStore<{ themeId?: string }>(STORAGE_KEY_ACTIVE_THEME);
-    activeId = active?.themeId ?? null;
+    const sdk = getMenuSdk();
+    list = (await loadSkinsFromDisk(sdk)).ok;
+    activeId = (await readActive(sdk))?.themeId ?? null;
   } catch (err) {
     console.warn('🎨 [DreamSkin:Menu] 读皮肤列表失败:', err);
   }
@@ -1417,13 +1509,9 @@ async function readSkinsForMenu(): Promise<{ skins: SkinMenuEntry[]; activeId: s
 /** 菜单里点某套皮肤 —— 走与面板完全相同的那条应用链路。 */
 async function applySkinFromMenu(themeId: string): Promise<void> {
   const sdk = getMenuSdk();
-  const { skins } = await readSkinsForMenu();
-  if (!skins.some((s) => s.id === themeId)) return;
-
-  const list: ThemeItem[] = (await readThemeStore<ThemeItem[]>(STORAGE_KEY_CUSTOM_THEMES)) || [];
-  const item = list.find((t) => t.id === themeId);
+  const item = (await loadSkinsFromDisk(sdk)).ok.find((t) => t.id === themeId);
   if (!item) {
-    console.warn(`🎨 [DreamSkin:Menu] 皮肤 ${themeId} 在存储里找不到，跳过`);
+    console.warn(`🎨 [DreamSkin:Menu] 皮肤 ${themeId} 不在列表里或图片文件已缺失，跳过`);
     return;
   }
 
@@ -1447,11 +1535,7 @@ async function applySkinFromMenu(themeId: string): Promise<void> {
     }
   }
 
-  writeThemeStore(STORAGE_KEY_ACTIVE_THEME, {
-    themeId: item.id,
-    name: applied.name,
-    imageBlobUrl: item.imageBlobUrl,
-  });
+  await writeActive(sdk, { themeId: item.id, name: applied.name });
   sdk?.events?.emit('dream-skin:applied', { themeId: item.id, name: item.name });
 }
 
@@ -1474,7 +1558,7 @@ async function resetAppearanceFromMenu(): Promise<void> {
   }
   if (typeof sdkUi.setPalette === 'function') sdkUi.setPalette('mono');
 
-  writeThemeStore(STORAGE_KEY_ACTIVE_THEME, null);
+  await writeActive(sdk, null);
   sdk?.events?.emit('dream-skin:applied', { themeId: null, name: null });
 }
 
@@ -1569,7 +1653,8 @@ async function replayInstalledPalettes(): Promise<void> {
   if (!sdkUi || typeof sdkUi.registerPalette !== 'function') return;
 
   try {
-    const list: ThemeItem[] = (await readThemeStore<ThemeItem[]>(STORAGE_KEY_CUSTOM_THEMES)) || [];
+    // 只重放通过磁盘核对的皮肤：缺图的不进色系表。
+    const list: ThemeItem[] = (await loadSkinsFromDisk(sdk)).ok;
     if (!list.length) return;
 
     let ok = 0;

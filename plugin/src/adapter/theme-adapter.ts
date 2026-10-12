@@ -191,8 +191,36 @@ export async function getSkinRootDir(sdk: any): Promise<string> {
   }
 }
 
+/** data:image 壁纸落盘的目录名（skin 根目录下）。 */
+export const WALLPAPER_DIR_NAME = 'wallpapers';
+
 /**
- * 将 Base64 或大体积图片写入系统安全目录 (userData/wallpapers)，
+ * 把 data:image Base64 写成 `<skin>/wallpapers/<themeId>.<ext>`，返回相对信息。
+ * 失败返回 null（调用方决定降级）。
+ */
+export async function writeWallpaperFile(
+  sdk: any,
+  themeId: string,
+  dataUri: string
+): Promise<{ skinDir: string; imageFile: string } | null> {
+  const fs = sdk?.filesystem;
+  if (!fs) return null;
+  const match = dataUri.match(/^data:image\/(\w+);base64,(.+)$/);
+  if (!match) return null;
+  const skinRootDir = await getSkinRootDir(sdk);
+  if (!skinRootDir) return null;
+
+  const wallpaperDir = `${skinRootDir}/${WALLPAPER_DIR_NAME}`;
+  await fs.mkdir(wallpaperDir).catch(() => {});
+  const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+  const imageFile = `${themeId}.${ext}`;
+  // 覆盖写入物理磁盘目录 (~/.berrytrace/skin/wallpapers/)
+  await fs.writeFile(`${wallpaperDir}/${imageFile}`, match[2]);
+  return { skinDir: WALLPAPER_DIR_NAME, imageFile };
+}
+
+/**
+ * 将 Base64 或大体积图片写入系统安全目录 (skin/wallpapers)，
  * 并返回精简的 berrytrace-plugin://local-file 协议路径，彻底解决 5MB localStorage 配额爆满与沙箱阻断问题。
  */
 export async function saveWallpaperToDisk(
@@ -208,31 +236,15 @@ export async function saveWallpaperToDisk(
   }
 
   try {
-    const fs = sdk?.filesystem;
-    if (!fs) {
+    if (!sdk?.filesystem) {
       console.warn('⚠️ [DreamSkin:SaveWallpaper] 宿主未包含 filesystem 模块，降级保留原 Base64');
       return base64Data;
     }
-
+    const saved = await writeWallpaperFile(sdk, themeId, base64Data);
+    if (!saved) return base64Data;
     const skinRootDir = await getSkinRootDir(sdk);
-    if (!skinRootDir) return base64Data;
-
-    const wallpaperDir = `${skinRootDir}/wallpapers`;
-    await fs.mkdir(wallpaperDir).catch(() => {});
-
-    // 从 base64 提取拓展名与纯数据
-    const match = base64Data.match(/^data:image\/(\w+);base64,(.+)$/);
-    if (!match) return base64Data;
-
-    const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
-    const rawContent = match[2];
-    const filePath = `${wallpaperDir}/${themeId}.${ext}`;
-
-    // 覆盖写入物理磁盘目录 (~/.berrytrace/skin/wallpapers/)
-    await fs.writeFile(filePath, rawContent);
-    const protocolUrl = formatPluginResourceUrl(filePath);
-    console.log(`🎨 [DreamSkin:SaveWallpaper] ✅ 成功将 Base64 壁纸保存至物理皮肤路径: ${filePath} -> 协议 URL: ${protocolUrl}`);
-
+    const protocolUrl = formatPluginResourceUrl(`${skinRootDir}/${saved.skinDir}/${saved.imageFile}`);
+    console.log(`🎨 [DreamSkin:SaveWallpaper] ✅ 成功将 Base64 壁纸保存至物理皮肤路径 -> 协议 URL: ${protocolUrl}`);
     return protocolUrl;
   } catch (err) {
     console.error('🚨 [DreamSkin:SaveWallpaper] 磁盘落盘保存失败:', err);

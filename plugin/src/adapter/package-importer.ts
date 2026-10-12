@@ -38,8 +38,13 @@ export interface DreamSkinPackage {
   manifest?: DreamSkinManifest;
   theme: DreamSkinThemeConfig;
   themeCss?: string;
+  /** 运行期预览 URL，不落盘。落盘用 skinDir + imageFile。 */
   imageBlobUrl?: string;
   imageBase64?: string;
+  /** 原生解压落在 skin 根目录下的目录名；JSZip 降级路径没有。 */
+  skinDir?: string;
+  /** 背景图在 skinDir 内的相对路径；没找到图片时缺省。 */
+  imageFile?: string;
 }
 
 /**
@@ -143,9 +148,11 @@ export async function installThemeZipNative(
   console.log(`🎨 [DreamSkin:Importer] [步骤 5/5] 寻找背景图片素材, 预估磁盘物理路径: ${diskImgPath}`);
 
   let resolvedImgPath = diskImgPath;
+  let imageFound = false;
   try {
     // 校验背景图片是否存在
     await fs.readFile(diskImgPath, 'base64');
+    imageFound = true;
     console.log(`🎨 [DreamSkin:Importer] ✅ 确认根目录背景图片存在: ${diskImgPath}`);
   } catch (err) {
     console.warn(`🎨 [DreamSkin:Importer] ⚠️ 根路径 ${diskImgPath} 未能直接匹配，检索子目录图源...`, err);
@@ -157,6 +164,7 @@ export async function installThemeZipNative(
           try {
             await fs.readFile(tryPath, 'base64');
             resolvedImgPath = tryPath;
+            imageFound = true;
             console.log(`🎨 [DreamSkin:Importer] ✅ 在嵌套子目录 [${sub.name}] 中成功匹配背景图: ${tryPath}`);
             break;
           } catch {}
@@ -168,6 +176,11 @@ export async function installThemeZipNative(
   const cleanPath = resolvedImgPath.replace(/\\/g, '/');
   // 核心：直接生成指向 ~/.berrytrace/skin/... 的轻量级协议 URL，切勿在原生解压流程中将文件转成 5MB Base64！
   const imageBlobUrl = formatPluginResourceUrl(cleanPath);
+  // 落盘只存相对信息：skinDir（skin 根目录下的目录名）+ imageFile（相对 skinDir 的路径）。
+  const normalizedThemeDir = themeDir.replace(/\\/g, '/');
+  const imageFile = imageFound && cleanPath.startsWith(`${normalizedThemeDir}/`)
+    ? cleanPath.slice(normalizedThemeDir.length + 1)
+    : undefined;
 
   // 5. 读取可选的 theme.css 自用自定义 CSS
   let themeCss: string | undefined;
@@ -183,7 +196,9 @@ export async function installThemeZipNative(
   return {
     theme: themeConfig,
     themeCss,
-    imageBlobUrl,
+    imageBlobUrl: imageFile ? imageBlobUrl : undefined,
+    skinDir: rawId,
+    imageFile,
   };
 }
 

@@ -12,10 +12,9 @@ import {
   type SdkPlugin,
 } from '../adapter/theme-adapter';
 
-declare const sdk: any;
+import { loadSkinsFromDisk, readActive } from '../adapter/theme-store';
 
-const STORAGE_KEY_CUSTOM_THEMES = 'berrytrace_dream_skin_custom_themes';
-const STORAGE_KEY_ACTIVE_THEME = 'berrytrace_dream_skin_active';
+declare const sdk: any;
 
 /**
  * 从存储中恢复并跨窗口广播/挂载激活的主题
@@ -24,24 +23,23 @@ export async function restoreAndApplyActiveTheme(): Promise<void> {
   try {
     if (!sdk?.storage || !sdk?.ui) return;
 
-    const savedActive = await sdk.storage.getItem(STORAGE_KEY_ACTIVE_THEME);
+    const savedActive = await readActive(sdk);
     if (!savedActive?.themeId) {
       console.log('🎨 [DreamSkin:Main] 当前未激活任何自定义 DreamSkin 主题');
       return;
     }
 
-    // 查找包含完整 Base64 图片数据的 ThemeItem
-    const customList: any[] = (await sdk.storage.getItem(STORAGE_KEY_CUSTOM_THEMES)) || [];
-    const activeItem = customList.find((t) => t.id === savedActive.themeId) || savedActive.item;
-
-    if (activeItem?.config) {
-      const applied = transformDreamSkinToBerryTrace(activeItem.config, activeItem.imageBlobUrl);
-      await applySkinViaSDK(sdk.ui as SdkUi, applied, sdk.plugin as SdkPlugin);
-      console.log(`🎨 [DreamSkin:Main] 成功跨窗口挂载常驻主题：${applied.name}`);
-    } else if (savedActive.applied) {
-      await applySkinViaSDK(sdk.ui as SdkUi, savedActive.applied, sdk.plugin as SdkPlugin);
-      console.log(`🎨 [DreamSkin:Main] 成功跨窗口挂载常驻主题：${savedActive.applied.name}`);
+    // 只认通过磁盘核对的皮肤：图片文件缺了的不挂载（面板打开时会问用户怎么处理）。
+    const { ok } = await loadSkinsFromDisk(sdk);
+    const activeItem = ok.find((t) => t.id === savedActive.themeId);
+    if (!activeItem?.config) {
+      console.log(`🎨 [DreamSkin:Main] 当前主题 ${savedActive.themeId} 不在列表里或图片文件缺失，跳过挂载`);
+      return;
     }
+
+    const applied = transformDreamSkinToBerryTrace(activeItem.config, activeItem.imageBlobUrl);
+    await applySkinViaSDK(sdk.ui as SdkUi, applied, sdk.plugin as SdkPlugin);
+    console.log(`🎨 [DreamSkin:Main] 成功跨窗口挂载常驻主题：${applied.name}`);
   } catch (err) {
     console.error('🚨 [DreamSkin:Main] 恢复常驻主题失败:', err);
   }
